@@ -47,21 +47,24 @@ pub async fn resolve_track(
         )
         .await
     {
-        Ok(track) => {
+        Ok(meta) => {
             let res = TrackResponse {
-                title: track.title,
-                source_url: track.source_url,
-                stream_url: track.stream_url,
-                duration_secs: track.duration_secs,
-                author: track.author,
-                thumbnail: track.thumbnail,
+                title: meta.title,
+                source_url: meta.source_url,
+                stream_url: meta.stream_url,
+                duration_secs: meta.duration_secs,
+                author: meta.author,
+                thumbnail: meta.thumbnail,
             };
             Ok(Json(ApiResponse::ok(res)))
         }
-        Err(err) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::err(format!("Fallo resolviendo pista: {}", err))),
-        )),
+        Err(e) => {
+            warn!(query = %payload.query, error = %e, "Track resolution failed");
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::err(format!("Track resolution failed: {}", e))),
+            ))
+        }
     }
 }
 
@@ -152,10 +155,10 @@ pub async fn player_play(
 
     info!(guild = payload.guild_id, query = %payload.url, "Resolviendo fuente de audio (Pista/Playlist/Mix/Radio)...");
 
-    // Extracción por lotes (Soporta canciones individuales, Playlists, Mixes RD... y Radios)
+    // Extracción optimizada (Fast Start): Pista 1 en paralelo con Flat-Playlist
     let batch = match state
         .resolver
-        .resolve_batch(
+        .resolve_playlist_batch(
             &payload.url,
             payload.extractor_args.as_deref(),
             payload.extra_args.as_deref(),
@@ -177,6 +180,8 @@ pub async fn player_play(
 
     // Si se solicita reemplazar explícitamente, se detiene la cola y el stream actual
     if payload.replace == Some(true) {
+        state.next_epoch(payload.guild_id);
+        state.pending_playlists.remove(&payload.guild_id);
         driver.stop();
         driver.queue().stop();
     }
@@ -185,36 +190,120 @@ pub async fn player_play(
     let target_volume = payload.volume.unwrap_or(1.0);
     let effective_volume = (target_volume * 0.95).clamp(0.0, 2.0);
 
-    for track in &batch.tracks {
-        let source = HttpRequest::new(state.http_client.clone(), track.stream_url.clone());
-        let songbird_track = Track::new_with_data(source.into(), Arc::new(track.clone()));
-        let handle = driver.enqueue(songbird_track).await;
-        let _ = handle.set_volume(effective_volume);
-    }
+    // Encolar inmediatamente la pista 1 para inicio de reproducción instantáneo (~3-4s)
+    let source = HttpRequest::new(state.http_client.clone(), batch.first_track.stream_url.clone());
+    let songbird_track = Track::new_with_data(source.into(), Arc::new(batch.first_track.clone()));
+    let handle = driver.enqueue(songbird_track).await;
+    let _ = handle.set_volume(effective_volume);
 
     let total_queue_len = driver.queue().len();
-    let first_track = batch.tracks.first().cloned().unwrap();
+    drop(driver); // Liberar lock antes de despachar tareas asíncronas
+
+    // Si es una playlist/mix con pistas pendientes, iniciar background worker
+    if !batch.remaining_entries.is_empty() {
+        let guild_id = payload.guild_id;
+        let epoch = state.next_epoch(guild_id);
+        state.pending_playlists.insert(guild_id, batch.remaining_entries.clone());
+
+        let driver_clone = driver_ref.clone();
+        let resolver_clone = state.resolver.clone();
+        let http_client = state.http_client.clone();
+        let pending_map = state.pending_playlists.clone();
+        let epochs = state.load_epochs.clone();
+        let remaining = batch.remaining_entries;
+        let extractor_args = payload.extractor_args.clone();
+        let extra_args = payload.extra_args.clone();
+        let cookies = payload.cookies.clone();
+
+        tokio::spawn(async move {
+            info!(
+                guild = guild_id,
+                count = remaining.len(),
+                epoch = epoch,
+                "Iniciando carga asíncrona de playlist en segundo plano..."
+            );
+
+            for item in remaining {
+                // Verificar si la sesión fue detenida o reemplazada
+                let current_epoch = epochs
+                    .get(&guild_id)
+                    .map(|e| e.load(std::sync::atomic::Ordering::SeqCst))
+                    .unwrap_or(0);
+                if current_epoch != epoch {
+                    info!(guild = guild_id, "Carga de playlist en segundo plano cancelada");
+                    break;
+                }
+
+                match resolver_clone
+                    .resolve_single(
+                        &item.url,
+                        extractor_args.as_deref(),
+                        extra_args.as_deref(),
+                        cookies.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(track) => {
+                        let cur_check = epochs
+                            .get(&guild_id)
+                            .map(|e| e.load(std::sync::atomic::Ordering::SeqCst))
+                            .unwrap_or(0);
+                        if cur_check != epoch {
+                            break;
+                        }
+
+                        let mut d = driver_clone.lock().await;
+                        let src = HttpRequest::new(http_client.clone(), track.stream_url.clone());
+                        let trk = Track::new_with_data(src.into(), Arc::new(track.clone()));
+                        let h = d.enqueue(trk).await;
+                        let _ = h.set_volume(effective_volume);
+
+                        if let Some(mut pend) = pending_map.get_mut(&guild_id) {
+                            pend.retain(|p| p.url != item.url);
+                        }
+                        info!(
+                            guild = guild_id,
+                            title = %track.title,
+                            in_queue = d.queue().len(),
+                            "Pista de playlist resuelta y encolada en segundo plano"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            guild = guild_id,
+                            url = %item.url,
+                            error = %err,
+                            "Fallo al resolver pista de playlist en background"
+                        );
+                        if let Some(mut pend) = pending_map.get_mut(&guild_id) {
+                            pend.retain(|p| p.url != item.url);
+                        }
+                    }
+                }
+            }
+            info!(guild = guild_id, "Carga en segundo plano de playlist completada");
+        });
+    }
 
     let response = PlayResponse {
-        title: first_track.title,
-        source_url: first_track.source_url,
-        stream_url: first_track.stream_url,
-        duration_secs: first_track.duration_secs,
-        author: first_track.author,
-        thumbnail: first_track.thumbnail,
+        title: batch.first_track.title,
+        source_url: batch.first_track.source_url,
+        stream_url: batch.first_track.stream_url,
+        duration_secs: batch.first_track.duration_secs,
+        author: batch.first_track.author,
+        thumbnail: batch.first_track.thumbnail,
         is_playlist: batch.is_playlist,
         playlist_title: batch.playlist_title,
-        playlist_tracks_count: batch.tracks.len(),
-        queue_length: total_queue_len,
+        playlist_tracks_count: batch.total_tracks_count,
+        queue_length: total_queue_len + if batch.is_playlist { batch.total_tracks_count.saturating_sub(1) } else { 0 },
         was_empty: initial_queue_len == 0,
     };
 
     info!(
         guild = payload.guild_id,
-        tracks_enqueued = batch.tracks.len(),
-        total_in_queue = total_queue_len,
         is_playlist = batch.is_playlist,
-        "Pistas encoladas exitosamente en Songbird TrackQueue"
+        playlist_tracks_count = batch.total_tracks_count,
+        "Pista inicial lista y encolada exitosamente"
     );
 
     Ok(Json(ApiResponse::ok(response)))
@@ -249,6 +338,20 @@ pub async fn player_queue(
             author: meta.author.clone(),
             thumbnail: meta.thumbnail.clone(),
         });
+    }
+
+    // Agregar pistas de playlist que aún se están cargando en segundo plano
+    if let Some(pending) = state.pending_playlists.get(&payload.guild_id) {
+        for item in pending.iter() {
+            all_tracks.push(TrackResponse {
+                title: format!("⏳ {}", item.title),
+                source_url: item.url.clone(),
+                stream_url: String::new(),
+                duration_secs: item.duration_secs,
+                author: item.author.clone(),
+                thumbnail: item.thumbnail.clone(),
+            });
+        }
     }
 
     let current = if !is_empty && !all_tracks.is_empty() {
@@ -296,6 +399,8 @@ pub async fn player_control(
             Ok(Json(ApiResponse::ok("Player resumed")))
         }
         "stop" => {
+            state.next_epoch(payload.guild_id);
+            state.pending_playlists.remove(&payload.guild_id);
             driver.queue().stop();
             driver.stop();
             Ok(Json(ApiResponse::ok("Player stopped")))
@@ -306,6 +411,8 @@ pub async fn player_control(
             Ok(Json(ApiResponse::ok("Track skipped")))
         }
         "clear" => {
+            state.next_epoch(payload.guild_id);
+            state.pending_playlists.remove(&payload.guild_id);
             driver.queue().modify_queue(|q| {
                 if q.len() > 1 {
                     let first = q.pop_front().unwrap();
@@ -342,6 +449,8 @@ pub async fn voice_leave(
     State(state): State<AppState>,
     Json(payload): Json<LeavePayload>,
 ) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<&'static str>>)> {
+    state.next_epoch(payload.guild_id);
+    state.pending_playlists.remove(&payload.guild_id);
     if let Some((_, driver_ref)) = state.players.remove(&payload.guild_id) {
         let mut driver = driver_ref.lock().await;
         driver.stop();
