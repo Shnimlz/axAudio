@@ -34,15 +34,23 @@ FROM debian:bookworm-slim AS runner
 # Instalar dependencias mínimas de ejecución:
 # - ca-certificates: esencial para streaming HTTPS de audios
 # - libopus0: librería compartida de códec de audio
-# - curl: para el healthcheck de Docker/Coolify
+# - curl, unzip: utilidades
 # - python3 & yt-dlp: extractor de audio y resolución de URLs CDN directas
+# - deno: motor de JavaScript requerido por yt-dlp EJS para descifrar firmas de YouTube
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libopus0 \
     curl \
+    unzip \
     python3 \
+    && ARCH=$(uname -m) \
+    && if [ "$ARCH" = "aarch64" ]; then DENO_ARCH="aarch64"; else DENO_ARCH="x86_64"; fi \
+    && curl -fsSL "https://github.com/denoland/deno/releases/latest/download/deno-${DENO_ARCH}-unknown-linux-gnu.zip" -o /tmp/deno.zip \
+    && unzip /tmp/deno.zip -d /usr/local/bin \
+    && rm /tmp/deno.zip \
     && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
-    && chmod a+rx /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp /usr/local/bin/deno \
+    && apt-get purge -y unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Seguridad: crear usuario no root

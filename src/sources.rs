@@ -73,13 +73,16 @@ impl SourceResolver {
         info!(query = %query_trimmed, "Resolviendo stream CDN mediante yt-dlp...");
 
         // 2. Extraer metadatos con yt-dlp en formato JSON (--dump-single-json)
+        // Usamos clientes TV e iOS para saltar el bloqueo de BotGuard (poToken)
         let mut cmd = Command::new("yt-dlp");
         cmd.arg("--no-playlist")
             .arg("--format")
             .arg("bestaudio/best")
             .arg("--dump-single-json")
             .arg("--default-search")
-            .arg("ytsearch:");
+            .arg("ytsearch:")
+            .arg("--extractor-args")
+            .arg("youtube:player_client=tv,tv_embedded,ios,web");
 
         cmd.arg(query_trimmed);
 

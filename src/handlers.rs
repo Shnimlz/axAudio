@@ -153,7 +153,12 @@ pub async fn player_play(
 
     let source = HttpRequest::new(state.http_client.clone(), track.stream_url.clone());
     let mut driver = driver_ref.lock().await;
-    let handle = driver.play_input(source.into());
+
+    // Detener cualquier stream anterior y limpiar cola antes de reproducir la nueva pista
+    driver.stop();
+    driver.queue().stop();
+
+    let handle = driver.enqueue_input(source.into()).await;
 
     if let Some(vol) = payload.volume {
         let clamped = vol.clamp(0.0, 2.0);
@@ -186,30 +191,31 @@ pub async fn player_control(
         }
     };
 
-    let driver = driver_ref.lock().await;
-    let queue = driver.queue();
+    let mut driver = driver_ref.lock().await;
 
     match payload.action.as_str() {
         "pause" => {
-            let _ = queue.pause();
+            let _ = driver.queue().pause();
             Ok(Json(ApiResponse::ok("Player paused")))
         }
         "resume" => {
-            let _ = queue.resume();
+            let _ = driver.queue().resume();
             Ok(Json(ApiResponse::ok("Player resumed")))
         }
         "stop" => {
-            queue.stop();
+            driver.queue().stop();
+            driver.stop();
             Ok(Json(ApiResponse::ok("Player stopped")))
         }
         "skip" => {
-            let _ = queue.skip();
+            let _ = driver.queue().skip();
+            driver.stop();
             Ok(Json(ApiResponse::ok("Track skipped")))
         }
         "volume" => {
             if let Some(val) = payload.value {
                 let clamped = val.clamp(0.0, 2.0);
-                if let Some(track) = queue.current() {
+                if let Some(track) = driver.queue().current() {
                     let _ = track.set_volume(clamped);
                 }
                 Ok(Json(ApiResponse::ok("Volume updated")))
