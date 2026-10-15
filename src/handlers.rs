@@ -1,23 +1,145 @@
 use axum::{
-    extract::State,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json},
 };
+use async_trait::async_trait;
 use songbird::driver::Driver;
+use songbird::events::{Event, EventContext, EventHandler, TrackEvent};
 use songbird::input::HttpRequest;
-use songbird::tracks::Track;
+use songbird::tracks::{Track, TrackHandle};
 use songbird::ConnectionInfo;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
 use crate::models::{
     ApiResponse, ControlPayload, JoinPayload, LeavePayload, PlayPayload, PlayResponse,
-    QueuePayload, QueueResponse, ResolvePayload, StatsResponse, TrackResponse,
+    PlayerEvent, QueuePayload, QueueResponse, ResolvePayload, StatsResponse, TrackResponse,
 };
 use crate::sources::TrackMetadata;
 use crate::state::AppState;
+
+struct TrackPlayNotifier {
+    guild_id: u64,
+    meta: Arc<TrackMetadata>,
+    event_tx: broadcast::Sender<PlayerEvent>,
+}
+
+#[async_trait]
+impl EventHandler for TrackPlayNotifier {
+    async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        info!(guild = self.guild_id, title = %self.meta.title, "TrackPlay event fired");
+        let _ = self.event_tx.send(PlayerEvent::TrackStart {
+            guild_id: self.guild_id,
+            track: TrackResponse {
+                title: self.meta.title.clone(),
+                source_url: self.meta.source_url.clone(),
+                stream_url: self.meta.stream_url.clone(),
+                duration_secs: self.meta.duration_secs,
+                author: self.meta.author.clone(),
+                thumbnail: self.meta.thumbnail.clone(),
+            },
+        });
+        None
+    }
+}
+
+struct TrackEndNotifier {
+    guild_id: u64,
+    meta: Arc<TrackMetadata>,
+    event_tx: broadcast::Sender<PlayerEvent>,
+}
+
+#[async_trait]
+impl EventHandler for TrackEndNotifier {
+    async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        info!(guild = self.guild_id, title = %self.meta.title, "TrackEnd event fired");
+        let _ = self.event_tx.send(PlayerEvent::TrackEnd {
+            guild_id: self.guild_id,
+            track: Some(TrackResponse {
+                title: self.meta.title.clone(),
+                source_url: self.meta.source_url.clone(),
+                stream_url: self.meta.stream_url.clone(),
+                duration_secs: self.meta.duration_secs,
+                author: self.meta.author.clone(),
+                thumbnail: self.meta.thumbnail.clone(),
+            }),
+            reason: "finished".to_string(),
+        });
+        None
+    }
+}
+
+struct TrackErrorNotifier {
+    guild_id: u64,
+    meta: Arc<TrackMetadata>,
+    event_tx: broadcast::Sender<PlayerEvent>,
+}
+
+#[async_trait]
+impl EventHandler for TrackErrorNotifier {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        let err_msg = match ctx {
+            EventContext::Track(slice) => slice
+                .first()
+                .map(|(state, _)| format!("{:?}", state.playing))
+                .unwrap_or_else(|| "Playback error".to_string()),
+            _ => "Playback error".to_string(),
+        };
+        warn!(guild = self.guild_id, title = %self.meta.title, error = %err_msg, "TrackError event fired");
+        let _ = self.event_tx.send(PlayerEvent::TrackError {
+            guild_id: self.guild_id,
+            track: Some(TrackResponse {
+                title: self.meta.title.clone(),
+                source_url: self.meta.source_url.clone(),
+                stream_url: self.meta.stream_url.clone(),
+                duration_secs: self.meta.duration_secs,
+                author: self.meta.author.clone(),
+                thumbnail: self.meta.thumbnail.clone(),
+            }),
+            error: err_msg,
+        });
+        None
+    }
+}
+
+fn attach_track_events(
+    guild_id: u64,
+    meta: Arc<TrackMetadata>,
+    handle: &TrackHandle,
+    event_tx: &broadcast::Sender<PlayerEvent>,
+) {
+    let _ = handle.add_event(
+        Event::Track(TrackEvent::Play),
+        TrackPlayNotifier {
+            guild_id,
+            meta: meta.clone(),
+            event_tx: event_tx.clone(),
+        },
+    );
+    let _ = handle.add_event(
+        Event::Track(TrackEvent::End),
+        TrackEndNotifier {
+            guild_id,
+            meta: meta.clone(),
+            event_tx: event_tx.clone(),
+        },
+    );
+    let _ = handle.add_event(
+        Event::Track(TrackEvent::Error),
+        TrackErrorNotifier {
+            guild_id,
+            meta,
+            event_tx: event_tx.clone(),
+        },
+    );
+}
+
 
 pub async fn health() -> Json<ApiResponse<&'static str>> {
     Json(ApiResponse::ok("axAudio engine operational"))
@@ -192,9 +314,11 @@ pub async fn player_play(
 
     // Encolar inmediatamente la pista 1 para inicio de reproducción instantáneo (~3-4s)
     let source = HttpRequest::new(state.http_client.clone(), batch.first_track.stream_url.clone());
-    let songbird_track = Track::new_with_data(source.into(), Arc::new(batch.first_track.clone()));
+    let first_meta = Arc::new(batch.first_track.clone());
+    let songbird_track = Track::new_with_data(source.into(), first_meta.clone());
     let handle = driver.enqueue(songbird_track).await;
     let _ = handle.set_volume(effective_volume);
+    attach_track_events(payload.guild_id, first_meta, &handle, &state.event_tx);
 
     let total_queue_len = driver.queue().len();
     drop(driver); // Liberar lock antes de despachar tareas asíncronas
@@ -210,6 +334,7 @@ pub async fn player_play(
         let http_client = state.http_client.clone();
         let pending_map = state.pending_playlists.clone();
         let epochs = state.load_epochs.clone();
+        let event_tx_clone = state.event_tx.clone();
         let remaining = batch.remaining_entries;
         let extractor_args = payload.extractor_args.clone();
         let extra_args = payload.extra_args.clone();
@@ -282,9 +407,11 @@ pub async fn player_play(
 
                         let mut d = driver_clone.lock().await;
                         let src = HttpRequest::new(http_client.clone(), track.stream_url.clone());
-                        let trk = Track::new_with_data(src.into(), Arc::new(track.clone()));
+                        let track_meta = Arc::new(track.clone());
+                        let trk = Track::new_with_data(src.into(), track_meta.clone());
                         let h = d.enqueue(trk).await;
                         let _ = h.set_volume(effective_volume);
+                        attach_track_events(guild_id, track_meta, &h, &event_tx_clone);
 
                         if let Some(mut pend) = pending_map.get_mut(&guild_id) {
                             pend.retain(|p| p.url != item.url);
@@ -487,3 +614,51 @@ pub async fn voice_leave(
         Ok(Json(ApiResponse::ok("Session was not active")))
     }
 }
+
+pub async fn ws_events(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_ws_events(socket, state))
+}
+
+async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
+    let mut rx = state.event_tx.subscribe();
+    info!("🔌 Client connected to axAudio WebSocket /v1/events");
+
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(evt) => {
+                        if let Ok(json) = serde_json::to_string(&evt) {
+                            if socket.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!("WebSocket client lagged behind, skipped {} events", missed);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    info!("🔌 Client disconnected from axAudio WebSocket /v1/events");
+}
+

@@ -156,3 +156,23 @@ impl<T> ApiResponse<T> {
         }
     }
 }
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PlayerEvent {
+    TrackStart {
+        guild_id: u64,
+        track: TrackResponse,
+    },
+    TrackEnd {
+        guild_id: u64,
+        track: Option<TrackResponse>,
+        reason: String,
+    },
+    TrackError {
+        guild_id: u64,
+        track: Option<TrackResponse>,
+        error: String,
+    },
+}
+

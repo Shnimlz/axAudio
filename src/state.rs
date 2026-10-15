@@ -4,8 +4,9 @@ use std::time::Instant;
 use dashmap::DashMap;
 use reqwest::Client;
 use songbird::driver::Driver;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 
+use crate::models::PlayerEvent;
 use crate::sources::{FlatPlaylistItem, SourceResolver};
 
 #[derive(Clone)]
@@ -16,10 +17,12 @@ pub struct AppState {
     pub start_time: Instant,
     pub load_epochs: Arc<DashMap<u64, Arc<AtomicU64>>>,
     pub pending_playlists: Arc<DashMap<u64, Vec<FlatPlaylistItem>>>,
+    pub event_tx: broadcast::Sender<PlayerEvent>,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let (event_tx, _) = broadcast::channel(256);
         Self {
             players: Arc::new(DashMap::new()),
             http_client: Client::builder()
@@ -30,6 +33,7 @@ impl AppState {
             start_time: Instant::now(),
             load_epochs: Arc::new(DashMap::new()),
             pending_playlists: Arc::new(DashMap::new()),
+            event_tx,
         }
     }
 
@@ -41,6 +45,7 @@ impl AppState {
         entry.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
     }
 
+    #[allow(dead_code)]
     pub fn current_epoch(&self, guild_id: u64) -> u64 {
         self.load_epochs
             .get(&guild_id)

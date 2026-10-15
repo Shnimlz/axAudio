@@ -240,7 +240,10 @@ All endpoints accept and return JSON. Snowflake IDs (`guild_id`, `channel_id`, `
 | `POST` | `/v1/voice/leave` | Disconnect from a voice channel |
 | `POST` | `/v1/player/play` | Enqueue a URL or search query |
 | `POST` | `/v1/player/control` | Pause, resume, skip, stop, volume |
+| `POST` | `/v1/player/queue` | Inspect current track and upcoming queue |
 | `POST` | `/v1/tracks/resolve` | Resolve metadata and stream URL without playing |
+| `WS` | `/v1/events` | Real-time WebSocket player events (track start / end / error) |
+
 
 <details>
 <summary><b>Health check & stats</b></summary>
@@ -489,9 +492,9 @@ async function skipTrack(guildId: string) {
 - [x] yt-dlp + Deno + PoToken sidecar
 - [x] Multi-account cookie pool with round-robin and auto-retry
 - [x] Docker Compose deployment
+- [x] Queue inspection endpoint (`/v1/player/queue`)
+- [x] WebSocket player events (`/v1/events`: track start / end / error)
 - [ ] Seek / position control
-- [ ] Queue inspection endpoint
-- [ ] WebSocket player events (track start / end / error)
 
 Have an idea? [Open an issue](https://github.com/YOUR_USER/axAudio/issues).
 

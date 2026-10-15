@@ -43,6 +43,7 @@ pub struct ResolvedPlaylistBatch {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct ResolvedBatch {
     pub is_playlist: bool,
     pub playlist_title: Option<String>,
