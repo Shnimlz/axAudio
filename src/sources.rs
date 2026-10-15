@@ -389,40 +389,56 @@ impl SourceResolver {
         let val: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| format!("Error parseando salida JSON de yt-dlp: {:?}", e))?;
 
+        let entries_first = val.get("entries").and_then(|arr| arr.as_array()).and_then(|arr| arr.first());
+
         let stream_url = val
             .get("url")
             .and_then(|u| u.as_str())
-            .or_else(|| {
-                val.get("entries")
-                    .and_then(|arr| arr.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|item| item.get("url"))
-                    .and_then(|u| u.as_str())
-            })
+            .or_else(|| entries_first.and_then(|item| item.get("url")).and_then(|u| u.as_str()))
             .ok_or_else(|| "No se encontró stream_url de audio para la pista".to_string())?;
 
         let title = val
             .get("title")
             .and_then(|t| t.as_str())
+            .filter(|t| !t.starts_with("ytsearch") && !t.starts_with("scsearch"))
+            .or_else(|| entries_first.and_then(|e| e.get("title")).and_then(|t| t.as_str()))
             .unwrap_or("Pista Desconocida")
             .to_string();
 
         let source_url = val
             .get("webpage_url")
+            .or_else(|| val.get("original_url"))
             .and_then(|u| u.as_str())
+            .or_else(|| {
+                entries_first
+                    .and_then(|e| e.get("webpage_url").or_else(|| e.get("url")))
+                    .and_then(|u| u.as_str())
+            })
             .unwrap_or(query_trimmed)
             .to_string();
 
-        let duration_secs = val.get("duration").and_then(|d| d.as_u64());
+        let duration_secs = val
+            .get("duration")
+            .and_then(|d| d.as_u64())
+            .or_else(|| entries_first.and_then(|e| e.get("duration")).and_then(|d| d.as_u64()));
+
         let author = val
             .get("uploader")
             .or_else(|| val.get("channel"))
             .and_then(|u| u.as_str())
+            .or_else(|| {
+                entries_first
+                    .and_then(|e| e.get("uploader").or_else(|| e.get("channel")))
+                    .and_then(|u| u.as_str())
+            })
             .map(|s| s.to_string());
 
         let thumbnail = val
             .get("thumbnail")
             .and_then(|t| t.as_str())
+            .or_else(|| {
+                entries_first.and_then(|e| e.get("thumbnail")).and_then(|t| t.as_str())
+            })
             .or_else(|| {
                 val.get("thumbnails")
                     .and_then(|arr| arr.as_array())
