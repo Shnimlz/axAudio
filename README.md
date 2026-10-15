@@ -1,11 +1,13 @@
-<div align="center">
-
-<!-- Tip: add a banner here -> <img src="assets/banner.png" alt="axAudio" width="720"> -->
-
-# ⚡ axAudio
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/light.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/light.svg">
+    <img alt="AxAudio" src="assets/light.svg" width="300">
+  </picture>
+</p>
 
 **Ultra-lightweight, bare-metal Discord audio engine written in Rust.**
-<br>
+
 A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -21,15 +23,11 @@ A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 [**YouTube Anti-Bot**](#%EF%B8%8F-youtube-anti-bot--botguard) ·
 [**Bot Example**](#-discord-bot-integration)
 
-<br>
-
 |  📦 Binary  |    🧠 RAM    | 🚀 Startup |    🎚️ Transport     |
 | :---------: | :----------: | :--------: | :-----------------: |
 | **~8.4 MB** | **~8–15 MB** | **< 5 ms** | **50 Hz RTP / UDP** |
 
 </div>
-
----
 
 ## 📖 Table of Contents
 
@@ -47,8 +45,6 @@ A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 - [Disclaimer](#%EF%B8%8F-disclaimer)
 - [License](#-license)
 
----
-
 ## 🤔 Why axAudio?
 
 Running Lavalink means running a JVM. On a small VPS that is most of your RAM gone before a single song plays. **axAudio** does the same job as a single Rust binary that starts instantly and sips memory, so a 1 vCPU free-tier box can serve voice comfortably.
@@ -62,8 +58,6 @@ Running Lavalink means running a JVM. On a small VPS that is most of your RAM go
 | Garbage collector                                |      **None**      |       Yes        |
 | Built-in YouTube anti-bot (PoToken, cookie pool) |         ✅         | Plugin-dependent |
 
----
-
 ## ✨ Features
 
 - 🦀 **Pure Rust core**: Songbird 0.4 + Symphonia 0.5, no GC pauses.
@@ -74,8 +68,6 @@ Running Lavalink means running a JVM. On a small VPS that is most of your RAM go
 - 🎧 **Studio-grade fidelity**: native 48 kHz Opus (format 251), `tanh` soft-clipping and headroom normalization.
 - 🪶 **Tuned for tiny servers**: defaults to `TOKIO_WORKER_THREADS=2`, ideal for Oracle Cloud Free Tier, AWS t4g/t3a and Hetzner VPS.
 - 🐳 **One-command deploy** with Docker Compose.
-
----
 
 ## 🧩 Architecture
 
@@ -96,8 +88,6 @@ flowchart LR
     Q --> UDP["50 Hz real-time<br/>UDP RTP engine"]
     DRV --> UDP
 ```
-
----
 
 ## 🚀 Quick Start
 
@@ -164,8 +154,6 @@ docker run -d \
 
 </details>
 
----
-
 ## 💻 Running on Bare Metal
 
 <details>
@@ -204,8 +192,6 @@ cargo build --release
 ./target/release/axAudio
 ```
 
----
-
 ## ⚙️ Configuration
 
 Everything is configurable through environment variables or a `.env` file.
@@ -226,8 +212,6 @@ Everything is configurable through environment variables or a `.env` file.
 | `YTDLP_REMOTE_COMPONENTS` | `ejs:github`                           | EJS remote solver source. Set to `none` to disable.                   |
 | `YTDLP_EXTRACTOR_ARGS`    | _auto (bgutil)_                        | Custom `--extractor-args` flags for `yt-dlp`.                         |
 | `YTDLP_EXTRA_ARGS`        | _none_                                 | Extra flags forwarded directly to `yt-dlp`.                           |
-
----
 
 ## 📡 REST API Reference
 
@@ -404,8 +388,6 @@ Content-Type: application/json
 
 </details>
 
----
-
 ## 🛡️ YouTube Anti-Bot & BotGuard
 
 Datacenter and cloud IPs are routinely hit with _"Sign in to confirm you're not a bot"_. `axAudio` ships a layered bypass:
@@ -434,8 +416,6 @@ Datacenter and cloud IPs are routinely hit with _"Sign in to confirm you're not 
 - **Soft-clipping**: Songbird's `use_softclip` applies a `tanh` limiter to intersample peaks near 0 dBFS, which removes harsh digital clipping while keeping bass dynamics intact.
 - **Headroom normalization**: a 0.95 (-0.5 dBFS) true-peak margin keeps loud masters from overloading the output stage.
 - **Configurable bitrate**: up to 384 kbps via `AUDIO_BITRATE`.
-
----
 
 ## 🤖 Discord Bot Integration
 
