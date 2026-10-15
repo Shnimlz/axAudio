@@ -35,7 +35,16 @@ pub async fn resolve_track(
     State(state): State<AppState>,
     Json(payload): Json<ResolvePayload>,
 ) -> Result<Json<ApiResponse<TrackResponse>>, (StatusCode, Json<ApiResponse<TrackResponse>>)> {
-    match state.resolver.resolve(&payload.query).await {
+    match state
+        .resolver
+        .resolve(
+            &payload.query,
+            payload.extractor_args.as_deref(),
+            payload.extra_args.as_deref(),
+            payload.cookies.as_deref(),
+        )
+        .await
+    {
         Ok(track) => {
             let res = TrackResponse {
                 title: track.title,
@@ -133,7 +142,16 @@ pub async fn player_play(
     info!(guild = payload.guild_id, query = %payload.url, "Resolviendo fuente de audio para streaming");
 
     // Extracción de metadatos y URL CDN directa (o stream nativo)
-    let track = match state.resolver.resolve(&payload.url).await {
+    let track = match state
+        .resolver
+        .resolve(
+            &payload.url,
+            payload.extractor_args.as_deref(),
+            payload.extra_args.as_deref(),
+            payload.cookies.as_deref(),
+        )
+        .await
+    {
         Ok(t) => t,
         Err(e) => {
             error!(guild = payload.guild_id, error = %e, "Fallo al resolver fuente con yt-dlp");

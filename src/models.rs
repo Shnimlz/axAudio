@@ -56,6 +56,9 @@ pub struct PlayPayload {
     pub guild_id: u64,
     pub url: String,
     pub volume: Option<f32>,
+    pub extractor_args: Option<String>,
+    pub extra_args: Option<String>,
+    pub cookies: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +78,9 @@ pub struct LeavePayload {
 #[derive(Debug, Deserialize)]
 pub struct ResolvePayload {
     pub query: String,
+    pub extractor_args: Option<String>,
+    pub extra_args: Option<String>,
+    pub cookies: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

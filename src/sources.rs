@@ -44,16 +44,24 @@ impl SourceResolver {
             || lower.contains("shoutcast")
     }
 
-    /// Resuelve la URL CDN directa y los metadatos usando yt-dlp con caché en memoria
-    pub async fn resolve(&self, query: &str) -> Result<TrackMetadata, String> {
+    /// Resuelve la URL CDN directa y los metadatos usando yt-dlp con opciones y caché en memoria
+    pub async fn resolve(
+        &self,
+        query: &str,
+        custom_extractor_args: Option<&str>,
+        custom_extra_args: Option<&str>,
+        custom_cookies: Option<&str>,
+    ) -> Result<TrackMetadata, String> {
         let query_trimmed = query.trim();
 
-        // 1. Revisar caché en memoria
-        if let Some(entry) = self.cache.get(query_trimmed) {
-            let (meta, cached_at) = entry.value();
-            if cached_at.elapsed() < self.ttl {
-                info!(query = %query_trimmed, title = %meta.title, "Source resolver cache hit");
-                return Ok(meta.clone());
+        // 1. Revisar caché en memoria (si no se pasan opciones personalizadas que alteren la extracción)
+        if custom_extractor_args.is_none() && custom_extra_args.is_none() && custom_cookies.is_none() {
+            if let Some(entry) = self.cache.get(query_trimmed) {
+                let (meta, cached_at) = entry.value();
+                if cached_at.elapsed() < self.ttl {
+                    info!(query = %query_trimmed, title = %meta.title, "Source resolver cache hit");
+                    return Ok(meta.clone());
+                }
             }
         }
 
@@ -72,35 +80,100 @@ impl SourceResolver {
 
         info!(query = %query_trimmed, "Resolviendo stream CDN mediante yt-dlp...");
 
-        // 2. Extraer metadatos con yt-dlp en formato JSON (--dump-single-json)
-        // Usamos clientes TV e iOS para saltar el bloqueo de BotGuard (poToken)
         let mut cmd = Command::new("yt-dlp");
         cmd.arg("--no-playlist")
-            .arg("--format")
-            .arg("bestaudio/best")
-            .arg("--dump-single-json")
-            .arg("--default-search")
-            .arg("ytsearch:")
-            .arg("--remote-components")
-            .arg("ejs:github");
+            .arg("--dump-single-json");
 
-        // Configuración de POT Provider (BgUtils) si está activo en la red interna o local
-        let pot_provider_url = std::env::var("BGUTIL_POT_URL")
-            .unwrap_or_else(|_| "http://bgutil-pot:4416".to_string());
-        cmd.arg("--extractor-args")
-            .arg(format!("youtubepot-bgutilhttp:base_url={}", pot_provider_url));
+        // 1. Formato personalizable (default: bestaudio/best)
+        let format = std::env::var("YTDLP_FORMAT").unwrap_or_else(|_| "bestaudio/best".to_string());
+        cmd.arg("--format").arg(format);
 
-        // Soporte para archivo de cookies de YouTube (bypasses bot-detection en IPs de centros de datos)
-        let cookie_candidates = [
-            std::env::var("YOUTUBE_COOKIES_PATH").ok(),
-            Some("/app/cookies.txt".to_string()),
-            Some("cookies.txt".to_string()),
-        ];
-        for candidate in cookie_candidates.into_iter().flatten() {
-            if std::path::Path::new(&candidate).exists() {
-                info!(cookie_path = %candidate, "Utilizando cookies de YouTube para autenticación yt-dlp");
-                cmd.arg("--cookies").arg(candidate);
-                break;
+        // 2. Motor de búsqueda personalizable (default: ytsearch:)
+        let default_search = std::env::var("YTDLP_DEFAULT_SEARCH").unwrap_or_else(|_| "ytsearch:".to_string());
+        cmd.arg("--default-search").arg(default_search);
+
+        // 3. EJS Challenge solver (GitHub releases)
+        let remote_components = std::env::var("YTDLP_REMOTE_COMPONENTS").unwrap_or_else(|_| "ejs:github".to_string());
+        if !remote_components.is_empty() && remote_components != "none" {
+            cmd.arg("--remote-components").arg(remote_components);
+        }
+
+        // 4. Extractor Args personalizables (prioridad: payload > env YTDLP_EXTRACTOR_ARGS > bgutil-pot por defecto)
+        if let Some(args) = custom_extractor_args {
+            cmd.arg("--extractor-args").arg(args);
+        } else if let Ok(env_args) = std::env::var("YTDLP_EXTRACTOR_ARGS") {
+            cmd.arg("--extractor-args").arg(env_args);
+        } else {
+            let pot_provider_url = std::env::var("BGUTIL_POT_URL")
+                .unwrap_or_else(|_| "http://bgutil-pot:4416".to_string());
+            cmd.arg("--extractor-args")
+                .arg(format!("youtubepot-bgutilhttp:base_url={}", pot_provider_url));
+        }
+
+        // 5. Soporte flexible de Cookies (prioridad: payload > YTDLP_COOKIES texto/env > archivos)
+        let mut cookie_path_to_use: Option<String> = None;
+
+        if let Some(c) = custom_cookies {
+            let path = std::path::Path::new(c);
+            if path.exists() {
+                cookie_path_to_use = Some(c.to_string());
+            } else if c.contains('\n') || c.contains("# Netscape") || c.contains(".google.com") {
+                let temp_path = "/tmp/axaudio_custom_cookies.txt";
+                if let Ok(()) = tokio::fs::write(temp_path, c).await {
+                    cookie_path_to_use = Some(temp_path.to_string());
+                }
+            }
+        }
+
+        if cookie_path_to_use.is_none() {
+            if let Ok(env_cookies) = std::env::var("YTDLP_COOKIES").or_else(|_| std::env::var("YOUTUBE_COOKIES")) {
+                let trimmed = env_cookies.trim();
+                let path = std::path::Path::new(trimmed);
+                if path.exists() {
+                    cookie_path_to_use = Some(trimmed.to_string());
+                } else if trimmed.contains('\n') || trimmed.contains("# Netscape") || trimmed.contains(".google.com") {
+                    let temp_path = "/tmp/axaudio_env_cookies.txt";
+                    if let Ok(()) = tokio::fs::write(temp_path, trimmed).await {
+                        cookie_path_to_use = Some(temp_path.to_string());
+                    }
+                }
+            }
+        }
+
+        if cookie_path_to_use.is_none() {
+            let cookie_candidates = [
+                std::env::var("YTDLP_COOKIES_PATH").ok(),
+                std::env::var("YOUTUBE_COOKIES_PATH").ok(),
+                Some("/app/cookies.txt".to_string()),
+                Some("cookies.txt".to_string()),
+            ];
+            for candidate in cookie_candidates.into_iter().flatten() {
+                if std::path::Path::new(&candidate).exists() {
+                    cookie_path_to_use = Some(candidate);
+                    break;
+                }
+            }
+        }
+
+        if let Some(path) = cookie_path_to_use {
+            info!(cookie_path = %path, "Utilizando cookies para autenticación yt-dlp");
+            cmd.arg("--cookies").arg(path);
+        }
+
+        // 6. Argumentos adicionales libres (prioridad: env YTDLP_EXTRA_ARGS y custom_extra_args)
+        if let Ok(env_extra) = std::env::var("YTDLP_EXTRA_ARGS") {
+            for arg in env_extra.split_whitespace() {
+                if !arg.is_empty() {
+                    cmd.arg(arg);
+                }
+            }
+        }
+
+        if let Some(extra) = custom_extra_args {
+            for arg in extra.split_whitespace() {
+                if !arg.is_empty() {
+                    cmd.arg(arg);
+                }
             }
         }
 
