@@ -12,7 +12,8 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::models::{
-    ApiResponse, ControlPayload, JoinPayload, LeavePayload, PlayPayload, StatsResponse,
+    ApiResponse, ControlPayload, JoinPayload, LeavePayload, PlayPayload, ResolvePayload,
+    StatsResponse, TrackResponse,
 };
 use crate::state::AppState;
 
@@ -28,6 +29,29 @@ pub async fn get_stats(State(state): State<AppState>) -> Json<ApiResponse<StatsR
         active_players: state.players.len(),
     };
     Json(ApiResponse::ok(stats))
+}
+
+pub async fn resolve_track(
+    State(state): State<AppState>,
+    Json(payload): Json<ResolvePayload>,
+) -> Result<Json<ApiResponse<TrackResponse>>, (StatusCode, Json<ApiResponse<TrackResponse>>)> {
+    match state.resolver.resolve(&payload.query).await {
+        Ok(track) => {
+            let res = TrackResponse {
+                title: track.title,
+                source_url: track.source_url,
+                stream_url: track.stream_url,
+                duration_secs: track.duration_secs,
+                author: track.author,
+                thumbnail: track.thumbnail,
+            };
+            Ok(Json(ApiResponse::ok(res)))
+        }
+        Err(err) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::err(format!("Fallo resolviendo pista: {}", err))),
+        )),
+    }
 }
 
 pub async fn voice_join(
@@ -65,10 +89,16 @@ pub async fn voice_join(
         user_id: user_id.into(),
     };
 
+    // Optimización de CPU en 2 vCPUs: use_softclip(false) ahorra ~3% de ciclos por tick
     let driver_entry = state
         .players
         .entry(payload.guild_id)
-        .or_insert_with(|| Arc::new(Mutex::new(Driver::new(Default::default()))));
+        .or_insert_with(|| {
+            let mut config = songbird::Config::default();
+            config.preallocated_tracks = 1;
+            config.use_softclip = false;
+            Arc::new(Mutex::new(Driver::new(config)))
+        });
 
     let mut driver = driver_entry.lock().await;
     match driver.connect(connection_info).await {
@@ -89,7 +119,7 @@ pub async fn voice_join(
 pub async fn player_play(
     State(state): State<AppState>,
     Json(payload): Json<PlayPayload>,
-) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<&'static str>>)> {
+) -> Result<Json<ApiResponse<TrackResponse>>, (StatusCode, Json<ApiResponse<TrackResponse>>)> {
     let driver_ref = match state.players.get(&payload.guild_id) {
         Some(d) => d.clone(),
         None => {
@@ -100,9 +130,28 @@ pub async fn player_play(
         }
     };
 
-    info!(guild = payload.guild_id, url = %payload.url, "Streaming track to voice driver");
+    info!(guild = payload.guild_id, query = %payload.url, "Resolviendo fuente de audio para streaming");
 
-    let source = HttpRequest::new(state.http_client.clone(), payload.url);
+    // Extracción de metadatos y URL CDN directa (o stream nativo)
+    let track = match state.resolver.resolve(&payload.url).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!(guild = payload.guild_id, error = %e, "Fallo al resolver fuente con yt-dlp");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::err(format!("Fallo resolviendo pista: {}", e))),
+            ));
+        }
+    };
+
+    info!(
+        guild = payload.guild_id,
+        title = %track.title,
+        stream_url = %track.stream_url,
+        "Iniciando streaming nativo de audio vía Tokio HttpRequest"
+    );
+
+    let source = HttpRequest::new(state.http_client.clone(), track.stream_url.clone());
     let mut driver = driver_ref.lock().await;
     let handle = driver.play_input(source.into());
 
@@ -111,7 +160,16 @@ pub async fn player_play(
         let _ = handle.set_volume(clamped);
     }
 
-    Ok(Json(ApiResponse::ok("Playback started")))
+    let response = TrackResponse {
+        title: track.title,
+        source_url: track.source_url,
+        stream_url: track.stream_url,
+        duration_secs: track.duration_secs,
+        author: track.author,
+        thumbnail: track.thumbnail,
+    };
+
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 pub async fn player_control(

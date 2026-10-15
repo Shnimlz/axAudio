@@ -1,5 +1,6 @@
 mod handlers;
 mod models;
+mod sources;
 mod state;
 
 use axum::{
@@ -11,8 +12,24 @@ use std::net::SocketAddr;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Sintonización de CPU para entornos VPS con 2 vCPUs:
+    // Limitar worker_threads a 2 y max_blocking_threads a 4 para prevenir contención de cores
+    let worker_threads = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(2);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(4)
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -28,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/v1/stats", get(handlers::get_stats))
+        .route("/v1/tracks/resolve", post(handlers::resolve_track))
         .route("/v1/voice/join", post(handlers::voice_join))
         .route("/v1/voice/leave", post(handlers::voice_leave))
         .route("/v1/player/play", post(handlers::player_play))

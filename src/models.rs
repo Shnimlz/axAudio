@@ -72,6 +72,21 @@ pub struct LeavePayload {
     pub guild_id: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ResolvePayload {
+    pub query: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrackResponse {
+    pub title: String,
+    pub source_url: String,
+    pub stream_url: String,
+    pub duration_secs: Option<u64>,
+    pub author: Option<String>,
+    pub thumbnail: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StatsResponse {
     pub status: &'static str,

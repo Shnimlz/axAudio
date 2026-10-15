@@ -35,10 +35,14 @@ FROM debian:bookworm-slim AS runner
 # - ca-certificates: esencial para streaming HTTPS de audios
 # - libopus0: librería compartida de códec de audio
 # - curl: para el healthcheck de Docker/Coolify
+# - python3 & yt-dlp: extractor de audio y resolución de URLs CDN directas
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libopus0 \
     curl \
+    python3 \
+    && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp \
     && rm -rf /var/lib/apt/lists/*
 
 # Seguridad: crear usuario no root
