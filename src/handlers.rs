@@ -224,6 +224,34 @@ pub async fn player_play(
             );
 
             for item in remaining {
+                // 1. Control de saturación de CPU y Buffer de cola:
+                // Si la cola de Songbird ya tiene 3 o más pistas listas, pausar la resolución
+                // hasta que la reproducción avance, evitando quemar CPU innecesariamente.
+                loop {
+                    let current_epoch = epochs
+                        .get(&guild_id)
+                        .map(|e| e.load(std::sync::atomic::Ordering::SeqCst))
+                        .unwrap_or(0);
+                    if current_epoch != epoch {
+                        info!(guild = guild_id, "Carga de playlist en segundo plano cancelada");
+                        return;
+                    }
+
+                    let in_queue = {
+                        let d = driver_clone.lock().await;
+                        d.queue().len()
+                    };
+
+                    if in_queue < 3 {
+                        break;
+                    }
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+                }
+
+                // 2. Cooldown para respirar la CPU entre llamadas a yt-dlp
+                tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+
                 // Verificar si la sesión fue detenida o reemplazada
                 let current_epoch = epochs
                     .get(&guild_id)
@@ -407,7 +435,6 @@ pub async fn player_control(
         }
         "skip" => {
             let _ = driver.queue().skip();
-            driver.stop();
             Ok(Json(ApiResponse::ok("Track skipped")))
         }
         "clear" => {
@@ -416,9 +443,7 @@ pub async fn player_control(
             driver.queue().modify_queue(|q| {
                 if q.len() > 1 {
                     let first = q.pop_front().unwrap();
-                    for track in q.drain(..) {
-                        let _ = track.stop();
-                    }
+                    q.clear();
                     q.push_front(first);
                 }
             });

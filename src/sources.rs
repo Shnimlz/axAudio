@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -53,6 +54,7 @@ pub struct SourceResolver {
     cache: Arc<DashMap<String, (TrackMetadata, Instant)>>,
     ttl: Duration,
     cookie_rotation_index: Arc<AtomicUsize>,
+    process_semaphore: Arc<Semaphore>,
 }
 
 impl SourceResolver {
@@ -61,6 +63,7 @@ impl SourceResolver {
             cache: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(3600 * 4), // 4 horas de TTL para streams de audio
             cookie_rotation_index: Arc::new(AtomicUsize::new(0)),
+            process_semaphore: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -181,6 +184,7 @@ impl SourceResolver {
         cookie_path: Option<&str>,
     ) -> Result<FlatPlaylist, String> {
         let query_trimmed = query.trim();
+        let _permit = self.process_semaphore.acquire().await.map_err(|e| format!("Fallo adquiriendo semáforo de proceso para flat-playlist: {}", e))?;
         let mut cmd = Command::new("yt-dlp");
         cmd.arg("--flat-playlist");
         cmd.arg("--dump-single-json");
@@ -310,6 +314,7 @@ impl SourceResolver {
         cookie_path: Option<&str>,
     ) -> Result<TrackMetadata, String> {
         let query_trimmed = query.trim();
+        let _permit = self.process_semaphore.acquire().await.map_err(|e| format!("Fallo adquiriendo semáforo de proceso para pista individual: {}", e))?;
         let mut cmd = Command::new("yt-dlp");
         cmd.arg("--no-playlist");
         cmd.arg("--dump-single-json");
@@ -596,14 +601,9 @@ impl SourceResolver {
         // Si el enlace ya contiene un video ID específico (ej. watch?v=XYZ&list=RDXYZ),
         // resolvemos la primera canción Y la lista plana EN PARALELO mediante tokio::join!
         if let Some(first_video_url) = Self::extract_video_url(query_trimmed) {
-            info!(v_url = %first_video_url, "Extrayendo primera pista y lista plana en paralelo con tokio::join!...");
-            let (single_res, flat_res) = tokio::join!(
-                self.resolve_single(&first_video_url, custom_extractor_args, custom_extra_args, custom_cookies),
-                self.resolve_flat_playlist(query_trimmed, custom_extractor_args, custom_extra_args, custom_cookies)
-            );
-
-            let first_track = single_res?;
-            let flat_playlist = flat_res?;
+            info!(v_url = %first_video_url, "Extrayendo primera pista y lista plana de forma secuencial y controlada...");
+            let first_track = self.resolve_single(&first_video_url, custom_extractor_args, custom_extra_args, custom_cookies).await?;
+            let flat_playlist = self.resolve_flat_playlist(query_trimmed, custom_extractor_args, custom_extra_args, custom_cookies).await?;
 
             let mut remaining = flat_playlist.entries;
             // Remover la primera canción de los pendientes para no duplicar
