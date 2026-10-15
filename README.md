@@ -13,7 +13,8 @@ A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#-quick-start)
+[![Docker Image](https://img.shields.io/badge/ghcr.io-axaudio-blue?logo=docker&logoColor=white)](https://github.com/Shnimlz/axAudio/pkgs/container/axaudio)
+[![Release](https://img.shields.io/github/v/release/Shnimlz/axAudio?logo=github&color=2ea44f)](https://github.com/Shnimlz/axAudio/releases)
 [![Songbird](https://img.shields.io/badge/songbird-0.4-blueviolet)](https://github.com/serenity-rs/songbird)
 [![Stars](https://img.shields.io/github/stars/Shnimlz/axAudio?style=flat&logo=github)](https://github.com/Shnimlz/axAudio/stargazers)
 [![Issues](https://img.shields.io/github/issues/Shnimlz/axAudio)](https://github.com/Shnimlz/axAudio/issues)
@@ -93,44 +94,63 @@ flowchart LR
 
 ## 🚀 Quick Start
 
-The fastest and most reliable way to run `axAudio` is Docker Compose.
+You can run `axAudio` either using **instant pre-built Docker images** from GitHub Container Registry (zero compile time) or by **building from source** using the included multi-stage `Dockerfile`.
 
-**1. Clone the repo**
+### 🍪 1. Export your YouTube cookies
 
-```bash
-git clone https://github.com/YOUR_USER/axAudio.git
-cd axAudio
-```
+Before launching, prepare your cookies for the YouTube anti-bot bypass:
 
-**2. Export your YouTube cookies**
-
-1. Log into YouTube in a desktop browser (preferably with a secondary / throwaway Google account).
-2. Export your cookies in Netscape format with an extension such as **Get cookies.txt LOCALLY** (Chrome / Firefox).
-3. Save the file as `cookies.txt` in the project root.
-4. On Linux / VPS, give `yt-dlp` write access so it can persist refreshed session tokens:
+1. Log into YouTube in a desktop browser (preferably a secondary / throwaway Google account).
+2. Export your cookies in Netscape format with an extension like **Get cookies.txt LOCALLY** (Chrome / Firefox).
+3. Save the file as `cookies.txt` (or a directory `./cookies/*.txt` for multi-account pool).
+4. On Linux / VPS, grant write permissions so `yt-dlp` can persist refreshed session tokens:
 
    ```bash
    chmod 666 cookies.txt
    ```
 
-**3. Start the stack**
+---
+
+### ⚡ Option A: Instant Pre-built Image (Recommended)
+
+Pre-built multi-arch (`linux/amd64`, `linux/arm64`) images are published to **GitHub Container Registry** on every release. You don't need Rust or C++ toolchains installed.
+
+#### With Docker Compose
+
+Create a `docker-compose.yml`:
+
+```yaml
+services:
+  axaudio:
+    image: ghcr.io/shnimlz/axaudio:latest
+    container_name: axaudio
+    restart: unless-stopped
+    ports:
+      - "2333:2333"
+    environment:
+      - PORT=2333
+      - BGUTIL_POT_URL=http://bgutil-pot:4416
+      - TOKIO_WORKER_THREADS=2
+    volumes:
+      - ./cookies.txt:/app/cookies.txt:rw
+    depends_on:
+      - bgutil-pot
+
+  bgutil-pot:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-pot
+    restart: unless-stopped
+    ports:
+      - "4416:4416"
+```
+
+Start the stack:
 
 ```bash
 docker compose up -d
 ```
 
-This launches both `axAudio` and the `bgutil-pot` PoToken sidecar.
-
-**4. Check that it's alive**
-
-```bash
-curl http://localhost:2333/health
-```
-
-<details>
-<summary><b>🐋 Run as standalone Docker containers (without Compose)</b></summary>
-
-<br>
+#### With Docker CLI
 
 ```bash
 # 1. Start the PoToken provider sidecar
@@ -140,21 +160,49 @@ docker run -d \
   -p 4416:4416 \
   brainicism/bgutil-ytdlp-pot-provider:latest
 
-# 2. Build axAudio
-docker build -t axaudio .
-
-# 3. Run axAudio mounting your cookies.txt
+# 2. Run pre-built axAudio
 docker run -d \
   --name axaudio \
   --restart unless-stopped \
   -p 2333:2333 \
   -e PORT=2333 \
   -e BGUTIL_POT_URL=http://host.docker.internal:4416 \
-  -v $(pwd)/cookies.txt:/app/cookies.txt \
-  axaudio
+  -v $(pwd)/cookies.txt:/app/cookies.txt:rw \
+  ghcr.io/shnimlz/axaudio:latest
 ```
 
-</details>
+> [!TIP]
+> You can pin a specific release version using `ghcr.io/shnimlz/axaudio:1.1.X` (e.g. `1.1.28`) or use `latest` for the most recent build.
+
+---
+
+### 🛠️ Option B: Build from Source (Coolify, Git, Custom Builds)
+
+The repository includes a self-contained multi-stage `Dockerfile`. Use this if you are deploying directly from a Git repository in **Coolify** or if you wish to modify the Rust codebase.
+
+```bash
+git clone https://github.com/Shnimlz/axAudio.git
+cd axAudio
+docker compose up -d --build
+```
+
+#### Deploying in Coolify:
+1. **New Resource** &rarr; **Public Repository** &rarr; `https://github.com/Shnimlz/axAudio` (branch `master`).
+2. **Build Pack**: Select **`Dockerfile`**.
+3. **Ports Exposes**: `2333`.
+4. **Persistent Storage**: Mount your host cookies volume to `/app/cookies.txt` or `/app/cookies`.
+5. **Environment Variables**: Set `BGUTIL_POT_URL` to your sidecar internal URL.
+
+---
+
+### ✅ Verify Deployment
+
+Check that the server is up and inspect runtime stats:
+
+```bash
+curl http://localhost:2333/health
+curl http://localhost:2333/v1/stats
+```
 
 ## 💻 Running on Bare Metal
 
@@ -294,6 +342,7 @@ Content-Type: application/json
   "guild_id": "123456789012345678",
   "url": "https://www.youtube.com/watch?v=GitbDhOPBGs",
   "volume": 1.0,
+  "format": "ba[format_id=251]/bestaudio",
   "extractor_args": null,
   "extra_args": null,
   "cookies": null
@@ -305,6 +354,7 @@ Content-Type: application/json
 | `guild_id`       |    ✅    | Target guild.                                                                                     |
 | `url`            |    ✅    | Direct stream (`.mp3`, `.ogg`, ...), YouTube URL, or search query (e.g. `ytsearch:lofi hip hop`). |
 | `volume`         |          | Float from `0.0` to `2.0` (default `1.0`).                                                        |
+| `format`         |          | Audio codec/format override (e.g. `ba[format_id=251]/bestaudio`, `flac/bestaudio/opus`).          |
 | `extractor_args` |          | Per-request override for `yt-dlp --extractor-args`.                                               |
 | `extra_args`     |          | Per-request extra CLI flags for `yt-dlp`.                                                         |
 | `cookies`        |          | Per-request Netscape cookies text or file path.                                                   |
@@ -523,7 +573,7 @@ async function skipTrack(guildId: string) {
 - [x] Custom codec / format configuration per-request (`format: "flac/bestaudio/opus"`)
 - [ ] Seek / position control
 
-Have an idea? [Open an issue](https://github.com/YOUR_USER/axAudio/issues).
+Have an idea? [Open an issue](https://github.com/Shnimlz/axAudio/issues).
 
 ---
 
@@ -539,7 +589,7 @@ Contributions, issues and feature requests are welcome.
 
 If `axAudio` saves you RAM (and money), consider leaving a ⭐. It helps a lot.
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Shnimlz/axAudio&type=Date)](https://star-history.com/#YOUR_USER/axAudio&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Shnimlz/axAudio&type=Date)](https://star-history.com/#Shnimlz/axAudio&Date)
 
 ---
 
