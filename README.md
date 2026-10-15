@@ -509,7 +509,7 @@ Contributions, issues and feature requests are welcome.
 
 If `axAudio` saves you RAM (and money), consider leaving a ⭐. It helps a lot.
 
-[![Star History Chart](https://api.star-history.com/svg?repos=YOUR_USER/axAudio&type=Date)](https://star-history.com/#YOUR_USER/axAudio&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Shnimlz/axAudio&type=Date)](https://star-history.com/#YOUR_USER/axAudio&Date)
 
 ---
 
