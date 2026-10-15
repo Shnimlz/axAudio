@@ -43,13 +43,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     unzip \
     python3 \
+    python3-pip \
     && ARCH=$(uname -m) \
     && if [ "$ARCH" = "aarch64" ]; then DENO_ARCH="aarch64"; else DENO_ARCH="x86_64"; fi \
     && curl -fsSL "https://github.com/denoland/deno/releases/latest/download/deno-${DENO_ARCH}-unknown-linux-gnu.zip" -o /tmp/deno.zip \
     && unzip /tmp/deno.zip -d /usr/local/bin \
     && rm /tmp/deno.zip \
-    && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
-    && chmod a+rx /usr/local/bin/yt-dlp /usr/local/bin/deno \
+    && pip install --break-system-packages -U yt-dlp bgutil-ytdlp-pot-provider \
+    && chmod a+rx /usr/local/bin/deno \
     && apt-get purge -y unzip \
     && rm -rf /var/lib/apt/lists/*
 

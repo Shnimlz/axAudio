@@ -81,8 +81,28 @@ impl SourceResolver {
             .arg("--dump-single-json")
             .arg("--default-search")
             .arg("ytsearch:")
-            .arg("--extractor-args")
-            .arg("youtube:player_client=tv,tv_embedded,ios,web");
+            .arg("--remote-components")
+            .arg("ejs:github");
+
+        // Configuración de POT Provider (BgUtils) si está activo en la red interna o local
+        let pot_provider_url = std::env::var("BGUTIL_POT_URL")
+            .unwrap_or_else(|_| "http://bgutil-pot:4416".to_string());
+        cmd.arg("--extractor-args")
+            .arg(format!("youtubepot-bgutilhttp:base_url={}", pot_provider_url));
+
+        // Soporte para archivo de cookies de YouTube (bypasses bot-detection en IPs de centros de datos)
+        let cookie_candidates = [
+            std::env::var("YOUTUBE_COOKIES_PATH").ok(),
+            Some("/app/cookies.txt".to_string()),
+            Some("cookies.txt".to_string()),
+        ];
+        for candidate in cookie_candidates.into_iter().flatten() {
+            if std::path::Path::new(&candidate).exists() {
+                info!(cookie_path = %candidate, "Utilizando cookies de YouTube para autenticación yt-dlp");
+                cmd.arg("--cookies").arg(candidate);
+                break;
+            }
+        }
 
         cmd.arg(query_trimmed);
 
