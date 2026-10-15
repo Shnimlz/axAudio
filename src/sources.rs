@@ -482,109 +482,81 @@ impl SourceResolver {
             });
         }
 
-        // Función auxiliar interna para failover a SoundCloud en búsquedas
-        let attempt_sc_fallback = |e: &str| async move {
-            let is_url = query_trimmed.starts_with("http://") || query_trimmed.starts_with("https://");
-            let has_other_prefix = query_trimmed.starts_with("scsearch:") || query_trimmed.starts_with("bcsearch:");
+        // 3. Intento primario con cookie personalizada o pool
+        let primary_result = if let Some(c) = custom_cookies {
+            self.run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(c), custom_format).await
+        } else {
+            let cookie_pool = self.get_available_cookie_pool().await;
+            if cookie_pool.is_empty() {
+                self.run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, None, custom_format).await
+            } else {
+                let total = cookie_pool.len();
+                let start_idx = self.cookie_rotation_index.fetch_add(1, Ordering::Relaxed) % total;
+                let mut last_err = String::new();
+                let mut resolved = None;
 
-            if !is_url && !has_other_prefix {
-                let clean_query = query_trimmed.strip_prefix("ytsearch:").unwrap_or(query_trimmed);
-                let sc_query = format!("scsearch:{}", clean_query);
-                warn!(
-                    yt_error = %e,
-                    sc_query = %sc_query,
-                    "YouTube falló o fue bloqueado; ejecutando failover automático a SoundCloud..."
-                );
-
-                match self
-                    .run_single_track_cmd(&sc_query, custom_extractor_args, custom_extra_args, None, custom_format)
-                    .await
-                {
-                    Ok(sc_meta) => {
-                        info!(title = %sc_meta.title, "Pista resuelta exitosamente mediante failover de SoundCloud");
-                        return Ok(sc_meta);
-                    }
-                    Err(sc_err) => {
-                        warn!(sc_error = %sc_err, "Failover a SoundCloud también falló");
+                for i in 0..total {
+                    let idx = (start_idx + i) % total;
+                    let cookie_file = &cookie_pool[idx];
+                    match self
+                        .run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(cookie_file), custom_format)
+                        .await
+                    {
+                        Ok(meta) => {
+                            resolved = Some(meta);
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(cookie_file = %cookie_file, error = %e, "Cookie falló para pista, reintentando...");
+                            last_err = e;
+                        }
                     }
                 }
+
+                match resolved {
+                    Some(m) => Ok(m),
+                    None => Err(format!("Todas las cookies del pool fallaron resolviendo la pista. Último error: {}", last_err)),
+                }
             }
-            Err(e.to_string())
         };
 
-        // 3. Cookie personalizada
-        if let Some(c) = custom_cookies {
-            match self
-                .run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(c), custom_format)
-                .await
-            {
-                Ok(meta) => {
-                    self.cache.insert(cache_key, (meta.clone(), Instant::now()));
-                    return Ok(meta);
-                }
-                Err(e) => {
-                    let fallback_res = attempt_sc_fallback(&e).await;
-                    if let Ok(meta) = fallback_res {
-                        self.cache.insert(cache_key, (meta.clone(), Instant::now()));
-                        return Ok(meta);
+        match primary_result {
+            Ok(meta) => {
+                self.cache.insert(cache_key, (meta.clone(), Instant::now()));
+                Ok(meta)
+            }
+            Err(e) => {
+                // Cascading failover: Si no es una URL directa (o es búsqueda) y falló en YouTube, intentar SoundCloud
+                let is_url = query_trimmed.starts_with("http://") || query_trimmed.starts_with("https://");
+                let has_other_prefix = query_trimmed.starts_with("scsearch:") || query_trimmed.starts_with("bcsearch:");
+
+                if !is_url && !has_other_prefix {
+                    let clean_query = query_trimmed.strip_prefix("ytsearch:").unwrap_or(query_trimmed);
+                    let sc_query = format!("scsearch:{}", clean_query);
+                    warn!(
+                        yt_error = %e,
+                        sc_query = %sc_query,
+                        "YouTube falló o fue bloqueado; ejecutando failover automático a SoundCloud..."
+                    );
+
+                    match self
+                        .run_single_track_cmd(&sc_query, custom_extractor_args, custom_extra_args, None, custom_format)
+                        .await
+                    {
+                        Ok(sc_meta) => {
+                            info!(title = %sc_meta.title, "Pista resuelta exitosamente mediante failover de SoundCloud");
+                            self.cache.insert(cache_key, (sc_meta.clone(), Instant::now()));
+                            return Ok(sc_meta);
+                        }
+                        Err(sc_err) => {
+                            warn!(sc_error = %sc_err, "Failover a SoundCloud también falló");
+                        }
                     }
-                    return Err(e);
                 }
+
+                Err(e)
             }
         }
-
-        // 4. Pool de cookies
-        let cookie_pool = self.get_available_cookie_pool().await;
-        if cookie_pool.is_empty() {
-            match self
-                .run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, None, custom_format)
-                .await
-            {
-                Ok(meta) => {
-                    self.cache.insert(cache_key, (meta.clone(), Instant::now()));
-                    return Ok(meta);
-                }
-                Err(e) => {
-                    let fallback_res = attempt_sc_fallback(&e).await;
-                    if let Ok(meta) = fallback_res {
-                        self.cache.insert(cache_key, (meta.clone(), Instant::now()));
-                        return Ok(meta);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        let total = cookie_pool.len();
-        let start_idx = self.cookie_rotation_index.fetch_add(1, Ordering::Relaxed) % total;
-        let mut last_err = String::new();
-
-        for i in 0..total {
-            let idx = (start_idx + i) % total;
-            let cookie_file = &cookie_pool[idx];
-            match self
-                .run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(cookie_file), custom_format)
-                .await
-            {
-                Ok(meta) => {
-                    self.cache.insert(cache_key, (meta.clone(), Instant::now()));
-                    return Ok(meta);
-                }
-                Err(e) => {
-                    warn!(cookie_file = %cookie_file, error = %e, "Cookie falló para pista, reintentando...");
-                    last_err = e;
-                }
-            }
-        }
-
-        // Si todas las cookies del pool fallaron, intentar failover a SoundCloud antes de tirar error
-        let fallback_res = attempt_sc_fallback(&last_err).await;
-        if let Ok(meta) = fallback_res {
-            self.cache.insert(cache_key, (meta.clone(), Instant::now()));
-            return Ok(meta);
-        }
-
-        Err(format!("Todas las cookies del pool fallaron resolviendo la pista. Último error: {}", last_err))
     }
 
     /// Resuelve la lista plana de una playlist / mix con límite opcional y rotación de cookies
