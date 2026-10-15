@@ -1,3 +1,4 @@
+<div align="center">
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/light.svg">
@@ -26,8 +27,9 @@ A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 |  📦 Binary  |    🧠 RAM    | 🚀 Startup |    🎚️ Transport     |
 | :---------: | :----------: | :--------: | :-----------------: |
 | **~8.4 MB** | **~8–15 MB** | **< 5 ms** | **50 Hz RTP / UDP** |
-
 </div>
+
+<br>
 
 ## 📖 Table of Contents
 
