@@ -12,7 +12,7 @@ A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#-quick-start)
 [![Songbird](https://img.shields.io/badge/songbird-0.4-blueviolet)](https://github.com/serenity-rs/songbird)
-[![Stars](https://img.shields.io/github/stars/Shnimlz/axAudio?style=flat&logo=github)](https://github.com/YOUR_USER/axAudio/stargazers)
+[![Stars](https://img.shields.io/github/stars/Shnimlz/axAudio?style=flat&logo=github)](https://github.com/Shnimlz/axAudio/stargazers)
 [![Issues](https://img.shields.io/github/issues/Shnimlz/axAudio)](https://github.com/Shnimlz/axAudio/issues)
 
 [**Quick Start**](#-quick-start) ·
@@ -23,8 +23,8 @@ A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 
 <br>
 
-| 📦 Binary | 🧠 RAM | 🚀 Startup | 🎚️ Transport |
-| :---: | :---: | :---: | :---: |
+|  📦 Binary  |    🧠 RAM    | 🚀 Startup |    🎚️ Transport     |
+| :---------: | :----------: | :--------: | :-----------------: |
 | **~8.4 MB** | **~8–15 MB** | **< 5 ms** | **50 Hz RTP / UDP** |
 
 </div>
@@ -53,14 +53,14 @@ A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 
 Running Lavalink means running a JVM. On a small VPS that is most of your RAM gone before a single song plays. **axAudio** does the same job as a single Rust binary that starts instantly and sips memory, so a 1 vCPU free-tier box can serve voice comfortably.
 
-| | **axAudio** | **Lavalink** |
-| :--- | :---: | :---: |
-| Language | Rust | Java |
-| Memory footprint | **~8–15 MB** | 1.5 GB+ |
-| Startup | **< 5 ms** | JVM warm-up |
-| Artifact | **~8.4 MB binary** | JVM + JAR |
-| Garbage collector | **None** | Yes |
-| Built-in YouTube anti-bot (PoToken, cookie pool) | ✅ | Plugin-dependent |
+|                                                  |    **axAudio**     |   **Lavalink**   |
+| :----------------------------------------------- | :----------------: | :--------------: |
+| Language                                         |        Rust        |       Java       |
+| Memory footprint                                 |    **~8–15 MB**    |     1.5 GB+      |
+| Startup                                          |     **< 5 ms**     |   JVM warm-up    |
+| Artifact                                         | **~8.4 MB binary** |    JVM + JAR     |
+| Garbage collector                                |      **None**      |       Yes        |
+| Built-in YouTube anti-bot (PoToken, cookie pool) |         ✅         | Plugin-dependent |
 
 ---
 
@@ -173,15 +173,15 @@ docker run -d \
 
 <br>
 
-| Requirement | Install |
-| :--- | :--- |
-| **Rust & Cargo** 1.80+ | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| **Build tools & Opus** (Ubuntu / Debian) | `sudo apt install -y cmake pkg-config libopus-dev python3 python3-pip` |
-| **Build tools & Opus** (macOS) | `brew install cmake opus python` |
-| **Build tools & Opus** (Windows) | Install [CMake](https://cmake.org/download/) and [Python 3](https://www.python.org/), and make sure Opus is in your `PATH` (or use `vcpkg`) |
-| **Deno 2+** (Linux / macOS) | `curl -fsSL https://deno.land/install.sh \| sh` |
-| **Deno 2+** (Windows) | `irm https://deno.land/install.ps1 \| iex` |
-| **Python packages** | `pip install -U yt-dlp bgutil-ytdlp-pot-provider` |
+| Requirement                              | Install                                                                                                                                     |
+| :--------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Rust & Cargo** 1.80+                   | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh`                                                                           |
+| **Build tools & Opus** (Ubuntu / Debian) | `sudo apt install -y cmake pkg-config libopus-dev python3 python3-pip`                                                                      |
+| **Build tools & Opus** (macOS)           | `brew install cmake opus python`                                                                                                            |
+| **Build tools & Opus** (Windows)         | Install [CMake](https://cmake.org/download/) and [Python 3](https://www.python.org/), and make sure Opus is in your `PATH` (or use `vcpkg`) |
+| **Deno 2+** (Linux / macOS)              | `curl -fsSL https://deno.land/install.sh \| sh`                                                                                             |
+| **Deno 2+** (Windows)                    | `irm https://deno.land/install.ps1 \| iex`                                                                                                  |
+| **Python packages**                      | `pip install -U yt-dlp bgutil-ytdlp-pot-provider`                                                                                           |
 
 </details>
 
@@ -210,22 +210,22 @@ cargo build --release
 
 Everything is configurable through environment variables or a `.env` file.
 
-| Variable | Default | Description |
-| :--- | :--- | :--- |
-| `PORT` | `2333` | HTTP server listening port. |
-| `AUDIO_BITRATE` | `128000` | Opus bitrate in bps (e.g. `128000`, `192000`, `256000`, `384000`). |
-| `RUST_LOG` | `axAudio=info,tower_http=info` | Tracing log level filter. |
-| `TOKIO_WORKER_THREADS` | `2` | Tokio worker threads (recommended: your vCPU count). |
-| `BGUTIL_POT_URL` | `http://bgutil-pot:4416` | URL of the Proof-of-Origin token sidecar. |
-| `YTDLP_COOKIES_DIR` | `/app/cookies`, `./cookies` | Directory with multiple `.txt` cookie files for round-robin rotation. |
-| `YTDLP_COOKIES_POOL` | _none_ | Comma-separated list of cookie file paths. |
-| `YTDLP_COOKIES_PATH` | `/app/cookies.txt`, `./cookies.txt` | Single Netscape `cookies.txt` fallback. |
-| `YTDLP_COOKIES` | _none_ | Raw Netscape cookie content or path override. |
-| `YTDLP_FORMAT` | `ba[format_id=251]/ba[acodec=opus]...` | Prefers YouTube's native 48 kHz Opus stream (format 251). |
-| `YTDLP_DEFAULT_SEARCH` | `ytsearch:` | Search provider prefix for text queries. |
-| `YTDLP_REMOTE_COMPONENTS` | `ejs:github` | EJS remote solver source. Set to `none` to disable. |
-| `YTDLP_EXTRACTOR_ARGS` | _auto (bgutil)_ | Custom `--extractor-args` flags for `yt-dlp`. |
-| `YTDLP_EXTRA_ARGS` | _none_ | Extra flags forwarded directly to `yt-dlp`. |
+| Variable                  | Default                                | Description                                                           |
+| :------------------------ | :------------------------------------- | :-------------------------------------------------------------------- |
+| `PORT`                    | `2333`                                 | HTTP server listening port.                                           |
+| `AUDIO_BITRATE`           | `128000`                               | Opus bitrate in bps (e.g. `128000`, `192000`, `256000`, `384000`).    |
+| `RUST_LOG`                | `axAudio=info,tower_http=info`         | Tracing log level filter.                                             |
+| `TOKIO_WORKER_THREADS`    | `2`                                    | Tokio worker threads (recommended: your vCPU count).                  |
+| `BGUTIL_POT_URL`          | `http://bgutil-pot:4416`               | URL of the Proof-of-Origin token sidecar.                             |
+| `YTDLP_COOKIES_DIR`       | `/app/cookies`, `./cookies`            | Directory with multiple `.txt` cookie files for round-robin rotation. |
+| `YTDLP_COOKIES_POOL`      | _none_                                 | Comma-separated list of cookie file paths.                            |
+| `YTDLP_COOKIES_PATH`      | `/app/cookies.txt`, `./cookies.txt`    | Single Netscape `cookies.txt` fallback.                               |
+| `YTDLP_COOKIES`           | _none_                                 | Raw Netscape cookie content or path override.                         |
+| `YTDLP_FORMAT`            | `ba[format_id=251]/ba[acodec=opus]...` | Prefers YouTube's native 48 kHz Opus stream (format 251).             |
+| `YTDLP_DEFAULT_SEARCH`    | `ytsearch:`                            | Search provider prefix for text queries.                              |
+| `YTDLP_REMOTE_COMPONENTS` | `ejs:github`                           | EJS remote solver source. Set to `none` to disable.                   |
+| `YTDLP_EXTRACTOR_ARGS`    | _auto (bgutil)_                        | Custom `--extractor-args` flags for `yt-dlp`.                         |
+| `YTDLP_EXTRA_ARGS`        | _none_                                 | Extra flags forwarded directly to `yt-dlp`.                           |
 
 ---
 
@@ -233,17 +233,16 @@ Everything is configurable through environment variables or a `.env` file.
 
 All endpoints accept and return JSON. Snowflake IDs (`guild_id`, `channel_id`, `user_id`) can be numbers or numeric strings.
 
-| Method | Endpoint | Description |
-| :---: | :--- | :--- |
-| `GET` | `/health` · `/v1/stats` | Health check and runtime stats |
-| `POST` | `/v1/voice/join` | Connect to a voice channel |
-| `POST` | `/v1/voice/leave` | Disconnect from a voice channel |
-| `POST` | `/v1/player/play` | Enqueue a URL or search query |
-| `POST` | `/v1/player/control` | Pause, resume, skip, stop, volume |
-| `POST` | `/v1/player/queue` | Inspect current track and upcoming queue |
-| `POST` | `/v1/tracks/resolve` | Resolve metadata and stream URL without playing |
-| `WS` | `/v1/events` | Real-time WebSocket player events (track start / end / error) |
-
+| Method | Endpoint                | Description                                                   |
+| :----: | :---------------------- | :------------------------------------------------------------ |
+| `GET`  | `/health` · `/v1/stats` | Health check and runtime stats                                |
+| `POST` | `/v1/voice/join`        | Connect to a voice channel                                    |
+| `POST` | `/v1/voice/leave`       | Disconnect from a voice channel                               |
+| `POST` | `/v1/player/play`       | Enqueue a URL or search query                                 |
+| `POST` | `/v1/player/control`    | Pause, resume, skip, stop, volume                             |
+| `POST` | `/v1/player/queue`      | Inspect current track and upcoming queue                      |
+| `POST` | `/v1/tracks/resolve`    | Resolve metadata and stream URL without playing               |
+|  `WS`  | `/v1/events`            | Real-time WebSocket player events (track start / end / error) |
 
 <details>
 <summary><b>Health check & stats</b></summary>
@@ -314,14 +313,14 @@ Content-Type: application/json
 }
 ```
 
-| Field | Required | Description |
-| :--- | :---: | :--- |
-| `guild_id` | ✅ | Target guild. |
-| `url` | ✅ | Direct stream (`.mp3`, `.ogg`, ...), YouTube URL, or search query (e.g. `ytsearch:lofi hip hop`). |
-| `volume` | | Float from `0.0` to `2.0` (default `1.0`). |
-| `extractor_args` | | Per-request override for `yt-dlp --extractor-args`. |
-| `extra_args` | | Per-request extra CLI flags for `yt-dlp`. |
-| `cookies` | | Per-request Netscape cookies text or file path. |
+| Field            | Required | Description                                                                                       |
+| :--------------- | :------: | :------------------------------------------------------------------------------------------------ |
+| `guild_id`       |    ✅    | Target guild.                                                                                     |
+| `url`            |    ✅    | Direct stream (`.mp3`, `.ogg`, ...), YouTube URL, or search query (e.g. `ytsearch:lofi hip hop`). |
+| `volume`         |          | Float from `0.0` to `2.0` (default `1.0`).                                                        |
+| `extractor_args` |          | Per-request override for `yt-dlp --extractor-args`.                                               |
+| `extra_args`     |          | Per-request extra CLI flags for `yt-dlp`.                                                         |
+| `cookies`        |          | Per-request Netscape cookies text or file path.                                                   |
 
 </details>
 
@@ -340,12 +339,12 @@ Content-Type: application/json
 }
 ```
 
-| `action` | Effect |
-| :--- | :--- |
-| `pause` | Pauses current playback. |
-| `resume` | Resumes paused playback. |
-| `skip` | Skips to the next item in the queue. |
-| `stop` | Stops playback and clears the queue. |
+| `action` | Effect                                            |
+| :------- | :------------------------------------------------ |
+| `pause`  | Pauses current playback.                          |
+| `resume` | Resumes paused playback.                          |
+| `skip`   | Skips to the next item in the queue.              |
+| `stop`   | Stops playback and clears the queue.              |
 | `volume` | Sets output volume with `value` (`0.0` to `2.0`). |
 
 ```json
@@ -409,13 +408,13 @@ Content-Type: application/json
 
 ## 🛡️ YouTube Anti-Bot & BotGuard
 
-Datacenter and cloud IPs are routinely hit with *"Sign in to confirm you're not a bot"*. `axAudio` ships a layered bypass:
+Datacenter and cloud IPs are routinely hit with _"Sign in to confirm you're not a bot"_. `axAudio` ships a layered bypass:
 
-| Layer | What it does |
-| :--- | :--- |
-| **Deno JS engine** | `yt-dlp` needs a JavaScript runtime to decode YouTube's dynamic `base.js` player signatures. `axAudio` bundles Deno v2 for this. |
-| **PoToken sidecar** | Integrates with [`brainicism/bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) to generate valid BotGuard PoTokens on the fly. |
-| **Multi-account cookie pool** | Round-robin rotation across `./cookies/*.txt` or `YTDLP_COOKIES_POOL`, with automatic retry on the next cookie if one hits a challenge or rate limit. |
+| Layer                         | What it does                                                                                                                                                      |
+| :---------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Deno JS engine**            | `yt-dlp` needs a JavaScript runtime to decode YouTube's dynamic `base.js` player signatures. `axAudio` bundles Deno v2 for this.                                  |
+| **PoToken sidecar**           | Integrates with [`brainicism/bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) to generate valid BotGuard PoTokens on the fly. |
+| **Multi-account cookie pool** | Round-robin rotation across `./cookies/*.txt` or `YTDLP_COOKIES_POOL`, with automatic retry on the next cookie if one hits a challenge or rate limit.             |
 
 <details>
 <summary><b>🍪 Cookie pool details</b></summary>
@@ -443,9 +442,9 @@ Datacenter and cloud IPs are routinely hit with *"Sign in to confirm you're not 
 A minimal example with TypeScript and Discord.js:
 
 ```typescript
-import axios from 'axios';
+import axios from "axios";
 
-const AXAUDIO_URL = 'http://127.0.0.1:2333';
+const AXAUDIO_URL = "http://127.0.0.1:2333";
 
 // 1. Join a voice channel
 async function joinVoice(guild, channel, botUser) {
@@ -478,7 +477,7 @@ async function playTrack(guildId: string, query: string) {
 async function skipTrack(guildId: string) {
   await axios.post(`${AXAUDIO_URL}/v1/player/control`, {
     guild_id: guildId,
-    action: 'skip',
+    action: "skip",
   });
 }
 ```
