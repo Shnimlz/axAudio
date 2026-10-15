@@ -23,7 +23,9 @@ RUN rm -rf src
 # 3. Copiar el código fuente real de axAudio
 COPY src ./src
 
-# 4. Compilar el binario final con Link-Time Optimization
+# 4. Compilar el binario final con Link-Time Optimization y versión inyectada
+ARG AXAUDIO_VERSION="0.1.0"
+ENV AXAUDIO_VERSION=$AXAUDIO_VERSION
 RUN touch src/main.rs && cargo build --release
 
 # ==========================================

@@ -142,6 +142,11 @@ fn attach_track_events(
 }
 
 
+pub const AXAUDIO_VERSION: &str = match option_env!("AXAUDIO_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 pub async fn health() -> Json<ApiResponse<&'static str>> {
     Json(ApiResponse::ok("axAudio engine operational"))
 }
@@ -149,7 +154,7 @@ pub async fn health() -> Json<ApiResponse<&'static str>> {
 pub async fn get_stats(State(state): State<AppState>) -> Json<ApiResponse<StatsResponse>> {
     let stats = StatsResponse {
         status: "healthy",
-        version: "0.1.0",
+        version: AXAUDIO_VERSION,
         uptime_seconds: state.start_time.elapsed().as_secs(),
         active_players: state.players.len(),
     };
