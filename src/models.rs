@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::sources::FlatPlaylistItem;
 
 pub fn deserialize_u64_flexible<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
@@ -60,6 +61,7 @@ pub struct PlayPayload {
     pub extractor_args: Option<String>,
     pub extra_args: Option<String>,
     pub cookies: Option<String>,
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +90,24 @@ pub struct ResolvePayload {
     pub extractor_args: Option<String>,
     pub extra_args: Option<String>,
     pub cookies: Option<String>,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchPayload {
+    pub query: String,
+    pub limit: Option<usize>,
+    pub source: Option<String>, // "auto" (default), "youtube", "soundcloud"
+    pub extractor_args: Option<String>,
+    pub extra_args: Option<String>,
+    pub cookies: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SearchResponse {
+    pub query: String,
+    pub source_used: String,
+    pub tracks: Vec<FlatPlaylistItem>,
 }
 
 #[derive(Debug, Serialize, Clone)]

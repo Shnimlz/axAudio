@@ -46,6 +46,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(handlers::health))
         .route("/v1/stats", get(handlers::get_stats))
         .route("/v1/tracks/resolve", post(handlers::resolve_track))
+        .route("/v1/tracks/search", post(handlers::search_tracks))
         .route("/v1/voice/join", post(handlers::voice_join))
         .route("/v1/voice/leave", post(handlers::voice_leave))
         .route("/v1/player/play", post(handlers::player_play))

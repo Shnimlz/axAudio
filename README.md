@@ -227,7 +227,8 @@ All endpoints accept and return JSON. Snowflake IDs (`guild_id`, `channel_id`, `
 | `POST` | `/v1/player/play`       | Enqueue a URL or search query                                 |
 | `POST` | `/v1/player/control`    | Pause, resume, skip, stop, volume                             |
 | `POST` | `/v1/player/queue`      | Inspect current track and upcoming queue                      |
-| `POST` | `/v1/tracks/resolve`    | Resolve metadata and stream URL without playing               |
+| `POST` | `/v1/tracks/resolve`    | Resolve metadata and direct CDN stream URL without playing    |
+| `POST` | `/v1/tracks/search`     | Fast multi-source search (~1s) with auto YouTube/SoundCloud   |
 |  `WS`  | `/v1/events`            | Real-time WebSocket player events (track start / end / error) |
 
 <details>
@@ -372,6 +373,49 @@ Content-Type: application/json
 }
 ```
 
+> [!TIP]
+> **Standalone Apps (Non-Discord)**: You can pass `"format": "flac/bestaudio/best"` or `"format": "ba[ext=mp3]"` in the JSON body to request high-res or custom audio codecs directly.
+
+</details>
+
+<details>
+<summary><b>Fast multi-source track search (YouTube + SoundCloud fallback)</b></summary>
+
+<br>
+
+Searches across providers with flat metadata extraction in ~1s. If YouTube fails or returns 0 results, it automatically cascades to SoundCloud without downtime:
+
+```http
+POST /v1/tracks/search
+Content-Type: application/json
+
+{
+  "query": "Daft Punk One More Time",
+  "limit": 5,
+  "source": "auto"
+}
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "query": "Daft Punk One More Time",
+    "source_used": "youtube",
+    "tracks": [
+      {
+        "title": "Daft Punk - One More Time (Official Audio)",
+        "url": "https://www.youtube.com/watch?v=FGBhQbmPwH8",
+        "duration_secs": 320,
+        "author": "Daft Punk",
+        "thumbnail": "https://i.ytimg.com/vi/FGBhQbmPwH8/hqdefault.jpg"
+      }
+    ]
+  },
+  "message": null
+}
+```
+
 </details>
 
 <details>
@@ -475,6 +519,8 @@ async function skipTrack(guildId: string) {
 - [x] Docker Compose deployment
 - [x] Queue inspection endpoint (`/v1/player/queue`)
 - [x] WebSocket player events (`/v1/events`: track start / end / error)
+- [x] Multi-source track search (`/v1/tracks/search`) with auto YouTube -> SoundCloud failover
+- [x] Custom codec / format configuration per-request (`format: "flac/bestaudio/opus"`)
 - [ ] Seek / position control
 
 Have an idea? [Open an issue](https://github.com/YOUR_USER/axAudio/issues).

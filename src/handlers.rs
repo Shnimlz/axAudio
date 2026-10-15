@@ -19,7 +19,8 @@ use tracing::{error, info, warn};
 
 use crate::models::{
     ApiResponse, ControlPayload, JoinPayload, LeavePayload, PlayPayload, PlayResponse,
-    PlayerEvent, QueuePayload, QueueResponse, ResolvePayload, StatsResponse, TrackResponse,
+    PlayerEvent, QueuePayload, QueueResponse, ResolvePayload, SearchPayload, SearchResponse,
+    StatsResponse, TrackResponse,
 };
 use crate::sources::TrackMetadata;
 use crate::state::AppState;
@@ -166,6 +167,7 @@ pub async fn resolve_track(
             payload.extractor_args.as_deref(),
             payload.extra_args.as_deref(),
             payload.cookies.as_deref(),
+            payload.format.as_deref(),
         )
         .await
     {
@@ -185,6 +187,43 @@ pub async fn resolve_track(
             Err((
                 StatusCode::BAD_REQUEST,
                 Json(ApiResponse::err(format!("Track resolution failed: {}", e))),
+            ))
+        }
+    }
+}
+
+pub async fn search_tracks(
+    State(state): State<AppState>,
+    Json(payload): Json<SearchPayload>,
+) -> Result<Json<ApiResponse<SearchResponse>>, (StatusCode, Json<ApiResponse<SearchResponse>>)> {
+    let limit = payload.limit.unwrap_or(5);
+    let source = payload.source.as_deref().unwrap_or("auto");
+
+    match state
+        .resolver
+        .search(
+            &payload.query,
+            limit,
+            source,
+            payload.extractor_args.as_deref(),
+            payload.extra_args.as_deref(),
+            payload.cookies.as_deref(),
+        )
+        .await
+    {
+        Ok((source_used, tracks)) => {
+            let res = SearchResponse {
+                query: payload.query,
+                source_used,
+                tracks,
+            };
+            Ok(Json(ApiResponse::ok(res)))
+        }
+        Err(e) => {
+            warn!(query = %payload.query, error = %e, "Track search failed");
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::err(format!("Track search failed: {}", e))),
             ))
         }
     }
@@ -285,6 +324,7 @@ pub async fn player_play(
             payload.extractor_args.as_deref(),
             payload.extra_args.as_deref(),
             payload.cookies.as_deref(),
+            payload.format.as_deref(),
         )
         .await
     {
@@ -339,6 +379,7 @@ pub async fn player_play(
         let extractor_args = payload.extractor_args.clone();
         let extra_args = payload.extra_args.clone();
         let cookies = payload.cookies.clone();
+        let format_opt = payload.format.clone();
 
         tokio::spawn(async move {
             info!(
@@ -393,6 +434,7 @@ pub async fn player_play(
                         extractor_args.as_deref(),
                         extra_args.as_deref(),
                         cookies.as_deref(),
+                        format_opt.as_deref(),
                     )
                     .await
                 {

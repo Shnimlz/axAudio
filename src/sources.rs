@@ -183,6 +183,7 @@ impl SourceResolver {
         custom_extractor_args: Option<&str>,
         custom_extra_args: Option<&str>,
         cookie_path: Option<&str>,
+        max_items: Option<usize>,
     ) -> Result<FlatPlaylist, String> {
         let query_trimmed = query.trim();
         let _permit = self.process_semaphore.acquire().await.map_err(|e| format!("Fallo adquiriendo semáforo de proceso para flat-playlist: {}", e))?;
@@ -190,7 +191,11 @@ impl SourceResolver {
         cmd.arg("--flat-playlist");
         cmd.arg("--dump-single-json");
 
-        let playlist_max = std::env::var("YTDLP_PLAYLIST_MAX").unwrap_or_else(|_| "25".to_string());
+        let playlist_max = if let Some(m) = max_items {
+            m.to_string()
+        } else {
+            std::env::var("YTDLP_PLAYLIST_MAX").unwrap_or_else(|_| "25".to_string())
+        };
         cmd.arg("--playlist-end").arg(playlist_max);
 
         let default_search = std::env::var("YTDLP_DEFAULT_SEARCH").unwrap_or_else(|_| "ytsearch:".to_string());
@@ -306,13 +311,14 @@ impl SourceResolver {
         Ok(FlatPlaylist { title, entries })
     }
 
-    /// Resuelve el flujo de audio CDN de una única canción en ~3.5 segundos con formato 251 Opus nativo
+    /// Resuelve el flujo de audio CDN de una única canción
     async fn run_single_track_cmd(
         &self,
         query: &str,
         custom_extractor_args: Option<&str>,
         custom_extra_args: Option<&str>,
         cookie_path: Option<&str>,
+        custom_format: Option<&str>,
     ) -> Result<TrackMetadata, String> {
         let query_trimmed = query.trim();
         let _permit = self.process_semaphore.acquire().await.map_err(|e| format!("Fallo adquiriendo semáforo de proceso para pista individual: {}", e))?;
@@ -321,7 +327,11 @@ impl SourceResolver {
         cmd.arg("--dump-single-json");
 
         let default_format = "ba[format_id=251]/ba[acodec=opus]/ba[ext=webm]/bestaudio[ext=m4a]/bestaudio/best";
-        let format = std::env::var("YTDLP_FORMAT").unwrap_or_else(|_| default_format.to_string());
+        let format = if let Some(fmt) = custom_format {
+            fmt.to_string()
+        } else {
+            std::env::var("YTDLP_FORMAT").unwrap_or_else(|_| default_format.to_string())
+        };
         cmd.arg("--format").arg(format);
 
         let default_search = std::env::var("YTDLP_DEFAULT_SEARCH").unwrap_or_else(|_| "ytsearch:".to_string());
@@ -432,19 +442,26 @@ impl SourceResolver {
         })
     }
 
-    /// Resuelve una pista individual con soporte de caché y rotación de cookies
+    /// Resuelve una pista individual con soporte de caché, rotación de cookies y failover automático a SoundCloud
     pub async fn resolve_single(
         &self,
         query: &str,
         custom_extractor_args: Option<&str>,
         custom_extra_args: Option<&str>,
         custom_cookies: Option<&str>,
+        custom_format: Option<&str>,
     ) -> Result<TrackMetadata, String> {
         let query_trimmed = query.trim();
 
-        // 1. Revisar caché en memoria
+        // 1. Revisar caché en memoria (considerando el formato solicitado)
+        let cache_key = if let Some(fmt) = custom_format {
+            format!("{}##fmt={}", query_trimmed, fmt)
+        } else {
+            query_trimmed.to_string()
+        };
+
         if custom_extractor_args.is_none() && custom_extra_args.is_none() && custom_cookies.is_none() {
-            if let Some(entry) = self.cache.get(query_trimmed) {
+            if let Some(entry) = self.cache.get(&cache_key) {
                 let (meta, cached_at) = entry.value();
                 if cached_at.elapsed() < self.ttl {
                     info!(query = %query_trimmed, title = %meta.title, "Source resolver cache hit");
@@ -465,23 +482,77 @@ impl SourceResolver {
             });
         }
 
+        // Función auxiliar interna para failover a SoundCloud en búsquedas
+        let attempt_sc_fallback = |e: &str| async move {
+            let is_url = query_trimmed.starts_with("http://") || query_trimmed.starts_with("https://");
+            let has_other_prefix = query_trimmed.starts_with("scsearch:") || query_trimmed.starts_with("bcsearch:");
+
+            if !is_url && !has_other_prefix {
+                let clean_query = query_trimmed.strip_prefix("ytsearch:").unwrap_or(query_trimmed);
+                let sc_query = format!("scsearch:{}", clean_query);
+                warn!(
+                    yt_error = %e,
+                    sc_query = %sc_query,
+                    "YouTube falló o fue bloqueado; ejecutando failover automático a SoundCloud..."
+                );
+
+                match self
+                    .run_single_track_cmd(&sc_query, custom_extractor_args, custom_extra_args, None, custom_format)
+                    .await
+                {
+                    Ok(sc_meta) => {
+                        info!(title = %sc_meta.title, "Pista resuelta exitosamente mediante failover de SoundCloud");
+                        return Ok(sc_meta);
+                    }
+                    Err(sc_err) => {
+                        warn!(sc_error = %sc_err, "Failover a SoundCloud también falló");
+                    }
+                }
+            }
+            Err(e.to_string())
+        };
+
         // 3. Cookie personalizada
         if let Some(c) = custom_cookies {
-            let meta = self
-                .run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(c))
-                .await?;
-            self.cache.insert(query_trimmed.to_string(), (meta.clone(), Instant::now()));
-            return Ok(meta);
+            match self
+                .run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(c), custom_format)
+                .await
+            {
+                Ok(meta) => {
+                    self.cache.insert(cache_key, (meta.clone(), Instant::now()));
+                    return Ok(meta);
+                }
+                Err(e) => {
+                    let fallback_res = attempt_sc_fallback(&e).await;
+                    if let Ok(meta) = fallback_res {
+                        self.cache.insert(cache_key, (meta.clone(), Instant::now()));
+                        return Ok(meta);
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         // 4. Pool de cookies
         let cookie_pool = self.get_available_cookie_pool().await;
         if cookie_pool.is_empty() {
-            let meta = self
-                .run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, None)
-                .await?;
-            self.cache.insert(query_trimmed.to_string(), (meta.clone(), Instant::now()));
-            return Ok(meta);
+            match self
+                .run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, None, custom_format)
+                .await
+            {
+                Ok(meta) => {
+                    self.cache.insert(cache_key, (meta.clone(), Instant::now()));
+                    return Ok(meta);
+                }
+                Err(e) => {
+                    let fallback_res = attempt_sc_fallback(&e).await;
+                    if let Ok(meta) = fallback_res {
+                        self.cache.insert(cache_key, (meta.clone(), Instant::now()));
+                        return Ok(meta);
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         let total = cookie_pool.len();
@@ -492,11 +563,11 @@ impl SourceResolver {
             let idx = (start_idx + i) % total;
             let cookie_file = &cookie_pool[idx];
             match self
-                .run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(cookie_file))
+                .run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(cookie_file), custom_format)
                 .await
             {
                 Ok(meta) => {
-                    self.cache.insert(query_trimmed.to_string(), (meta.clone(), Instant::now()));
+                    self.cache.insert(cache_key, (meta.clone(), Instant::now()));
                     return Ok(meta);
                 }
                 Err(e) => {
@@ -506,29 +577,37 @@ impl SourceResolver {
             }
         }
 
+        // Si todas las cookies del pool fallaron, intentar failover a SoundCloud antes de tirar error
+        let fallback_res = attempt_sc_fallback(&last_err).await;
+        if let Ok(meta) = fallback_res {
+            self.cache.insert(cache_key, (meta.clone(), Instant::now()));
+            return Ok(meta);
+        }
+
         Err(format!("Todas las cookies del pool fallaron resolviendo la pista. Último error: {}", last_err))
     }
 
-    /// Resuelve la lista plana de una playlist / mix con rotación de cookies
-    pub async fn resolve_flat_playlist(
+    /// Resuelve la lista plana de una playlist / mix con límite opcional y rotación de cookies
+    pub async fn resolve_flat_playlist_with_limit(
         &self,
         query: &str,
         custom_extractor_args: Option<&str>,
         custom_extra_args: Option<&str>,
         custom_cookies: Option<&str>,
+        max_items: Option<usize>,
     ) -> Result<FlatPlaylist, String> {
         let query_trimmed = query.trim();
 
         if let Some(c) = custom_cookies {
             return self
-                .run_flat_playlist_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(c))
+                .run_flat_playlist_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(c), max_items)
                 .await;
         }
 
         let cookie_pool = self.get_available_cookie_pool().await;
         if cookie_pool.is_empty() {
             return self
-                .run_flat_playlist_cmd(query_trimmed, custom_extractor_args, custom_extra_args, None)
+                .run_flat_playlist_cmd(query_trimmed, custom_extractor_args, custom_extra_args, None, max_items)
                 .await;
         }
 
@@ -540,7 +619,7 @@ impl SourceResolver {
             let idx = (start_idx + i) % total;
             let cookie_file = &cookie_pool[idx];
             match self
-                .run_flat_playlist_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(cookie_file))
+                .run_flat_playlist_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(cookie_file), max_items)
                 .await
             {
                 Ok(playlist) => return Ok(playlist),
@@ -554,6 +633,74 @@ impl SourceResolver {
         Err(format!("Todas las cookies fallaron para flat-playlist. Último error: {}", last_err))
     }
 
+    /// Resuelve la lista plana de una playlist / mix con rotación de cookies
+    pub async fn resolve_flat_playlist(
+        &self,
+        query: &str,
+        custom_extractor_args: Option<&str>,
+        custom_extra_args: Option<&str>,
+        custom_cookies: Option<&str>,
+    ) -> Result<FlatPlaylist, String> {
+        self.resolve_flat_playlist_with_limit(query, custom_extractor_args, custom_extra_args, custom_cookies, None).await
+    }
+
+    /// Búsqueda multi-fuente ultrarrápida (~1s) con soporte de failover YouTube -> SoundCloud
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        source: &str,
+        custom_extractor_args: Option<&str>,
+        custom_extra_args: Option<&str>,
+        custom_cookies: Option<&str>,
+    ) -> Result<(String, Vec<FlatPlaylistItem>), String> {
+        let query_trimmed = query.trim();
+        let clean_query = query_trimmed
+            .strip_prefix("ytsearch:")
+            .or_else(|| query_trimmed.strip_prefix("scsearch:"))
+            .unwrap_or(query_trimmed);
+
+        let capped_limit = limit.clamp(1, 25);
+
+        match source {
+            "soundcloud" => {
+                let sc_query = format!("scsearch{}:{}", capped_limit, clean_query);
+                let flat = self
+                    .run_flat_playlist_cmd(&sc_query, custom_extractor_args, custom_extra_args, None, Some(capped_limit))
+                    .await?;
+                Ok(("soundcloud".to_string(), flat.entries))
+            }
+            "youtube" => {
+                let yt_query = format!("ytsearch{}:{}", capped_limit, clean_query);
+                let flat = self
+                    .resolve_flat_playlist_with_limit(&yt_query, custom_extractor_args, custom_extra_args, custom_cookies, Some(capped_limit))
+                    .await?;
+                Ok(("youtube".to_string(), flat.entries))
+            }
+            _ => {
+                // "auto": Intentar YouTube primero; si falla o no hay resultados, fallback a SoundCloud
+                let yt_query = format!("ytsearch{}:{}", capped_limit, clean_query);
+                match self
+                    .resolve_flat_playlist_with_limit(&yt_query, custom_extractor_args, custom_extra_args, custom_cookies, Some(capped_limit))
+                    .await
+                {
+                    Ok(flat) if !flat.entries.is_empty() => Ok(("youtube".to_string(), flat.entries)),
+                    Ok(_) | Err(_) => {
+                        warn!(
+                            query = %clean_query,
+                            "Búsqueda en YouTube falló o devolvió 0 resultados; ejecutando failover a SoundCloud..."
+                        );
+                        let sc_query = format!("scsearch{}:{}", capped_limit, clean_query);
+                        let flat = self
+                            .run_flat_playlist_cmd(&sc_query, custom_extractor_args, custom_extra_args, None, Some(capped_limit))
+                            .await?;
+                        Ok(("soundcloud".to_string(), flat.entries))
+                    }
+                }
+            }
+        }
+    }
+
     /// Resuelve de forma ultrarrápida (Fast Start): pista 1 inmediata + lista de pendientes
     pub async fn resolve_playlist_batch(
         &self,
@@ -561,6 +708,7 @@ impl SourceResolver {
         custom_extractor_args: Option<&str>,
         custom_extra_args: Option<&str>,
         custom_cookies: Option<&str>,
+        custom_format: Option<&str>,
     ) -> Result<ResolvedPlaylistBatch, String> {
         let query_trimmed = query.trim();
 
@@ -587,7 +735,7 @@ impl SourceResolver {
 
         if !is_playlist {
             let first_track = self
-                .resolve_single(query_trimmed, custom_extractor_args, custom_extra_args, custom_cookies)
+                .resolve_single(query_trimmed, custom_extractor_args, custom_extra_args, custom_cookies, custom_format)
                 .await?;
             return Ok(ResolvedPlaylistBatch {
                 first_track,
@@ -603,7 +751,7 @@ impl SourceResolver {
         // resolvemos la primera canción Y la lista plana EN PARALELO mediante tokio::join!
         if let Some(first_video_url) = Self::extract_video_url(query_trimmed) {
             info!(v_url = %first_video_url, "Extrayendo primera pista y lista plana de forma secuencial y controlada...");
-            let first_track = self.resolve_single(&first_video_url, custom_extractor_args, custom_extra_args, custom_cookies).await?;
+            let first_track = self.resolve_single(&first_video_url, custom_extractor_args, custom_extra_args, custom_cookies, custom_format).await?;
             let flat_playlist = self.resolve_flat_playlist(query_trimmed, custom_extractor_args, custom_extra_args, custom_cookies).await?;
 
             let mut remaining = flat_playlist.entries;
@@ -639,7 +787,7 @@ impl SourceResolver {
 
         let first_entry = flat_playlist.entries.remove(0);
         let first_track = self
-            .resolve_single(&first_entry.url, custom_extractor_args, custom_extra_args, custom_cookies)
+            .resolve_single(&first_entry.url, custom_extractor_args, custom_extra_args, custom_cookies, custom_format)
             .await?;
 
         let total_count = flat_playlist.entries.len() + 1;
@@ -659,8 +807,9 @@ impl SourceResolver {
         custom_extractor_args: Option<&str>,
         custom_extra_args: Option<&str>,
         custom_cookies: Option<&str>,
+        custom_format: Option<&str>,
     ) -> Result<TrackMetadata, String> {
-        self.resolve_single(query, custom_extractor_args, custom_extra_args, custom_cookies)
+        self.resolve_single(query, custom_extractor_args, custom_extra_args, custom_cookies, custom_format)
             .await
     }
 }
