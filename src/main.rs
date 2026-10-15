@@ -1,3 +1,4 @@
+mod dsp;
 mod handlers;
 mod models;
 mod sources;
@@ -52,6 +53,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/player/play", post(handlers::player_play))
         .route("/v1/player/control", post(handlers::player_control))
         .route("/v1/player/queue", post(handlers::player_queue))
+        .route("/v1/player/eq", post(handlers::player_eq))
+        .route("/v1/player/dsp", post(handlers::player_dsp))
         .route("/v1/events", get(handlers::ws_events))
         .with_state(state);
 

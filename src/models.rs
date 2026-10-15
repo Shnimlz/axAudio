@@ -196,3 +196,30 @@ pub enum PlayerEvent {
     },
 }
 
+use crate::dsp::{BandSetting, DspStatus, SpatialSettings};
+
+#[derive(Debug, Deserialize)]
+pub struct EqPayload {
+    #[serde(deserialize_with = "deserialize_u64_flexible")]
+    pub guild_id: u64,
+    pub bands: Option<Vec<BandSetting>>,
+    pub preset: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DspPayload {
+    #[serde(deserialize_with = "deserialize_u64_flexible")]
+    pub guild_id: u64,
+    pub preset: Option<String>,
+    pub spatial: Option<SpatialSettings>,
+    pub bands: Option<Vec<BandSetting>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DspResponse {
+    pub guild_id: u64,
+    pub status: DspStatus,
+    pub message: String,
+}
+
+

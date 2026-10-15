@@ -1,17 +1,19 @@
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use dashmap::DashMap;
 use reqwest::Client;
 use songbird::driver::Driver;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 
+use crate::dsp::DspChain;
 use crate::models::PlayerEvent;
 use crate::sources::{FlatPlaylistItem, SourceResolver};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub players: Arc<DashMap<u64, Arc<Mutex<Driver>>>>,
+    pub players: Arc<DashMap<u64, Arc<tokio::sync::Mutex<Driver>>>>,
+    pub dsp_chains: Arc<DashMap<u64, Arc<Mutex<DspChain>>>>,
     pub http_client: Client,
     pub resolver: Arc<SourceResolver>,
     pub start_time: Instant,
@@ -25,6 +27,7 @@ impl AppState {
         let (event_tx, _) = broadcast::channel(256);
         Self {
             players: Arc::new(DashMap::new()),
+            dsp_chains: Arc::new(DashMap::new()),
             http_client: Client::builder()
                 .user_agent("Mozilla/5.0 (compatible; axAudio/0.1.0)")
                 .build()
@@ -35,6 +38,14 @@ impl AppState {
             pending_playlists: Arc::new(DashMap::new()),
             event_tx,
         }
+    }
+
+    pub fn get_dsp(&self, guild_id: u64) -> Arc<Mutex<DspChain>> {
+        let entry = self
+            .dsp_chains
+            .entry(guild_id)
+            .or_insert_with(|| Arc::new(Mutex::new(DspChain::new(48000.0))));
+        entry.value().clone()
     }
 
     pub fn next_epoch(&self, guild_id: u64) -> u64 {
