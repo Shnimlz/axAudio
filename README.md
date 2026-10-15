@@ -13,7 +13,7 @@ A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#-quick-start)
 [![Songbird](https://img.shields.io/badge/songbird-0.4-blueviolet)](https://github.com/serenity-rs/songbird)
 [![Stars](https://img.shields.io/github/stars/Shnimlz/axAudio?style=flat&logo=github)](https://github.com/YOUR_USER/axAudio/stargazers)
-[![Issues](https://img.shields.io/github/issues/YOUR_USER/axAudio)](https://github.com/Shnimlz/axAudio/issues)
+[![Issues](https://img.shields.io/github/issues/Shnimlz/axAudio)](https://github.com/Shnimlz/axAudio/issues)
 
 [**Quick Start**](#-quick-start) ·
 [**API Reference**](#-rest-api-reference) ·
