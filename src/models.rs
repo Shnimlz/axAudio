@@ -56,6 +56,7 @@ pub struct PlayPayload {
     pub guild_id: u64,
     pub url: String,
     pub volume: Option<f32>,
+    pub replace: Option<bool>,
     pub extractor_args: Option<String>,
     pub extra_args: Option<String>,
     pub cookies: Option<String>,
@@ -65,12 +66,18 @@ pub struct PlayPayload {
 pub struct ControlPayload {
     #[serde(deserialize_with = "deserialize_u64_flexible")]
     pub guild_id: u64,
-    pub action: String, // "pause", "resume", "stop", "volume"
+    pub action: String, // "pause", "resume", "stop", "skip", "volume", "clear"
     pub value: Option<f32>, // used when action is "volume" (0.0 to 2.0)
 }
 
 #[derive(Debug, Deserialize)]
 pub struct LeavePayload {
+    #[serde(deserialize_with = "deserialize_u64_flexible")]
+    pub guild_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueuePayload {
     #[serde(deserialize_with = "deserialize_u64_flexible")]
     pub guild_id: u64,
 }
@@ -83,7 +90,7 @@ pub struct ResolvePayload {
     pub cookies: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct TrackResponse {
     pub title: String,
     pub source_url: String,
@@ -91,6 +98,30 @@ pub struct TrackResponse {
     pub duration_secs: Option<u64>,
     pub author: Option<String>,
     pub thumbnail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct PlayResponse {
+    pub title: String,
+    pub source_url: String,
+    pub stream_url: String,
+    pub duration_secs: Option<u64>,
+    pub author: Option<String>,
+    pub thumbnail: Option<String>,
+    pub is_playlist: bool,
+    pub playlist_title: Option<String>,
+    pub playlist_tracks_count: usize,
+    pub queue_length: usize,
+    pub was_empty: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct QueueResponse {
+    pub guild_id: u64,
+    pub is_playing: bool,
+    pub current: Option<TrackResponse>,
+    pub queue: Vec<TrackResponse>,
+    pub total_tracks: usize,
 }
 
 #[derive(Debug, Serialize)]

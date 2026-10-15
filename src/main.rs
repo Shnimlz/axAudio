@@ -50,6 +50,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/voice/leave", post(handlers::voice_leave))
         .route("/v1/player/play", post(handlers::player_play))
         .route("/v1/player/control", post(handlers::player_control))
+        .route("/v1/player/queue", post(handlers::player_queue))
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")

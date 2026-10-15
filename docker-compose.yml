@@ -11,6 +11,13 @@ services:
       - PORT=2333
       - RUST_LOG=axAudio=info,tower_http=info
       - TOKIO_WORKER_THREADS=2
+      - BGUTIL_POT_URL=http://bgutil-pot:4416
+    volumes:
+      # Mount single cookie file or an entire directory of multi-account cookies
+      - ./cookies.txt:/app/cookies.txt
+      - ./cookies:/app/cookies
+    depends_on:
+      - bgutil-pot
     deploy:
       resources:
         limits:
@@ -22,3 +29,10 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+  bgutil-pot:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-pot
+    restart: unless-stopped
+    ports:
+      - "4416:4416"
