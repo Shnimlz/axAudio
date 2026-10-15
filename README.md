@@ -1,93 +1,147 @@
+<div align="center">
+
+<!-- Tip: add a banner here -> <img src="assets/banner.png" alt="axAudio" width="720"> -->
+
 # ⚡ axAudio
 
-**Ultra-lightweight, Bare-Metal Discord Native Audio Engine in Rust.**  
-Designed as a zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
+**Ultra-lightweight, bare-metal Discord audio engine written in Rust.**
+<br>
+A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](#-quick-start)
+[![Songbird](https://img.shields.io/badge/songbird-0.4-blueviolet)](https://github.com/serenity-rs/songbird)
+[![Stars](https://img.shields.io/github/stars/YOUR_USER/axAudio?style=flat&logo=github)](https://github.com/YOUR_USER/axAudio/stargazers)
+[![Issues](https://img.shields.io/github/issues/YOUR_USER/axAudio)](https://github.com/YOUR_USER/axAudio/issues)
+
+[**Quick Start**](#-quick-start) ·
+[**API Reference**](#-rest-api-reference) ·
+[**Configuration**](#%EF%B8%8F-configuration) ·
+[**YouTube Anti-Bot**](#%EF%B8%8F-youtube-anti-bot--botguard) ·
+[**Bot Example**](#-discord-bot-integration)
+
+<br>
+
+| 📦 Binary | 🧠 RAM | 🚀 Startup | 🎚️ Transport |
+| :---: | :---: | :---: | :---: |
+| **~8.4 MB** | **~8–15 MB** | **< 5 ms** | **50 Hz RTP / UDP** |
+
+</div>
 
 ---
 
-## 🚀 Key Specifications
+## 📖 Table of Contents
 
-* **Binary Size**: `~8.4 MB` (stripped release with Link-Time Optimization).
-* **RAM Footprint**: `~8 MB – 15 MB` (compared to 1.5 GB+ for Java Lavalink / JVM).
-* **Startup Time**: `< 5 ms`.
-* **Audio Engine**: `Songbird 0.4` + `Symphonia 0.5` (MP3, FLAC, AAC, OGG Vorbis, WAV).
-* **Transport**: Direct 50 Hz UDP RTP Opus streaming with hardware-accelerated ChaCha20-Poly1305 and AES-GCM encryption.
-* **Control Plane**: `Axum 0.8` + `Tokio` multi-threaded asynchronous runtime.
-* **CPU Tuning**: Pre-configured worker thread throttling (`TOKIO_WORKER_THREADS=2`) optimized for 1-2 vCPU cloud servers (e.g. Oracle Cloud Free Tier, AWS t4g/t3a, Hetzner VPS).
+- [Why axAudio?](#-why-axaudio)
+- [Features](#-features)
+- [Architecture](#-architecture)
+- [Quick Start](#-quick-start)
+- [Running on Bare Metal](#-running-on-bare-metal)
+- [Configuration](#%EF%B8%8F-configuration)
+- [REST API Reference](#-rest-api-reference)
+- [YouTube Anti-Bot & BotGuard](#%EF%B8%8F-youtube-anti-bot--botguard)
+- [Discord Bot Integration](#-discord-bot-integration)
+- [Roadmap](#-roadmap)
+- [Contributing](#-contributing)
+- [Disclaimer](#%EF%B8%8F-disclaimer)
+- [License](#-license)
 
 ---
 
-## 🧩 Architecture & Extraction Subsystem
+## 🤔 Why axAudio?
 
+Running Lavalink means running a JVM. On a small VPS that is most of your RAM gone before a single song plays. **axAudio** does the same job as a single Rust binary that starts instantly and sips memory, so a 1 vCPU free-tier box can serve voice comfortably.
+
+| | **axAudio** | **Lavalink** |
+| :--- | :---: | :---: |
+| Language | Rust | Java |
+| Memory footprint | **~8–15 MB** | 1.5 GB+ |
+| Startup | **< 5 ms** | JVM warm-up |
+| Artifact | **~8.4 MB binary** | JVM + JAR |
+| Garbage collector | **None** | Yes |
+| Built-in YouTube anti-bot (PoToken, cookie pool) | ✅ | Plugin-dependent |
+
+---
+
+## ✨ Features
+
+- 🦀 **Pure Rust core**: Songbird 0.4 + Symphonia 0.5, no GC pauses.
+- 🎵 **Wide format support**: MP3, FLAC, AAC, OGG Vorbis, WAV, plus direct HTTP / ICY streams.
+- 📡 **Real-time transport**: direct 50 Hz UDP RTP Opus streaming with hardware-accelerated ChaCha20-Poly1305 and AES-GCM encryption.
+- ⚙️ **Simple REST control plane**: Axum 0.8 on a multi-threaded Tokio runtime.
+- 🛡️ **YouTube bypass built in**: Deno JS runtime, PoToken sidecar and a multi-account cookie pool with automatic retry.
+- 🎧 **Studio-grade fidelity**: native 48 kHz Opus (format 251), `tanh` soft-clipping and headroom normalization.
+- 🪶 **Tuned for tiny servers**: defaults to `TOKIO_WORKER_THREADS=2`, ideal for Oracle Cloud Free Tier, AWS t4g/t3a and Hetzner VPS.
+- 🐳 **One-command deploy** with Docker Compose.
+
+---
+
+## 🧩 Architecture
+
+```mermaid
+flowchart LR
+    GW["Discord Gateway"] -->|"voice session + token + endpoint"| JOIN["POST /v1/voice/join"]
+    JOIN --> DRV["Songbird driver<br/>Voice UDP handshake"]
+
+    BOT["Your Discord bot"] -->|"URL or search query"| PLAY["POST /v1/player/play"]
+    PLAY --> RES["Source resolver<br/>yt-dlp + Deno"]
+
+    COOK[("Cookie pool")] -.-> RES
+    POT["PoToken sidecar<br/>bgutil-pot:4416"] -.-> RES
+
+    RES --> STR["Direct audio stream<br/>googlevideo CDN / HTTP / ICY"]
+    STR --> DEC["Symphonia decoder<br/>+ Opus transcoder"]
+    DEC --> Q["Songbird TrackQueue"]
+    Q --> UDP["50 Hz real-time<br/>UDP RTP engine"]
+    DRV --> UDP
 ```
-                         ┌────────────────────────────────────────────────────────┐
-                         │                      axAudio Node                      │
-                         │                                                        │
-Discord Gateway ───────► │ 1. POST /v1/voice/join (Session + Token + Endpoint)   │
-                         │ 2. Songbird Driver Handshake (Discord Voice UDP)       │
-                         │                                                        │
-Discord Bot Play ──────► │ 3. POST /v1/player/play (URL / Search Query)          │
-                         │       │                                                │
-                         │       ▼                                                │
-                         │  Source Resolver (yt-dlp + Deno JS Runtime)            │
-                         │       ├── Cookies (/app/cookies.txt)                   │
-                         │       └── PoToken Sidecar (http://bgutil-pot:4416)     │
-                         │       │                                                │
-                         │       ▼                                                │
-                         │  Direct Audio Stream (googlevideo CDN / HTTP / ICY)    │
-                         │       │                                                │
-                         │       ▼                                                │
-                         │  Symphonia Audio Decoder & Opus Transcoder             │
-                         │       │                                                │
-                         │       ▼                                                │
-                         │  Songbird TrackQueue ──► 50Hz Real-Time UDP RTP Engine │
-                         └────────────────────────────────────────────────────────┘
+
+---
+
+## 🚀 Quick Start
+
+The fastest and most reliable way to run `axAudio` is Docker Compose.
+
+**1. Clone the repo**
+
+```bash
+git clone https://github.com/YOUR_USER/axAudio.git
+cd axAudio
 ```
 
----
+**2. Export your YouTube cookies**
 
-## 🛡️ YouTube Anti-Bot & BotGuard Setup
+1. Log into YouTube in a desktop browser (preferably with a secondary / throwaway Google account).
+2. Export your cookies in Netscape format with an extension such as **Get cookies.txt LOCALLY** (Chrome / Firefox).
+3. Save the file as `cookies.txt` in the project root.
+4. On Linux / VPS, give `yt-dlp` write access so it can persist refreshed session tokens:
 
-Datacenter and cloud VPS IP addresses are routinely blocked by YouTube with `Sign in to confirm you’re not a bot`. `axAudio` comes with a built-in multi-layered bypass architecture:
-
-1. **Deno JavaScript Engine**: YouTube encrypts player signatures using dynamic `base.js` scripts. `yt-dlp` requires a JavaScript engine to decode these signatures. `axAudio` bundles Deno v2 to fulfill this requirement natively.
-2. **Proof-of-Origin (PoToken) Sidecar**: YouTube requires BotGuard PoTokens to authenticate requests. `axAudio` integrates with `brainicism/bgutil-ytdlp-pot-provider` to generate valid PoTokens on the fly without user intervention.
-3. **Multi-Account Cookie Pool**: Support for multiple Google account cookies (directory `./cookies/*.txt` or `YTDLP_COOKIES_POOL`).
-   * **Round-Robin Rotation**: Distributes video searches and streaming requests evenly across multiple accounts. This prevents YouTube from flagging or suspending an account for continuous search activity ("abnormal traffic").
-   * **Automatic Retry**: If an account in the pool gets a temporary challenge or rate-limit, `axAudio` immediately retries with the next cookie in the pool.
-   * **Cookie Lifespan**: Root credentials (`SID`, `HSID`, `SSID`) are valid for **1 to 2 years**. Rotating session tokens (`__Secure-1PSIDTS`, `SIDCC`) rotate frequently; `yt-dlp` updates them automatically in the file on every request if write permissions are enabled (`chmod 666`).
-   * **Stream URL Timeout**: The ~6-hour expiration applies only to individual `googlevideo.com` CDN playback URLs, not your login cookies. `axAudio` resolves fresh URLs as tracks are requested and maintains an in-memory cache for fast replay.
-4. **Studio-Grade Audio Fidelity & Bass Punch**:
-   * **Native 48 kHz Opus Priority (Format 251)**: `axAudio` prioritizes YouTube's native 48,000 Hz Stereo Opus stream at ~160 kbps. This bypasses lossy AAC conversion, eliminates sample-rate conversion ringing (44.1k → 48k), and delivers uncompressed sub-bass (20 Hz - 100 Hz).
-   * **Hardware-Accelerated Soft-Clipping**: Songbird's `use_softclip` applies a hyperbolic tangent (`tanh`) limiter curve to intersample peaks approaching 0 dBFS. This completely eliminates digital square-wave clipping (harsh screeching treble / "chillido") and retains deep, well-defined bass dynamics.
-   * **Headroom Normalization**: Built-in 0.95 (-0.5 dBFS) true-peak margin prevents master track overs from compressing the audio stage.
-   * **Configurable Opus Bitrate**: Up to 384 kbps (`AUDIO_BITRATE=128000`).
-
----
-
-## 🐳 Quick Start: Running with Docker (Recommended)
-
-The easiest and most reliable way to run `axAudio` in production or locally is via Docker Compose.
-
-### Step 1: Export Your YouTube Cookies
-1. Log into YouTube in a desktop browser (preferably using a secondary/throwaway Google account).
-2. Use an extension such as **Get cookies.txt LOCALLY** (Chrome/Firefox) to export your cookies in Netscape format.
-3. Save the exported file as `cookies.txt` in your project root directory.
-4. **Important (Linux/VPS)**: Grant write permissions so `yt-dlp` can persist refreshed session tokens:
    ```bash
    chmod 666 cookies.txt
    ```
 
-### Step 2: Start the Stack with Docker Compose
-Run both `axAudio` and the `bgutil-pot` sidecar with a single command:
+**3. Start the stack**
 
 ```bash
 docker compose up -d
 ```
 
-### Alternative: Run as a Standalone Docker Container
+This launches both `axAudio` and the `bgutil-pot` PoToken sidecar.
+
+**4. Check that it's alive**
+
 ```bash
-# 1. Start the PoToken provider sidecar on your docker network
+curl http://localhost:2333/health
+```
+
+<details>
+<summary><b>🐋 Run as standalone Docker containers (without Compose)</b></summary>
+
+<br>
+
+```bash
+# 1. Start the PoToken provider sidecar
 docker run -d \
   --name bgutil-pot \
   --restart unless-stopped \
@@ -108,82 +162,96 @@ docker run -d \
   axaudio
 ```
 
+</details>
+
 ---
 
-## 💻 Running Locally on Bare Metal
+## 💻 Running on Bare Metal
 
-If you prefer compiling and running directly on your machine:
+<details>
+<summary><b>Prerequisites</b></summary>
 
-### Prerequisites
+<br>
 
-* **Rust & Cargo**: 1.80+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-* **Build Tools & Opus Library**:
-  * **Ubuntu / Debian**: `sudo apt install -y cmake pkg-config libopus-dev python3 python3-pip`
-  * **macOS**: `brew install cmake opus python`
-  * **Windows**: Install [CMake](https://cmake.org/download/), [Python 3](https://www.python.org/), and ensure Opus libraries are in your `PATH` or use `vcpkg`.
-* **Deno 2+**:
-  * Linux / macOS: `curl -fsSL https://deno.land/install.sh | sh`
-  * Windows: `irm https://deno.land/install.ps1 | iex`
-* **Python Packages**:
-  ```bash
-  pip install -U yt-dlp bgutil-ytdlp-pot-provider
-  ```
+| Requirement | Install |
+| :--- | :--- |
+| **Rust & Cargo** 1.80+ | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| **Build tools & Opus** (Ubuntu / Debian) | `sudo apt install -y cmake pkg-config libopus-dev python3 python3-pip` |
+| **Build tools & Opus** (macOS) | `brew install cmake opus python` |
+| **Build tools & Opus** (Windows) | Install [CMake](https://cmake.org/download/) and [Python 3](https://www.python.org/), and make sure Opus is in your `PATH` (or use `vcpkg`) |
+| **Deno 2+** (Linux / macOS) | `curl -fsSL https://deno.land/install.sh \| sh` |
+| **Deno 2+** (Windows) | `irm https://deno.land/install.ps1 \| iex` |
+| **Python packages** | `pip install -U yt-dlp bgutil-ytdlp-pot-provider` |
 
-### Step 1: Run the PoToken Provider Sidecar
-You can run the lightweight sidecar via Docker:
+</details>
+
+**1. Run the PoToken sidecar**
+
 ```bash
 docker run -d --name bgutil-pot -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider:latest
 ```
 
-### Step 2: Provide Your `cookies.txt`
-Place your exported Netscape `cookies.txt` in the root of the project directory.
+**2. Add your `cookies.txt`** (Netscape format) to the project root.
 
-### Step 3: Run axAudio
+**3. Run axAudio**
+
 ```bash
 # Debug mode (fast compilation)
 cargo run
 
-# Or compile stripped release binary
+# Or build the stripped, LTO-optimized release binary
 cargo build --release
 ./target/release/axAudio
 ```
 
 ---
 
-## ⚙️ Environment Variables
+## ⚙️ Configuration
 
-All settings can be customized through environment variables or a `.env` file:
+Everything is configurable through environment variables or a `.env` file.
 
-| Variable | Default Value | Description |
+| Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PORT` | `2333` | HTTP server listening port. |
-| `AUDIO_BITRATE` | `128000` | Voice channel Opus encoding bitrate in bps (e.g. 128000, 192000, 256000, 384000). |
+| `AUDIO_BITRATE` | `128000` | Opus bitrate in bps (e.g. `128000`, `192000`, `256000`, `384000`). |
 | `RUST_LOG` | `axAudio=info,tower_http=info` | Tracing log level filter. |
-| `TOKIO_WORKER_THREADS` | `2` | Number of Tokio worker threads (recommended: number of vCPUs). |
-| `BGUTIL_POT_URL` | `http://bgutil-pot:4416` | URL to the Proof-of-Origin token provider sidecar. |
-| `YTDLP_COOKIES_DIR` | `/app/cookies`, `./cookies` | Directory containing multiple `.txt` cookie files for automatic round-robin rotation. |
-| `YTDLP_COOKIES_POOL` | _None_ | Comma-separated list of cookie file paths. |
-| `YTDLP_COOKIES_PATH` | `/app/cookies.txt`, `./cookies.txt` | Path to single Netscape `cookies.txt` fallback file. |
-| `YTDLP_COOKIES` | _None_ | Raw Netscape cookie content or path override. |
-| `YTDLP_FORMAT` | `ba[format_id=251]/ba[acodec=opus]...` | Prioritizes YouTube's native 48kHz Opus stream (format 251) for high-definition audio. |
-| `YTDLP_DEFAULT_SEARCH` | `ytsearch:` | Search engine provider prefix for text queries. |
+| `TOKIO_WORKER_THREADS` | `2` | Tokio worker threads (recommended: your vCPU count). |
+| `BGUTIL_POT_URL` | `http://bgutil-pot:4416` | URL of the Proof-of-Origin token sidecar. |
+| `YTDLP_COOKIES_DIR` | `/app/cookies`, `./cookies` | Directory with multiple `.txt` cookie files for round-robin rotation. |
+| `YTDLP_COOKIES_POOL` | _none_ | Comma-separated list of cookie file paths. |
+| `YTDLP_COOKIES_PATH` | `/app/cookies.txt`, `./cookies.txt` | Single Netscape `cookies.txt` fallback. |
+| `YTDLP_COOKIES` | _none_ | Raw Netscape cookie content or path override. |
+| `YTDLP_FORMAT` | `ba[format_id=251]/ba[acodec=opus]...` | Prefers YouTube's native 48 kHz Opus stream (format 251). |
+| `YTDLP_DEFAULT_SEARCH` | `ytsearch:` | Search provider prefix for text queries. |
 | `YTDLP_REMOTE_COMPONENTS` | `ejs:github` | EJS remote solver source. Set to `none` to disable. |
-| `YTDLP_EXTRACTOR_ARGS` | _Auto (bgutil)_ | Custom `--extractor-args` flags for `yt-dlp`. |
-| `YTDLP_EXTRA_ARGS` | _None_ | Additional arbitrary flags forwarded directly to `yt-dlp`. |
+| `YTDLP_EXTRACTOR_ARGS` | _auto (bgutil)_ | Custom `--extractor-args` flags for `yt-dlp`. |
+| `YTDLP_EXTRA_ARGS` | _none_ | Extra flags forwarded directly to `yt-dlp`. |
 
 ---
 
 ## 📡 REST API Reference
 
-All requests accept and return standard JSON payloads. Snowflake IDs (`guild_id`, `channel_id`, `user_id`) can be provided as numbers or numeric strings.
+All endpoints accept and return JSON. Snowflake IDs (`guild_id`, `channel_id`, `user_id`) can be numbers or numeric strings.
 
-### 1. Health Check & Stats
+| Method | Endpoint | Description |
+| :---: | :--- | :--- |
+| `GET` | `/health` · `/v1/stats` | Health check and runtime stats |
+| `POST` | `/v1/voice/join` | Connect to a voice channel |
+| `POST` | `/v1/voice/leave` | Disconnect from a voice channel |
+| `POST` | `/v1/player/play` | Enqueue a URL or search query |
+| `POST` | `/v1/player/control` | Pause, resume, skip, stop, volume |
+| `POST` | `/v1/tracks/resolve` | Resolve metadata and stream URL without playing |
+
+<details>
+<summary><b>Health check & stats</b></summary>
+
+<br>
+
 ```http
 GET /health
 GET /v1/stats
 ```
 
-**Response**:
 ```json
 {
   "success": true,
@@ -197,10 +265,14 @@ GET /v1/stats
 }
 ```
 
----
+</details>
 
-### 2. Connect to a Voice Channel
-When Discord's Gateway dispatches `VOICE_STATE_UPDATE` and `VOICE_SERVER_UPDATE`, forward the session parameters to `axAudio`:
+<details>
+<summary><b>Join a voice channel</b></summary>
+
+<br>
+
+When Discord dispatches `VOICE_STATE_UPDATE` and `VOICE_SERVER_UPDATE`, forward the session parameters to `axAudio`:
 
 ```http
 POST /v1/voice/join
@@ -216,10 +288,14 @@ Content-Type: application/json
 }
 ```
 
----
+</details>
 
-### 3. Enqueue / Play a Track
-Enqueues a direct audio stream URL, a YouTube video URL, or a text search query.
+<details>
+<summary><b>Play a track</b></summary>
+
+<br>
+
+Enqueues a direct audio URL, a YouTube URL, or a text search query.
 
 ```http
 POST /v1/player/play
@@ -235,61 +311,22 @@ Content-Type: application/json
 }
 ```
 
-* `url`: Direct stream URL (`.mp3`, `.ogg`, etc.), YouTube URL, or search query (e.g. `ytsearch:lofi hip hop`).
-* `volume` *(optional)*: Float multiplier from `0.0` to `2.0` (default: `1.0`).
-* `extractor_args` *(optional)*: Per-request override for `yt-dlp --extractor-args`.
-* `extra_args` *(optional)*: Per-request extra CLI flags for `yt-dlp`.
-* `cookies` *(optional)*: Per-request Netscape cookies text or file path.
-* `replace` *(optional)*: Boolean. If `true`, immediately stops the current stream and replaces it instead of appending to the queue.
+| Field | Required | Description |
+| :--- | :---: | :--- |
+| `guild_id` | ✅ | Target guild. |
+| `url` | ✅ | Direct stream (`.mp3`, `.ogg`, ...), YouTube URL, or search query (e.g. `ytsearch:lofi hip hop`). |
+| `volume` | | Float from `0.0` to `2.0` (default `1.0`). |
+| `extractor_args` | | Per-request override for `yt-dlp --extractor-args`. |
+| `extra_args` | | Per-request extra CLI flags for `yt-dlp`. |
+| `cookies` | | Per-request Netscape cookies text or file path. |
 
-*Supports YouTube Playlists (`/playlist?list=...`), Mixes (`&list=RD...`), and Radios! Automatically enqueues up to 25 tracks in sequence.*
+</details>
 
----
+<details>
+<summary><b>Player control (pause, resume, skip, stop, volume)</b></summary>
 
-### 4. Inspect Player Queue
-Query the currently playing track and the upcoming queued tracks in Songbird's native queue:
+<br>
 
-```http
-POST /v1/player/queue
-Content-Type: application/json
-
-{
-  "guild_id": "123456789012345678"
-}
-```
-
-**Response**:
-```json
-{
-  "success": true,
-  "data": {
-    "guild_id": 123456789012345678,
-    "is_playing": true,
-    "current": {
-      "title": "Song Title",
-      "source_url": "https://www.youtube.com/watch?v=GitbDhOPBGs",
-      "duration_secs": 214,
-      "author": "Artist Name",
-      "thumbnail": "https://i.ytimg.com/vi/GitbDhOPBGs/maxresdefault.jpg"
-    },
-    "queue": [
-      {
-        "title": "Next Song in Queue",
-        "source_url": "https://www.youtube.com/watch?v=...",
-        "duration_secs": 180,
-        "author": "Another Artist",
-        "thumbnail": "https://..."
-      }
-    ],
-    "total_tracks": 2
-  },
-  "message": null
-}
-```
-
----
-
-### 5. Player Control (Pause, Resume, Skip, Stop, Clear, Volume)
 ```http
 POST /v1/player/control
 Content-Type: application/json
@@ -300,25 +337,28 @@ Content-Type: application/json
 }
 ```
 
-Supported `action` values:
-* `"pause"`: Pauses current playback.
-* `"resume"`: Resumes paused playback.
-* `"skip"`: Skips the currently playing track to the next item in the queue.
-* `"clear"`: Clears all upcoming tracks in the queue without interrupting the currently playing song.
-* `"stop"`: Stops playback and clears the queue completely.
-* `"volume"`: Adjusts output volume using the `value` field (`0.0` to `2.0`).
-  ```json
-  {
-    "guild_id": "123456789012345678",
-    "action": "volume",
-    "value": 0.5
-  }
-  ```
+| `action` | Effect |
+| :--- | :--- |
+| `pause` | Pauses current playback. |
+| `resume` | Resumes paused playback. |
+| `skip` | Skips to the next item in the queue. |
+| `stop` | Stops playback and clears the queue. |
+| `volume` | Sets output volume with `value` (`0.0` to `2.0`). |
 
----
+```json
+{
+  "guild_id": "123456789012345678",
+  "action": "volume",
+  "value": 0.5
+}
+```
 
-### 5. Resolve Track Metadata Without Playing
-Query track metadata and extract the direct CDN stream URL without playing it:
+</details>
+
+<details>
+<summary><b>Resolve track metadata without playing</b></summary>
+
+<br>
 
 ```http
 POST /v1/tracks/resolve
@@ -329,7 +369,6 @@ Content-Type: application/json
 }
 ```
 
-**Response**:
 ```json
 {
   "success": true,
@@ -345,9 +384,13 @@ Content-Type: application/json
 }
 ```
 
----
+</details>
 
-### 6. Disconnect from Voice Channel
+<details>
+<summary><b>Leave a voice channel</b></summary>
+
+<br>
+
 ```http
 POST /v1/voice/leave
 Content-Type: application/json
@@ -357,18 +400,53 @@ Content-Type: application/json
 }
 ```
 
+</details>
+
 ---
 
-## 🤖 Discord Bot Integration Example (TypeScript / Discord.js)
+## 🛡️ YouTube Anti-Bot & BotGuard
+
+Datacenter and cloud IPs are routinely hit with *"Sign in to confirm you're not a bot"*. `axAudio` ships a layered bypass:
+
+| Layer | What it does |
+| :--- | :--- |
+| **Deno JS engine** | `yt-dlp` needs a JavaScript runtime to decode YouTube's dynamic `base.js` player signatures. `axAudio` bundles Deno v2 for this. |
+| **PoToken sidecar** | Integrates with [`brainicism/bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) to generate valid BotGuard PoTokens on the fly. |
+| **Multi-account cookie pool** | Round-robin rotation across `./cookies/*.txt` or `YTDLP_COOKIES_POOL`, with automatic retry on the next cookie if one hits a challenge or rate limit. |
+
+<details>
+<summary><b>🍪 Cookie pool details</b></summary>
+
+<br>
+
+- **Round-robin rotation** spreads searches and streams across accounts, so no single account gets flagged for "abnormal traffic".
+- **Automatic retry**: if an account gets a temporary challenge, the next cookie in the pool is used immediately.
+- **Cookie lifespan**: root credentials (`SID`, `HSID`, `SSID`) last **1–2 years**. Rotating tokens (`__Secure-1PSIDTS`, `SIDCC`) change often; `yt-dlp` refreshes them in the file on every request when write permissions are enabled (`chmod 666`).
+- **Stream URL timeout**: the ~6-hour expiry only applies to individual `googlevideo.com` playback URLs, not your login. `axAudio` resolves fresh URLs per request and keeps an in-memory cache for fast replays.
+
+</details>
+
+### 🎧 Studio-grade audio
+
+- **Native 48 kHz Opus (format 251)**: prioritizes YouTube's ~160 kbps stereo Opus stream. No lossy AAC conversion, no 44.1k → 48k resampling ringing, and clean sub-bass (20–100 Hz).
+- **Soft-clipping**: Songbird's `use_softclip` applies a `tanh` limiter to intersample peaks near 0 dBFS, which removes harsh digital clipping while keeping bass dynamics intact.
+- **Headroom normalization**: a 0.95 (-0.5 dBFS) true-peak margin keeps loud masters from overloading the output stage.
+- **Configurable bitrate**: up to 384 kbps via `AUDIO_BITRATE`.
+
+---
+
+## 🤖 Discord Bot Integration
+
+A minimal example with TypeScript and Discord.js:
 
 ```typescript
 import axios from 'axios';
 
 const AXAUDIO_URL = 'http://127.0.0.1:2333';
 
-// 1. Join Voice Channel
+// 1. Join a voice channel
 async function joinVoice(guild, channel, botUser) {
-  // Collect Discord Gateway Voice Update events:
+  // Collect the Discord Gateway voice events:
   // - GatewayDispatchEvents.VoiceServerUpdate
   // - GatewayDispatchEvents.VoiceStateUpdate
   const voiceData = await waitForDiscordVoiceHandshake(guild.id);
@@ -383,7 +461,7 @@ async function joinVoice(guild, channel, botUser) {
   });
 }
 
-// 2. Play Audio
+// 2. Play audio
 async function playTrack(guildId: string, query: string) {
   const response = await axios.post(`${AXAUDIO_URL}/v1/player/play`, {
     guild_id: guildId,
@@ -393,7 +471,7 @@ async function playTrack(guildId: string, query: string) {
   return response.data;
 }
 
-// 3. Skip Track
+// 3. Skip the current track
 async function skipTrack(guildId: string) {
   await axios.post(`${AXAUDIO_URL}/v1/player/control`, {
     guild_id: guildId,
@@ -404,6 +482,43 @@ async function skipTrack(guildId: string) {
 
 ---
 
+## 🗺️ Roadmap
+
+- [x] Songbird 0.4 voice engine with Symphonia decoding
+- [x] REST control plane (join, leave, play, control, resolve)
+- [x] yt-dlp + Deno + PoToken sidecar
+- [x] Multi-account cookie pool with round-robin and auto-retry
+- [x] Docker Compose deployment
+- [ ] Seek / position control
+- [ ] Queue inspection endpoint
+- [ ] WebSocket player events (track start / end / error)
+
+Have an idea? [Open an issue](https://github.com/YOUR_USER/axAudio/issues).
+
+---
+
+## 🤝 Contributing
+
+Contributions, issues and feature requests are welcome.
+
+1. Fork the repo
+2. Create your branch: `git checkout -b feat/amazing-feature`
+3. Commit your changes: `git commit -m "feat: add amazing feature"`
+4. Push: `git push origin feat/amazing-feature`
+5. Open a Pull Request
+
+If `axAudio` saves you RAM (and money), consider leaving a ⭐. It helps a lot.
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Shnimlz/axAudio&type=Date)](https://star-history.com/#YOUR_USER/axAudio&Date)
+
+---
+
+## ⚠️ Disclaimer
+
+Using YouTube cookies and automated extraction may violate YouTube's Terms of Service, and accounts used for it can be restricted or suspended. Use a throwaway account and use this software at your own risk. `axAudio` is not affiliated with Discord, YouTube or Google.
+
+---
+
 ## 📜 License
 
-Licensed under the MIT License.
+Released under the [MIT License](LICENSE).
