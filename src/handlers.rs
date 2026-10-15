@@ -57,7 +57,7 @@ pub async fn voice_join(
     );
 
     let connection_info = ConnectionInfo {
-        channel_id: Some(channel_id.into()),
+        channel_id: channel_id.into(),
         guild_id: guild_id.into(),
         endpoint: payload.endpoint,
         session_id: payload.session_id,
