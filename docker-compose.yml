@@ -1,0 +1,18 @@
+services:
+  axaudio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: axaudio
+    restart: unless-stopped
+    ports:
+      - "2333:2333"
+    environment:
+      - PORT=2333
+      - RUST_LOG=axAudio=info,tower_http=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:2333/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
