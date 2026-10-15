@@ -54,12 +54,12 @@ COPY --from=builder --chown=axaudio:axaudio /app/target/release/axAudio /app/axA
 ENV PORT=2333
 ENV RUST_LOG=axAudio=info,tower_http=info
 
-# Exponer el puerto HTTP de control
-EXPOSE 2333
+# Exponer puertos HTTP (2333 por defecto, 3000 para Coolify)
+EXPOSE 2333 3000
 
-# Monitoreo de salud para Docker / Coolify
-HEALTHCHECK --interval=20s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://127.0.0.1:2333/health || exit 1
+# Monitoreo de salud dinámico que evalúa la variable $PORT
+HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
+    CMD sh -c 'curl -f "http://127.0.0.1:${PORT:-2333}/health" || exit 1'
 
 # Ejecutar el motor de audio
 CMD ["/app/axAudio"]
