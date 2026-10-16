@@ -719,6 +719,7 @@ impl SourceResolver {
             "query": query
         });
 
+        let body_str = serde_json::to_string(&body).unwrap_or_default();
         let response = self
             .http_client
             .post(endpoint)
@@ -729,7 +730,7 @@ impl SourceResolver {
             )
             .header("X-YouTube-Client-Name", "1")
             .header("X-YouTube-Client-Version", "2.20240101.00.00")
-            .json(&body)
+            .body(body_str)
             .send()
             .await
             .map_err(|e| format!("Error de conexión con InnerTube: {}", e))?;
@@ -738,9 +739,12 @@ impl SourceResolver {
             return Err(format!("InnerTube devolvió status HTTP {}", response.status()));
         }
 
-        let json_data: serde_json::Value = response
-            .json()
+        let resp_text = response
+            .text()
             .await
+            .map_err(|e| format!("Error leyendo texto de respuesta de InnerTube: {}", e))?;
+
+        let json_data: serde_json::Value = serde_json::from_str(&resp_text)
             .map_err(|e| format!("Error decodificando respuesta JSON de InnerTube: {}", e))?;
 
         let mut results = Vec::new();
