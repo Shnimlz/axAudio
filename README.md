@@ -19,11 +19,11 @@ A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 [![Stars](https://img.shields.io/github/stars/Shnimlz/axAudio?style=flat&logo=github)](https://github.com/Shnimlz/axAudio/stargazers)
 [![Issues](https://img.shields.io/github/issues/Shnimlz/axAudio)](https://github.com/Shnimlz/axAudio/issues)
 
-[**Quick Start**](#-quick-start) ·
-[**API Reference**](#-rest-api-reference) ·
-[**Configuration**](#%EF%B8%8F-configuration) ·
-[**YouTube Anti-Bot**](#%EF%B8%8F-youtube-anti-bot--botguard) ·
-[**Bot Example**](#-discord-bot-integration)
+[**Docs Index**](docs/README.md) ·
+[**DSP Engine**](docs/dsp.md) ·
+[**Architecture**](docs/architecture.md) ·
+[**API Reference**](docs/api.md) ·
+[**Quick Start**](#-quick-start)
 
 |  📦 Binary  |    🧠 RAM    | 🚀 Startup |    🎚️ Transport     |
 | :---------: | :----------: | :--------: | :-----------------: |
@@ -36,7 +36,7 @@ A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 
 - [Why axAudio?](#-why-axaudio)
 - [Features](#-features)
-- [Architecture](#-architecture)
+- [Architecture & Documentation](#-architecture--documentation)
 - [Quick Start](#-quick-start)
 - [Running on Bare Metal](#-running-on-bare-metal)
 - [Configuration](#%EF%B8%8F-configuration)
@@ -47,6 +47,17 @@ A zero-GC, sub-millisecond, low-memory replacement for Java Lavalink.
 - [Contributing](#-contributing)
 - [Disclaimer](#%EF%B8%8F-disclaimer)
 - [License](#-license)
+
+## 📚 Technical Documentation
+
+Comprehensive engineering documentation is available under [`/docs`](docs/README.md):
+
+- 📐 [**Architecture & Concurrency**](docs/architecture.md): Zero-GC guarantees, thread pool tuning, Songbird driver integration.
+- 🎛️ [**DSP Processing Engine**](docs/dsp.md): Mathematical specification of 15-band TDF-II biquads, phase-coherent Mid/Side 3D widening, acoustic crossfeed, and soft-clip limiting.
+- 🌐 [**REST API Reference**](docs/api.md): Complete endpoint contracts, JSON schemas, and parameters.
+- 📡 [**WebSocket Telemetry**](docs/telemetry.md): Event bus specifications (`track_start`, `track_end`, `track_error`).
+- 🛡️ [**Streaming & Anti-Bot Bypass**](docs/streaming-and-sources.md): Multi-cookie pools, Deno JS runtime, and PoToken sidecar integration.
+- 🚀 [**Deployment & Operations**](docs/deployment.md): Docker Compose, host networking, Tailscale mesh peering, and system sizing.
 
 ## 🤔 Why axAudio?
 
