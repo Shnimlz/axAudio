@@ -3,7 +3,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/light_1.svg">
     <source media="(prefers-color-scheme: light)" srcset="assets/dark_1.svg">
-    <img alt="AxAudio" src="assets/light_1.svg" width="300">
+    <img alt="AxAudio" src="assets/light_1.svg">
   </picture>
 </p>
 
