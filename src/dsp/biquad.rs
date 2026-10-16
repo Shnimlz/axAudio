@@ -139,9 +139,14 @@ pub struct BiquadState {
 impl BiquadState {
     #[inline(always)]
     pub fn process_sample(&mut self, coeffs: &BiquadCoefficients, sample: f32) -> f32 {
-        let out = coeffs.b0 * sample + coeffs.b1 * self.x1 + coeffs.b2 * self.x2
+        let mut out = coeffs.b0 * sample + coeffs.b1 * self.x1 + coeffs.b2 * self.x2
             - coeffs.a1 * self.y1
             - coeffs.a2 * self.y2;
+
+        // Anti-denormal flush (evita números subnormales que ralentizan el hilo de audio y crean siseo)
+        if out.abs() < 1e-15 {
+            out = 0.0;
+        }
 
         self.x2 = self.x1;
         self.x1 = sample;

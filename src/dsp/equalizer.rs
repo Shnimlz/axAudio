@@ -25,12 +25,14 @@ pub struct Equalizer {
     pub is_active: bool,
 }
 
+pub const EQ_Q: f32 = 1.8;
+
 impl Equalizer {
     pub fn new(sample_rate: f32) -> Self {
         let mut filters = Vec::with_capacity(15);
         for &freq in &EQ_FREQUENCIES {
             filters.push(StereoBiquad::new(
-                FilterType::Peaking { q: 1.1 },
+                FilterType::Peaking { q: EQ_Q },
                 freq,
                 0.0,
                 sample_rate,
@@ -51,7 +53,7 @@ impl Equalizer {
             let clamped = gain_db.clamp(-15.0, 15.0);
             self.gains_db[band] = clamped;
             let freq = EQ_FREQUENCIES[band];
-            self.filters[band].update(FilterType::Peaking { q: 1.1 }, freq, clamped, self.sample_rate);
+            self.filters[band].update(FilterType::Peaking { q: EQ_Q }, freq, clamped, self.sample_rate);
             self.check_active();
         }
     }
@@ -86,7 +88,7 @@ impl Equalizer {
         self.gains_db = [0.0; 15];
         for (i, filter) in self.filters.iter_mut().enumerate() {
             filter.update(
-                FilterType::Peaking { q: 1.1 },
+                FilterType::Peaking { q: EQ_Q },
                 EQ_FREQUENCIES[i],
                 0.0,
                 self.sample_rate,

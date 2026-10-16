@@ -14,52 +14,52 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
     match name.to_lowercase().as_str() {
         "dolby-atmos" | "cinema-3d" | "atmos" => Some(DspPreset {
             name: "cinema-3d",
-            description: "Inmersión cinemática 3D tipo Dolby Atmos con crossfeed binaural y graves profundos",
+            description: "Inmersión cinemática 3D tipo Dolby Atmos con crossfeed binaural y graves limpios",
             // 25, 40, 63, 100, 160, 250, 400, 630, 1k, 1.6k, 2.5k, 4k, 6.3k, 10k, 16k
-            eq_bands: [4.0, 3.5, 2.5, 1.0, 0.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+            eq_bands: [3.0, 2.5, 1.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.5, 1.5, 2.0, 2.0, 2.5],
             spatial: SpatialSettings {
-                stereo_width: 1.45,
+                stereo_width: 1.25,
                 binaural_crossfeed: true,
-                crossfeed_level: 0.25,
+                crossfeed_level: 0.18,
                 bass_exciter: true,
-                bass_exciter_drive: 0.35,
+                bass_exciter_drive: 0.20,
             },
         }),
 
         "bass-boost-3d" | "bass-boost" | "bass" => Some(DspPreset {
             name: "bass-boost-3d",
-            description: "Realce agresivo de sub-graves con armónicos psicoacústicos y sonido ensanchado",
-            eq_bands: [7.5, 6.5, 5.0, 3.0, 1.5, 0.0, -0.5, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.0, 2.5],
+            description: "Realce profundo de sub-graves con armónicos limpios y escena ensanchada",
+            eq_bands: [5.0, 4.0, 3.0, 1.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.5, 1.5, 2.0],
             spatial: SpatialSettings {
-                stereo_width: 1.25,
+                stereo_width: 1.15,
                 binaural_crossfeed: false,
-                crossfeed_level: 0.15,
+                crossfeed_level: 0.10,
                 bass_exciter: true,
-                bass_exciter_drive: 0.65,
+                bass_exciter_drive: 0.25,
             },
         }),
 
         "concert-hall" | "arena" | "hall" => Some(DspPreset {
             name: "concert-hall",
-            description: "Acústica de auditorio masivo, apertura lateral máxima y brillo en agudos",
-            eq_bands: [2.0, 1.5, 1.0, 0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0],
+            description: "Acústica de sala de conciertos, apertura espacial amplia y aire en agudos",
+            eq_bands: [1.5, 1.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.0, 2.5, 2.5, 3.0, 3.0],
             spatial: SpatialSettings {
-                stereo_width: 1.70,
+                stereo_width: 1.35,
                 binaural_crossfeed: true,
-                crossfeed_level: 0.30,
+                crossfeed_level: 0.22,
                 bass_exciter: false,
-                bass_exciter_drive: 0.2,
+                bass_exciter_drive: 0.10,
             },
         }),
 
         "vocal-clarity" | "vocal" | "voice" => Some(DspPreset {
             name: "vocal-clarity",
-            description: "Voces cristalinas al frente con atenuación de retumbes y compresión espacial",
-            eq_bands: [-3.0, -2.5, -1.5, -0.5, 0.5, 1.0, 2.0, 3.0, 3.5, 3.0, 2.0, 1.0, 0.5, 0.0, -0.5],
+            description: "Voces cristalinas al frente con recorte de retumbes graves",
+            eq_bands: [-2.5, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 2.5, 2.5, 1.5, 0.5, 0.0, 0.0, 0.0],
             spatial: SpatialSettings {
                 stereo_width: 1.05,
                 binaural_crossfeed: false,
-                crossfeed_level: 0.1,
+                crossfeed_level: 0.08,
                 bass_exciter: false,
                 bass_exciter_drive: 0.0,
             },
@@ -67,14 +67,14 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
 
         "nightcore" => Some(DspPreset {
             name: "nightcore",
-            description: "Curva V-Shape con pegada de club y agudos chispeantes",
-            eq_bands: [5.0, 4.5, 3.5, 2.0, 0.5, -1.0, -1.5, -1.0, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.0],
+            description: "Curva V-Shape dinámica para electrónica con graves definidos y brillo",
+            eq_bands: [3.5, 3.0, 2.0, 1.0, 0.0, -0.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5],
             spatial: SpatialSettings {
-                stereo_width: 1.35,
+                stereo_width: 1.20,
                 binaural_crossfeed: false,
-                crossfeed_level: 0.15,
+                crossfeed_level: 0.10,
                 bass_exciter: true,
-                bass_exciter_drive: 0.45,
+                bass_exciter_drive: 0.25,
             },
         }),
 

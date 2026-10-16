@@ -71,6 +71,12 @@ impl DspChain {
         self.active_preset = Some("flat".to_string());
     }
 
+    /// Verifica si hay algún procesamiento activo en la cadena DSP
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.equalizer.is_active || self.spatial.is_active()
+    }
+
     /// Obtiene el estado actual para telemetría y API
     pub fn get_status(&self) -> DspStatus {
         DspStatus {
@@ -85,17 +91,49 @@ impl DspChain {
     /// Procesa un bloque de audio estéreo planar in-place a través de toda la cadena DSP
     #[inline]
     pub fn process_planar(&mut self, left: &mut [f32], right: &mut [f32]) {
-        // 1. Ecualizador de 15 bandas
+        if !self.is_active() {
+            return;
+        }
+
+        // 1. Compensación de Headroom (Pre-amp automático):
+        // Si hay bandas de EQ con ganancia positiva, atenuamos la entrada para
+        // garantizar que ningún pico sature ni distorsione el audio
+        let max_boost = self.equalizer.gains_db.iter().copied().fold(0.0f32, f32::max);
+        if max_boost > 0.2 {
+            let preamp = 10.0f32.powf(-max_boost / 20.0);
+            for s in left.iter_mut() {
+                *s *= preamp;
+            }
+            for s in right.iter_mut() {
+                *s *= preamp;
+            }
+        }
+
+        // 2. Ecualizador de 15 bandas
         self.equalizer.process_planar(left, right);
 
-        // 2. Spatializer (Mid/Side + Binaural Crossfeed + Bass Exciter)
+        // 3. Spatializer (Mid/Side + Binaural Crossfeed + Bass Exciter)
         self.spatial.process_planar(left, right);
 
-        // 3. Tanh Soft-Clipping de protección para evitar distorsión inter-sample digital
+        // 4. Limitador transparente de picos (solo actúa suavemente si excede 0.95)
         let len = left.len().min(right.len());
         for i in 0..len {
-            left[i] = (left[i] * 0.95).tanh();
-            right[i] = (right[i] * 0.95).tanh();
+            left[i] = soft_limit_peak(left[i]);
+            right[i] = soft_limit_peak(right[i]);
         }
+    }
+}
+
+/// Limitador transparente: lineal hasta 0.95 (-0.45 dBFS); comprime suavemente con tanh solo los picos extremos
+#[inline(always)]
+fn soft_limit_peak(x: f32) -> f32 {
+    const THRESHOLD: f32 = 0.95;
+    const MARGIN: f32 = 1.0 - THRESHOLD;
+    if x > THRESHOLD {
+        THRESHOLD + MARGIN * ((x - THRESHOLD) / MARGIN).tanh()
+    } else if x < -THRESHOLD {
+        -THRESHOLD - MARGIN * ((-x - THRESHOLD) / MARGIN).tanh()
+    } else {
+        x
     }
 }

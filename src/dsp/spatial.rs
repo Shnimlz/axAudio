@@ -128,6 +128,13 @@ impl SpatialProcessor {
         self.settings = settings;
     }
 
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        (self.settings.stereo_width - 1.0).abs() > 0.02
+            || self.settings.binaural_crossfeed
+            || self.settings.bass_exciter
+    }
+
     pub fn reset(&mut self) {
         self.delay_l.reset();
         self.delay_r.reset();
@@ -148,7 +155,7 @@ impl SpatialProcessor {
             return;
         }
 
-        let crossfeed = self.settings.crossfeed_level.clamp(0.0, 0.45);
+        let crossfeed = self.settings.crossfeed_level.clamp(0.0, 0.40);
         let bass_drive = self.settings.bass_exciter_drive.clamp(0.0, 1.0);
         let len = left.len().min(right.len());
 
@@ -157,13 +164,13 @@ impl SpatialProcessor {
             let mut r = right[i];
 
             // 1. Excitador Armónico de Sub-graves (Psychoacoustic Bass)
+            // Realza la presencia de graves en audífonos sin distorsión áspera
             if do_bass {
                 let (sub_l, sub_r) = self.bass_filter.process_pair(l, r);
-                // Generar 2do y 3er armónico no-lineal mediante saturación suave tanh
-                let harm_l = (sub_l * (1.0 + bass_drive * 3.0)).tanh();
-                let harm_r = (sub_r * (1.0 + bass_drive * 3.0)).tanh();
-                l += harm_l * bass_drive * 0.4;
-                r += harm_r * bass_drive * 0.4;
+                let harm_l = (sub_l * 1.5).tanh();
+                let harm_r = (sub_r * 1.5).tanh();
+                l += harm_l * bass_drive * 0.15;
+                r += harm_r * bass_drive * 0.15;
             }
 
             // 2. Mid/Side Spatial Widening
