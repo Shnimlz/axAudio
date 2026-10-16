@@ -10,9 +10,14 @@ permissions:
   packages: write
 
 jobs:
-  build-and-push:
-    name: Build, Tag & Publish GHCR
+  meta:
+    name: Compute Version Metadata
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+      lowercase: ${{ steps.repo.outputs.lowercase }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -20,7 +25,7 @@ jobs:
           fetch-depth: 0
 
       - name: Compute Semantic Version
-        id: meta_version
+        id: version
         run: |
           COMMITS=$(git rev-list --count HEAD)
           SHORT_SHA=$(git rev-parse --short HEAD)
@@ -31,8 +36,32 @@ jobs:
           echo "sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "=== Building axAudio version: ${VERSION} (${SHORT_SHA}) ==="
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Downcase repository name for Docker tag
+        id: repo
+        run: |
+          echo "lowercase=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            artifact_name: digests-amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            artifact_name: digests-arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -44,31 +73,83 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Downcase repository name for Docker tag
-        id: repo_name
-        run: |
-          echo "lowercase=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push Docker image
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ steps.repo_name.outputs.lowercase }}:latest
-            ghcr.io/${{ steps.repo_name.outputs.lowercase }}:${{ steps.meta_version.outputs.version }}
-            ghcr.io/${{ steps.repo_name.outputs.lowercase }}:${{ steps.meta_version.outputs.tag }}
+          platforms: ${{ matrix.platform }}
           build-args: |
-            AXAUDIO_VERSION=${{ steps.meta_version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            AXAUDIO_VERSION=${{ needs.meta.outputs.version }}
+          outputs: |
+            type=image,name=ghcr.io/${{ needs.meta.outputs.lowercase }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=build-${{ matrix.artifact_name }}
+          cache-to: type=gha,scope=build-${{ matrix.artifact_name }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge Manifests & Release
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Download all digest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-platform manifest and push
+        run: |
+          cd ${{ runner.temp }}/digests
+          DIGEST_LIST=""
+          for digest_file in *; do
+            DIGEST_LIST="${DIGEST_LIST} ghcr.io/${{ needs.meta.outputs.lowercase }}@sha256:${digest_file}"
+          done
+
+          echo "Pointers: ${DIGEST_LIST}"
+          docker buildx imagetools create \
+            -t ghcr.io/${{ needs.meta.outputs.lowercase }}:latest \
+            -t ghcr.io/${{ needs.meta.outputs.lowercase }}:${{ needs.meta.outputs.version }} \
+            -t ghcr.io/${{ needs.meta.outputs.lowercase }}:${{ needs.meta.outputs.tag }} \
+            ${DIGEST_LIST}
+
+      - name: Inspect final multi-platform image
+        run: |
+          docker buildx imagetools inspect ghcr.io/${{ needs.meta.outputs.lowercase }}:latest
 
       - name: Create Git Tag & GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta_version.outputs.tag }}
-          name: "axAudio v${{ steps.meta_version.outputs.version }}"
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: "axAudio ${{ needs.meta.outputs.tag }}"
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
