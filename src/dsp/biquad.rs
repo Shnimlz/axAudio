@@ -1,7 +1,9 @@
 //! Filtros IIR Biquad (Audio EQ Cookbook - Robert Bristow-Johnson)
 //!
-//! Implementación matemática de alta fidelidad para ecualización en tiempo real.
+//! Implementación matemática de alta fidelidad con topología Transposed Direct Form II (TDF-II).
+//! Incluye estabilización de factor Q en subgraves y bypass transparente de ganancia cero.
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FilterType {
     Peaking { q: f32 },
@@ -20,9 +22,29 @@ pub struct BiquadCoefficients {
     pub a2: f32,
 }
 
+impl Default for BiquadCoefficients {
+    fn default() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+        }
+    }
+}
+
 impl BiquadCoefficients {
     /// Calcula los coeficientes biquad para una frecuencia central, ganancia en dB y frecuencia de muestreo
     pub fn compute(filter_type: FilterType, freq_hz: f32, gain_db: f32, sample_rate: f32) -> Self {
+        // Zero-gain bypass: si la ganancia es prácticamente nula en un filtro peaking o shelf,
+        // devolvemos ganancia unitaria directa sin alterar la señal
+        if matches!(filter_type, FilterType::Peaking { .. } | FilterType::LowShelf | FilterType::HighShelf)
+            && gain_db.abs() < 0.01
+        {
+            return Self::default();
+        }
+
         let f0 = freq_hz.clamp(10.0, sample_rate * 0.49);
         let a = 10.0f32.powf(gain_db / 40.0);
         let w0 = 2.0 * std::f32::consts::PI * f0 / sample_rate;
@@ -31,7 +53,17 @@ impl BiquadCoefficients {
 
         match filter_type {
             FilterType::Peaking { q } => {
-                let alpha = sin_w0 / (2.0 * q.max(0.1));
+                // Estabilización de Q en graves:
+                // En frecuencias subgraves (< 60 Hz), un Q alto causa inestabilidad numérica
+                // severa y siseo/estática en coma flotante de 32 bits. Tapering suave hacia 0.8 en 20 Hz.
+                let effective_q = if f0 < 60.0 {
+                    let max_q = (f0 - 20.0).max(0.0) * ((q - 0.8) / 40.0) + 0.8;
+                    q.min(max_q).max(0.2)
+                } else {
+                    q.max(0.1)
+                };
+
+                let alpha = sin_w0 / (2.0 * effective_q);
                 let a0 = 1.0 + alpha / a;
                 let a1 = -2.0 * cos_w0;
                 let a2 = 1.0 - alpha / a;
@@ -127,44 +159,42 @@ impl BiquadCoefficients {
     }
 }
 
-/// Estado del filtro biquad para un solo canal de audio (Direct Form I / Transposed II)
+/// Estado del filtro biquad en Transposed Direct Form II (TDF-II)
+///
+/// A diferencia de Direct Form I (que mantiene x1, x2, y1, y2), TDF-II solo almacena dos
+/// variables de estado integradas (s1, s2). Esta topología reduce drásticamente el ruido
+/// de cuantización y cancelación en f32, eliminando ruidos de fondo y estática en frecuencias bajas.
 #[derive(Debug, Clone, Default)]
 pub struct BiquadState {
-    pub x1: f32,
-    pub x2: f32,
-    pub y1: f32,
-    pub y2: f32,
+    pub s1: f32,
+    pub s2: f32,
 }
 
 impl BiquadState {
     #[inline(always)]
     pub fn process_sample(&mut self, coeffs: &BiquadCoefficients, sample: f32) -> f32 {
-        let mut out = coeffs.b0 * sample + coeffs.b1 * self.x1 + coeffs.b2 * self.x2
-            - coeffs.a1 * self.y1
-            - coeffs.a2 * self.y2;
+        // Ecuaciones Transposed Direct Form II:
+        // y[n] = b0 * x[n] + s1
+        // s1   = b1 * x[n] - a1 * y[n] + s2
+        // s2   = b2 * x[n] - a2 * y[n]
+        let out = coeffs.b0 * sample + self.s1;
 
-        // Anti-denormal flush (evita números subnormales que ralentizan el hilo de audio y crean siseo)
-        if out.abs() < 1e-15 {
-            out = 0.0;
-        }
+        // Anti-denormal flush con umbral microscópico para evitar sobrecarga en CPU
+        let clean_out = if out.abs() < 1e-15 { 0.0 } else { out };
 
-        self.x2 = self.x1;
-        self.x1 = sample;
-        self.y2 = self.y1;
-        self.y1 = out;
+        self.s1 = coeffs.b1 * sample - coeffs.a1 * clean_out + self.s2;
+        self.s2 = coeffs.b2 * sample - coeffs.a2 * clean_out;
 
-        out
+        clean_out
     }
 
     pub fn reset(&mut self) {
-        self.x1 = 0.0;
-        self.x2 = 0.0;
-        self.y1 = 0.0;
-        self.y2 = 0.0;
+        self.s1 = 0.0;
+        self.s2 = 0.0;
     }
 }
 
-/// Filtro biquad estéreo completo (mantiene coeficientes y estados L/R)
+/// Filtro biquad estéreo completo (mantiene coeficientes y estados L/R en TDF-II)
 #[derive(Debug, Clone)]
 pub struct StereoBiquad {
     pub coeffs: BiquadCoefficients,
@@ -205,3 +235,38 @@ impl StereoBiquad {
         self.right.reset();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_zero_gain_bypass() {
+        let mut filter = StereoBiquad::new(FilterType::Peaking { q: 1.0 }, 1000.0, 0.0, 48000.0);
+        assert!(!filter.active);
+        let (l, r) = filter.process_pair(0.5, -0.25);
+        assert_eq!(l, 0.5);
+        assert_eq!(r, -0.25);
+    }
+
+    #[test]
+    fn test_sub_bass_stability() {
+        // Test 25 Hz sub-bass filter with aggressive boost
+        let mut filter = StereoBiquad::new(FilterType::Peaking { q: 1.8 }, 25.0, 12.0, 48000.0);
+        assert!(filter.active);
+
+        // Process impulse followed by silence for 1000 samples
+        let (first_l, first_r) = filter.process_pair(1.0, 1.0);
+        assert!(first_l.is_finite());
+        assert!(first_r.is_finite());
+
+        for _ in 0..1000 {
+            let (l, r) = filter.process_pair(0.0, 0.0);
+            assert!(l.is_finite());
+            assert!(r.is_finite());
+            assert!(l.abs() < 5.0);
+            assert!(r.abs() < 5.0);
+        }
+    }
+}
+

@@ -1,7 +1,9 @@
 //! Módulo de Procesamiento de Señales Digitales (DSP) de axAudio
 //!
 //! Integra ecualización de 15 bandas, expansión espacial Mid/Side,
-//! modelado binaural tipo Dolby Atmos y limitador analógico soft-clip.
+//! modelado acústico 3D y limitador analógico soft-clip.
+
+#![allow(unused_imports, dead_code)]
 
 pub mod biquad;
 pub mod decoder;

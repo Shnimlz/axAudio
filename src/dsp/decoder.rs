@@ -1,7 +1,8 @@
 //! Decodificador envoltorio DSP para Songbird y Symphonia
 //!
 //! Intercepta las muestras PCM de 32-bit float antes del mixer de Songbird,
-//! aplicando ecualización de 15 bandas, audio 3D binaural y soft-limiter.
+//! aplicando ecualización de 15 bandas, audio 3D estéreo y soft-limiter.
+//! Garantiza procesamiento determinista y continuo sin pérdidas de tramas por contención.
 
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
@@ -92,9 +93,8 @@ impl Decoder for DspDecoder {
     fn reset(&mut self) {
         self.inner.reset();
         self.last_was_dsp = false;
-        if let Ok(mut dsp) = self.dsp.try_lock() {
-            dsp.spatial.reset();
-        }
+        let mut dsp = self.dsp.lock().unwrap_or_else(|e| e.into_inner());
+        dsp.spatial.reset();
     }
 
     fn codec_params(&self) -> &CodecParameters {
@@ -106,21 +106,19 @@ impl Decoder for DspDecoder {
     }
 
     fn decode(&mut self, packet: &Packet) -> SymphResult<AudioBufferRef<'_>> {
-        // 1. Comprobar si hay algún filtro o procesamiento activo
-        let is_dsp_active = match self.dsp.try_lock() {
-            Ok(guard) => guard.is_active(),
-            Err(_) => false,
-        };
+        // 1. Decodificar la trama con el códec subyacente (sin retener locks innecesarios)
+        let decoded = self.inner.decode(packet)?;
 
-        // 2. Si el DSP está desactivado (modo flat/neutro), pasar directamente sin copias
-        // Esto garantiza CERO interferencias o alteraciones con la señal de Symphonia
-        if !is_dsp_active {
+        // 2. Adquirir lock determinista del DSP (operaciones en microsegundos, sin saltos por try_lock)
+        let mut dsp = self.dsp.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 3. Si el DSP está completamente desactivado (modo flat/neutro), retornar directo
+        // CERO sobrecarga o alteración de señal en modo neutro
+        if !dsp.is_active() {
             self.last_was_dsp = false;
-            return self.inner.decode(packet);
+            return Ok(decoded);
         }
 
-        // 3. DSP activo: decodificar la trama con el decodificador nativo
-        let decoded = self.inner.decode(packet)?;
         self.last_was_dsp = true;
 
         // 4. Asegurar que f32_buf tenga EXACTAMENTE la misma capacidad y especificación que decoded
@@ -142,14 +140,10 @@ impl Decoder for DspDecoder {
         // 5. Aplicar la cadena DSP sobre los canales de audio plano
         if f32_buf.spec().channels.count() >= 2 {
             let (left, right) = f32_buf.chan_pair_mut(0, 1);
-            if let Ok(mut dsp) = self.dsp.try_lock() {
-                dsp.process_planar(left, right);
-            }
+            dsp.process_planar(left, right);
         } else if f32_buf.spec().channels.count() == 1 {
             let mono = f32_buf.chan_mut(0);
-            if let Ok(mut dsp) = self.dsp.try_lock() {
-                dsp.equalizer.process_mono(mono);
-            }
+            dsp.equalizer.process_mono(mono);
         }
 
         Ok(AudioBufferRef::F32(Cow::Borrowed(f32_buf)))

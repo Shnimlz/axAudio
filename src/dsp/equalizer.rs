@@ -2,6 +2,10 @@
 //!
 //! Frecuencias estándar ISO / Lavalink:
 //! 25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 16000 Hz.
+//!
+//! Incorpora calibración de factor de calidad (Q) psicoacústico dependiente de la frecuencia:
+//! Q moderado y estabilizado en subgraves para evitar zumbidos y resonancias artificiales,
+//! Q quirúrgico en rango vocal/medios y Q suave en agudos para un timbre orgánico y cálido.
 
 use super::biquad::{FilterType, StereoBiquad};
 use serde::{Deserialize, Serialize};
@@ -10,6 +14,21 @@ pub const EQ_FREQUENCIES: [f32; 15] = [
     25.0, 40.0, 63.0, 100.0, 160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0, 2500.0, 4000.0, 6300.0,
     10000.0, 16000.0,
 ];
+
+/// Factor Q calibrado por banda según principios psicoacústicos de masterización
+#[inline]
+pub fn get_band_q(band: usize) -> f32 {
+    match band {
+        0 => 0.8,       // 25 Hz: subgrave ultra-bajo, ancho y libre de resonancia inestable
+        1 => 1.0,       // 40 Hz: pegada profunda de bombo/sub-bass
+        2 => 1.2,       // 63 Hz: bajo eléctrico y sintetizadores
+        3 => 1.4,       // 100 Hz: cuerpo de graves
+        4 => 1.6,       // 160 Hz: calidez de medios-graves
+        5..=9 => 1.8,   // 250 Hz - 2.5 kHz: precisión quirúrgica para rango vocal e instrumental
+        10..=12 => 1.5, // 4 kHz - 6.3 kHz: presencia y brillo nítido
+        _ => 1.2,       // 10 kHz - 16 kHz: aire sedoso en agudos tipo campana ancha
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BandSetting {
@@ -25,14 +44,12 @@ pub struct Equalizer {
     pub is_active: bool,
 }
 
-pub const EQ_Q: f32 = 1.8;
-
 impl Equalizer {
     pub fn new(sample_rate: f32) -> Self {
         let mut filters = Vec::with_capacity(15);
-        for &freq in &EQ_FREQUENCIES {
+        for (band, &freq) in EQ_FREQUENCIES.iter().enumerate() {
             filters.push(StereoBiquad::new(
-                FilterType::Peaking { q: EQ_Q },
+                FilterType::Peaking { q: get_band_q(band) },
                 freq,
                 0.0,
                 sample_rate,
@@ -53,7 +70,12 @@ impl Equalizer {
             let clamped = gain_db.clamp(-15.0, 15.0);
             self.gains_db[band] = clamped;
             let freq = EQ_FREQUENCIES[band];
-            self.filters[band].update(FilterType::Peaking { q: EQ_Q }, freq, clamped, self.sample_rate);
+            self.filters[band].update(
+                FilterType::Peaking { q: get_band_q(band) },
+                freq,
+                clamped,
+                self.sample_rate,
+            );
             self.check_active();
         }
     }
@@ -81,14 +103,16 @@ impl Equalizer {
                 self.set_band_db(b.band, b.gain);
             }
         }
+        self.check_active();
     }
 
     /// Restablece todas las bandas a plano (0 dB)
+    #[allow(dead_code)]
     pub fn reset_flat(&mut self) {
         self.gains_db = [0.0; 15];
         for (i, filter) in self.filters.iter_mut().enumerate() {
             filter.update(
-                FilterType::Peaking { q: EQ_Q },
+                FilterType::Peaking { q: get_band_q(i) },
                 EQ_FREQUENCIES[i],
                 0.0,
                 self.sample_rate,
@@ -98,7 +122,7 @@ impl Equalizer {
         self.is_active = false;
     }
 
-    fn check_active(&mut self) {
+    pub fn check_active(&mut self) {
         self.is_active = self.gains_db.iter().any(|g| g.abs() > 0.05);
     }
 

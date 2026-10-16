@@ -313,7 +313,7 @@ async fn create_track_with_dsp(
     dsp_chain: Arc<std::sync::Mutex<crate::dsp::DspChain>>,
 ) -> Track {
     let source = HttpRequest::new(http_client.clone(), stream_url.clone());
-    let mut input: songbird::input::Input = source.into();
+    let input: songbird::input::Input = source.into();
 
     match input
         .make_playable_async(
