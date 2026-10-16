@@ -56,15 +56,44 @@ pub struct SourceResolver {
     ttl: Duration,
     cookie_rotation_index: Arc<AtomicUsize>,
     process_semaphore: Arc<Semaphore>,
+    http_client: reqwest::Client,
+}
+
+/// Convierte cadenas de duración ("3:45", "1:15:20" o "45") a segundos totales
+pub fn parse_duration_string(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.len() {
+        1 => parts[0].trim().parse::<u64>().ok(),
+        2 => {
+            let mins = parts[0].trim().parse::<u64>().ok()?;
+            let secs = parts[1].trim().parse::<u64>().ok()?;
+            Some(mins * 60 + secs)
+        }
+        3 => {
+            let hours = parts[0].trim().parse::<u64>().ok()?;
+            let mins = parts[1].trim().parse::<u64>().ok()?;
+            let secs = parts[2].trim().parse::<u64>().ok()?;
+            Some(hours * 3600 + mins * 60 + secs)
+        }
+        _ => None,
+    }
 }
 
 impl SourceResolver {
     pub fn new() -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(6))
+            .connect_timeout(Duration::from_secs(3))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         Self {
             cache: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(3600 * 4), // 4 horas de TTL para streams de audio
             cookie_rotation_index: Arc::new(AtomicUsize::new(0)),
             process_semaphore: Arc::new(Semaphore::new(1)),
+            http_client,
         }
     }
 
@@ -498,13 +527,52 @@ impl SourceResolver {
             });
         }
 
+        // 2.5. Si no es URL directa ni prefijo especial (scsearch:, bcsearch:), resolver video con InnerTube nativo (~30ms)
+        let is_direct_url = query_trimmed.starts_with("http://") || query_trimmed.starts_with("https://");
+        let has_special_prefix = query_trimmed.starts_with("scsearch:") || query_trimmed.starts_with("bcsearch:");
+
+        let resolved_target = if !is_direct_url && !has_special_prefix {
+            let clean_q = query_trimmed.strip_prefix("ytsearch:").unwrap_or(query_trimmed);
+            match self.search_innertube(clean_q, 1).await {
+                Ok(entries) if !entries.is_empty() => {
+                    info!(
+                        query = %query_trimmed,
+                        resolved_url = %entries[0].url,
+                        title = %entries[0].title,
+                        "Query de texto resuelto nativamente a video directo con InnerTube"
+                    );
+                    entries[0].url.clone()
+                }
+                _ => query_trimmed.to_string(),
+            }
+        } else {
+            query_trimmed.to_string()
+        };
+
+        // Si se resolvió a una URL de video y ya estaba en caché, retornar inmediatamente sin invocar yt-dlp
+        if resolved_target != query_trimmed && custom_extractor_args.is_none() && custom_extra_args.is_none() && custom_cookies.is_none() {
+            let target_cache_key = if let Some(fmt) = custom_format {
+                format!("{}##fmt={}", resolved_target, fmt)
+            } else {
+                resolved_target.clone()
+            };
+            if let Some(entry) = self.cache.get(&target_cache_key) {
+                let (meta, cached_at) = entry.value();
+                if cached_at.elapsed() < self.ttl {
+                    info!(query = %query_trimmed, resolved = %resolved_target, title = %meta.title, "Source resolver cache hit post-InnerTube");
+                    self.cache.insert(cache_key, (meta.clone(), Instant::now()));
+                    return Ok(meta.clone());
+                }
+            }
+        }
+
         // 3. Intento primario con cookie personalizada o pool
         let primary_result = if let Some(c) = custom_cookies {
-            self.run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(c), custom_format).await
+            self.run_single_track_cmd(&resolved_target, custom_extractor_args, custom_extra_args, Some(c), custom_format).await
         } else {
             let cookie_pool = self.get_available_cookie_pool().await;
             if cookie_pool.is_empty() {
-                self.run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, None, custom_format).await
+                self.run_single_track_cmd(&resolved_target, custom_extractor_args, custom_extra_args, None, custom_format).await
             } else {
                 let total = cookie_pool.len();
                 let start_idx = self.cookie_rotation_index.fetch_add(1, Ordering::Relaxed) % total;
@@ -515,7 +583,7 @@ impl SourceResolver {
                     let idx = (start_idx + i) % total;
                     let cookie_file = &cookie_pool[idx];
                     match self
-                        .run_single_track_cmd(query_trimmed, custom_extractor_args, custom_extra_args, Some(cookie_file), custom_format)
+                        .run_single_track_cmd(&resolved_target, custom_extractor_args, custom_extra_args, Some(cookie_file), custom_format)
                         .await
                     {
                         Ok(meta) => {
@@ -539,6 +607,9 @@ impl SourceResolver {
         match primary_result {
             Ok(meta) => {
                 self.cache.insert(cache_key, (meta.clone(), Instant::now()));
+                if resolved_target != query_trimmed {
+                    self.cache.insert(resolved_target.clone(), (meta.clone(), Instant::now()));
+                }
                 Ok(meta)
             }
             Err(e) => {
@@ -632,7 +703,114 @@ impl SourceResolver {
         self.resolve_flat_playlist_with_limit(query, custom_extractor_args, custom_extra_args, custom_cookies, None).await
     }
 
-    /// Búsqueda multi-fuente ultrarrápida (~1s) con soporte de failover YouTube -> SoundCloud
+    /// Búsqueda nativa ultrarrápida (~30-50ms) usando la API directa de YouTube InnerTube sin Python/yt-dlp
+    pub async fn search_innertube(&self, query: &str, limit: usize) -> Result<Vec<FlatPlaylistItem>, String> {
+        let endpoint = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false";
+        let body = serde_json::json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20240101.00.00",
+                    "hl": "es",
+                    "gl": "US",
+                    "utcOffsetMinutes": 0
+                }
+            },
+            "query": query
+        });
+
+        let response = self
+            .http_client
+            .post(endpoint)
+            .header("Content-Type", "application/json")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            .header("X-YouTube-Client-Name", "1")
+            .header("X-YouTube-Client-Version", "2.20240101.00.00")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Error de conexión con InnerTube: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("InnerTube devolvió status HTTP {}", response.status()));
+        }
+
+        let json_data: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Error decodificando respuesta JSON de InnerTube: {}", e))?;
+
+        let mut results = Vec::new();
+        let target_limit = limit.clamp(1, 50);
+
+        // contents -> twoColumnSearchResultsRenderer -> primaryContents -> sectionListRenderer -> contents
+        let section_list = json_data
+            .pointer("/contents/twoColumnSearchResultsRenderer/primaryContents/sectionListRenderer/contents")
+            .and_then(|c| c.as_array());
+
+        if let Some(sections) = section_list {
+            for section in sections {
+                let items = section
+                    .pointer("/itemSectionRenderer/contents")
+                    .and_then(|c| c.as_array());
+
+                if let Some(items) = items {
+                    for item in items {
+                        if let Some(video) = item.get("videoRenderer") {
+                            let video_id = video.get("videoId").and_then(|v| v.as_str());
+                            if let Some(id) = video_id {
+                                let title = video
+                                    .pointer("/title/runs/0/text")
+                                    .or_else(|| video.pointer("/title/simpleText"))
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("Pista Desconocida")
+                                    .to_string();
+
+                                let duration_secs = video
+                                    .pointer("/lengthText/simpleText")
+                                    .or_else(|| video.pointer("/lengthText/runs/0/text"))
+                                    .and_then(|s| s.as_str())
+                                    .and_then(parse_duration_string);
+
+                                let author = video
+                                    .pointer("/ownerText/runs/0/text")
+                                    .or_else(|| video.pointer("/shortBylineText/runs/0/text"))
+                                    .and_then(|a| a.as_str())
+                                    .map(|s| s.to_string());
+
+                                let thumbnail = video
+                                    .pointer("/thumbnail/thumbnails")
+                                    .and_then(|t| t.as_array())
+                                    .and_then(|arr| arr.last())
+                                    .and_then(|t| t.get("url"))
+                                    .and_then(|u| u.as_str())
+                                    .map(|s| s.to_string());
+
+                                results.push(FlatPlaylistItem {
+                                    title,
+                                    url: format!("https://www.youtube.com/watch?v={}", id),
+                                    duration_secs,
+                                    author,
+                                    thumbnail,
+                                });
+
+                                if results.len() >= target_limit {
+                                    return Ok(results);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Búsqueda multi-fuente ultrarrápida (~30-50ms con InnerTube) con soporte de failover YouTube -> SoundCloud
     pub async fn search(
         &self,
         query: &str,
@@ -659,6 +837,20 @@ impl SourceResolver {
                 Ok(("soundcloud".to_string(), flat.entries))
             }
             "youtube" => {
+                // 1. Intento nativo InnerTube (cero uso de CPU, ~30-50ms)
+                if custom_cookies.is_none() && custom_extractor_args.is_none() && custom_extra_args.is_none() {
+                    match self.search_innertube(clean_query, capped_limit).await {
+                        Ok(entries) if !entries.is_empty() => {
+                            info!(query = %clean_query, count = entries.len(), "Búsqueda en YouTube completada vía InnerTube nativo");
+                            return Ok(("youtube".to_string(), entries));
+                        }
+                        Ok(_) | Err(_) => {
+                            warn!(query = %clean_query, "InnerTube no devolvió resultados o falló; recurriendo a yt-dlp...");
+                        }
+                    }
+                }
+
+                // 2. Fallback a yt-dlp flat-playlist si InnerTube falló o se especificaron parámetros personalizados
                 let yt_query = format!("ytsearch{}:{}", capped_limit, clean_query);
                 let flat = self
                     .resolve_flat_playlist_with_limit(&yt_query, custom_extractor_args, custom_extra_args, custom_cookies, Some(capped_limit))
@@ -666,7 +858,17 @@ impl SourceResolver {
                 Ok(("youtube".to_string(), flat.entries))
             }
             _ => {
-                // "auto": Intentar YouTube primero; si falla o no hay resultados, fallback a SoundCloud
+                // "auto": Intentar InnerTube nativo -> yt-dlp YouTube -> SoundCloud
+                if custom_cookies.is_none() && custom_extractor_args.is_none() && custom_extra_args.is_none() {
+                    if let Ok(entries) = self.search_innertube(clean_query, capped_limit).await {
+                        if !entries.is_empty() {
+                            info!(query = %clean_query, count = entries.len(), "Búsqueda automática resuelta con InnerTube nativo");
+                            return Ok(("youtube".to_string(), entries));
+                        }
+                    }
+                }
+
+                // Fallback 1: yt-dlp YouTube
                 let yt_query = format!("ytsearch{}:{}", capped_limit, clean_query);
                 match self
                     .resolve_flat_playlist_with_limit(&yt_query, custom_extractor_args, custom_extra_args, custom_cookies, Some(capped_limit))
@@ -676,8 +878,9 @@ impl SourceResolver {
                     Ok(_) | Err(_) => {
                         warn!(
                             query = %clean_query,
-                            "Búsqueda en YouTube falló o devolvió 0 resultados; ejecutando failover a SoundCloud..."
+                            "Búsqueda en YouTube (InnerTube y yt-dlp) falló o devolvió 0 resultados; ejecutando failover a SoundCloud..."
                         );
+                        // Fallback 2: SoundCloud
                         let sc_query = format!("scsearch{}:{}", capped_limit, clean_query);
                         let flat = self
                             .run_flat_playlist_cmd(&sc_query, custom_extractor_args, custom_extra_args, None, Some(capped_limit))
