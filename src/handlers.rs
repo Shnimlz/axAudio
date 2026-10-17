@@ -247,6 +247,7 @@ pub async fn auth_middleware(
         let header_authorized = req
             .headers()
             .get(header::AUTHORIZATION)
+            .or_else(|| req.headers().get("x-axaudio-password"))
             .and_then(|h| h.to_str().ok())
             .map(|val| {
                 let token = val.strip_prefix("Bearer ").unwrap_or(val).trim();
