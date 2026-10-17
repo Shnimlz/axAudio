@@ -188,11 +188,11 @@ impl SourceResolver {
                     while let Ok(Some(entry)) = entries.next_entry().await {
                         let entry_path = entry.path();
                         if entry_path.is_file() {
-                            if let Some(ext) = entry_path.extension() {
-                                if ext == "txt" {
-                                    if let Some(s) = entry_path.to_str() {
-                                        pool.push(s.to_string());
-                                    }
+                            let is_txt = entry_path.extension().map(|ext| ext == "txt").unwrap_or(false);
+                            let has_content = entry_path.metadata().map(|m| m.len() > 100).unwrap_or(false);
+                            if is_txt && has_content {
+                                if let Some(s) = entry_path.to_str() {
+                                    pool.push(s.to_string());
                                 }
                             }
                         }
@@ -205,7 +205,9 @@ impl SourceResolver {
         if let Ok(env_pool) = std::env::var("YTDLP_COOKIES_POOL") {
             for item in env_pool.split(',') {
                 let trimmed = item.trim();
-                if !trimmed.is_empty() && PathBuf::from(trimmed).is_file() {
+                let path = PathBuf::from(trimmed);
+                let has_content = path.metadata().map(|m| m.len() > 100).unwrap_or(false);
+                if !trimmed.is_empty() && path.is_file() && has_content {
                     pool.push(trimmed.to_string());
                 }
             }
@@ -220,7 +222,9 @@ impl SourceResolver {
         ];
 
         for candidate in single_candidates.into_iter().flatten() {
-            if PathBuf::from(&candidate).is_file() {
+            let path = PathBuf::from(&candidate);
+            let has_content = path.metadata().map(|m| m.len() > 100).unwrap_or(false);
+            if path.is_file() && has_content {
                 pool.push(candidate);
             }
         }
@@ -630,9 +634,21 @@ impl SourceResolver {
                     }
                 }
 
-                match resolved {
-                    Some(m) => Ok(m),
-                    None => Err(format!("Todas las cookies del pool fallaron resolviendo la pista. Último error: {}", last_err)),
+                if let Some(m) = resolved {
+                    Ok(m)
+                } else {
+                    warn!(
+                        last_err = %last_err,
+                        "Todas las cookies del pool fallaron resolviendo la pista; intentando fallback sin cookies (bgutil-pot)..."
+                    );
+                    self.run_single_track_cmd(
+                        &resolved_target,
+                        custom_extractor_args,
+                        custom_extra_args,
+                        None,
+                        custom_format,
+                    )
+                    .await
                 }
             }
         };
@@ -722,7 +738,12 @@ impl SourceResolver {
             }
         }
 
-        Err(format!("Todas las cookies fallaron para flat-playlist. Último error: {}", last_err))
+        warn!(
+            last_err = %last_err,
+            "Todas las cookies del pool fallaron para flat-playlist; intentando fallback sin cookies..."
+        );
+        self.run_flat_playlist_cmd(query_trimmed, custom_extractor_args, custom_extra_args, None, max_items)
+            .await
     }
 
     /// Resuelve la lista plana de una playlist / mix con rotación de cookies
