@@ -37,7 +37,7 @@ struct TrackPlayNotifier {
 #[async_trait]
 impl EventHandler for TrackPlayNotifier {
     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
-        info!(guild = self.guild_id, title = %self.meta.title, "TrackPlay event fired");
+        info!(guild = self.guild_id, title = %self.meta.title, "Evento TrackPlay emitido");
         if let Some(ref st) = self.state {
             st.set_last_track(self.guild_id, (*self.meta).clone());
             if let Some(vid) = SourceResolver::extract_video_id(&self.meta.source_url) {
@@ -82,7 +82,7 @@ impl EventHandler for TrackEndNotifier {
             _ => "finished",
         };
 
-        info!(guild = self.guild_id, title = %self.meta.title, reason = %reason, "TrackEnd event fired");
+        info!(guild = self.guild_id, title = %self.meta.title, reason = %reason, "Evento TrackEnd emitido");
         let _ = self.event_tx.send(PlayerEvent::TrackEnd {
             guild_id: self.guild_id,
             track: Some(TrackResponse {
@@ -160,10 +160,10 @@ impl EventHandler for TrackErrorNotifier {
             EventContext::Track(slice) => slice
                 .first()
                 .map(|(state, _)| format!("{:?}", state.playing))
-                .unwrap_or_else(|| "Playback error".to_string()),
-            _ => "Playback error".to_string(),
+                .unwrap_or_else(|| "Error de reproducción".to_string()),
+            _ => "Error de reproducción".to_string(),
         };
-        warn!(guild = self.guild_id, title = %self.meta.title, error = %err_msg, "TrackError event fired");
+        warn!(guild = self.guild_id, title = %self.meta.title, error = %err_msg, "Evento TrackError emitido");
         let _ = self.event_tx.send(PlayerEvent::TrackError {
             guild_id: self.guild_id,
             track: Some(TrackResponse {
@@ -243,7 +243,7 @@ pub const AXAUDIO_VERSION: &str = match option_env!("AXAUDIO_VERSION") {
 };
 
 pub async fn health() -> Json<ApiResponse<&'static str>> {
-    Json(ApiResponse::ok("axAudio engine operational"))
+    Json(ApiResponse::ok("Motor axAudio operativo"))
 }
 
 pub async fn auth_middleware(
@@ -277,10 +277,10 @@ pub async fn auth_middleware(
         };
 
         if !query_authorized {
-            warn!(uri = %req.uri(), "🚫 Unauthorized request rejected by auth middleware");
+            warn!(uri = %req.uri(), "Petición no autorizada rechazada por el middleware de autenticación");
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(ApiResponse::<()>::err("Unauthorized: invalid or missing authorization token")),
+                Json(ApiResponse::<()>::err("No autorizado: token de autenticación inválido o faltante")),
             ).into_response();
         }
     }
@@ -325,10 +325,10 @@ pub async fn resolve_track(
             Ok(Json(ApiResponse::ok(res)))
         }
         Err(e) => {
-            warn!(query = %payload.query, error = %e, "Track resolution failed");
+            warn!(query = %payload.query, error = %e, "Fallo al resolver la pista");
             Err((
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::err(format!("Track resolution failed: {}", e))),
+                Json(ApiResponse::err(format!("Fallo al resolver la pista: {}", e))),
             ))
         }
     }
@@ -362,10 +362,10 @@ pub async fn search_tracks(
             Ok(Json(ApiResponse::ok(res)))
         }
         Err(e) => {
-            warn!(query = %payload.query, error = %e, "Track search failed");
+            warn!(query = %payload.query, error = %e, "Fallo en la búsqueda de pistas");
             Err((
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::err(format!("Track search failed: {}", e))),
+                Json(ApiResponse::err(format!("Fallo en la búsqueda de pistas: {}", e))),
             ))
         }
     }
@@ -377,24 +377,24 @@ pub async fn voice_join(
 ) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<&'static str>>)> {
     let guild_id = match NonZeroU64::new(payload.guild_id) {
         Some(id) => id,
-        None => return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::err("Invalid guild_id: 0")))),
+        None => return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::err("guild_id inválido: 0")))),
     };
 
     let channel_id = match NonZeroU64::new(payload.channel_id) {
         Some(id) => id,
-        None => return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::err("Invalid channel_id: 0")))),
+        None => return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::err("channel_id inválido: 0")))),
     };
 
     let user_id = match NonZeroU64::new(payload.user_id) {
         Some(id) => id,
-        None => return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::err("Invalid user_id: 0")))),
+        None => return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::err("user_id inválido: 0")))),
     };
 
     info!(
         guild = payload.guild_id,
         channel = payload.channel_id,
         endpoint = %payload.endpoint,
-        "Connecting axAudio driver to Discord Voice"
+        "Conectando driver de axAudio al canal de voz de Discord"
     );
 
     let connection_info = ConnectionInfo {
@@ -431,14 +431,14 @@ pub async fn voice_join(
 
     match driver.connect(connection_info).await {
         Ok(_) => {
-            info!(guild = payload.guild_id, "Successfully connected to voice channel");
-            Ok(Json(ApiResponse::ok("Connected to Discord voice channel")))
+            info!(guild = payload.guild_id, "Conexión exitosa al canal de voz");
+            Ok(Json(ApiResponse::ok("Conectado al canal de voz de Discord")))
         }
         Err(e) => {
-            error!(guild = payload.guild_id, error = ?e, "Failed to connect driver to voice channel");
+            error!(guild = payload.guild_id, error = ?e, "Fallo al conectar el driver al canal de voz");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::err(format!("Driver connection failed: {:?}", e))),
+                Json(ApiResponse::err(format!("Fallo en la conexión del driver: {:?}", e))),
             ))
         }
     }
@@ -467,7 +467,7 @@ async fn create_track_with_dsp(
             Track::new_with_data(playable, meta)
         }
         Err(e) => {
-            warn!(error = ?e, "Pre-parsing falló para DSP, usando input nativo de Songbird");
+            warn!(error = ?e, "Pre-parsing falló para DSP, usando entrada nativa de Songbird");
             let fallback = HttpRequest::new(http_client, stream_url);
             Track::new_with_data(fallback.into(), meta)
         }
@@ -483,7 +483,7 @@ pub async fn player_play(
         None => {
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(ApiResponse::err("No active voice connection for this guild. Call /v1/voice/join first.")),
+                Json(ApiResponse::err("No hay conexión de voz activa para este servidor. Ejecute /v1/voice/join primero.")),
             ));
         }
     };
@@ -621,7 +621,7 @@ pub async fn player_queue(
         None => {
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(ApiResponse::err("No active voice player for this guild")),
+                Json(ApiResponse::err("No hay reproductor de voz activo para este servidor")),
             ));
         }
     };
@@ -647,7 +647,7 @@ pub async fn player_queue(
     if let Some(pending) = state.pending_playlists.get(&payload.guild_id) {
         for item in pending.iter() {
             all_tracks.push(TrackResponse {
-                title: format!("⏳ {}", item.title),
+                title: format!("[Pendiente] {}", item.title),
                 source_url: item.url.clone(),
                 stream_url: String::new(),
                 duration_secs: item.duration_secs,
@@ -700,7 +700,7 @@ pub async fn player_control(
         None => {
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(ApiResponse::err("No active voice player for this guild")),
+                Json(ApiResponse::err("No hay reproductor de voz activo para este servidor")),
             ));
         }
     };
@@ -710,11 +710,11 @@ pub async fn player_control(
     match payload.action.as_str() {
         "pause" => {
             let _ = driver.queue().pause();
-            Ok(Json(ApiResponse::ok("Player paused".to_string())))
+            Ok(Json(ApiResponse::ok("Reproductor pausado".to_string())))
         }
         "resume" => {
             let _ = driver.queue().resume();
-            Ok(Json(ApiResponse::ok("Player resumed".to_string())))
+            Ok(Json(ApiResponse::ok("Reproductor reanudado".to_string())))
         }
         "stop" => {
             state.next_epoch(payload.guild_id);
@@ -722,11 +722,11 @@ pub async fn player_control(
             state.end_prefetch(payload.guild_id);
             driver.queue().stop();
             driver.stop();
-            Ok(Json(ApiResponse::ok("Player stopped".to_string())))
+            Ok(Json(ApiResponse::ok("Reproductor detenido".to_string())))
         }
         "skip" => {
             let _ = driver.queue().skip();
-            Ok(Json(ApiResponse::ok("Track skipped".to_string())))
+            Ok(Json(ApiResponse::ok("Pista saltada".to_string())))
         }
         "clear" => {
             state.next_epoch(payload.guild_id);
@@ -739,7 +739,7 @@ pub async fn player_control(
                     q.push_front(first);
                 }
             });
-            Ok(Json(ApiResponse::ok("Queue cleared".to_string())))
+            Ok(Json(ApiResponse::ok("Cola limpiada".to_string())))
         }
         "volume" => {
             if let Some(val) = payload.value {
@@ -748,11 +748,11 @@ pub async fn player_control(
                 if let Some(track) = driver.queue().current() {
                     let _ = track.set_volume(clamped * 0.95);
                 }
-                Ok(Json(ApiResponse::ok(format!("Volume updated to {:.0}%", clamped * 100.0))))
+                Ok(Json(ApiResponse::ok(format!("Volumen actualizado al {:.0}%", clamped * 100.0))))
             } else {
                 Err((
                     StatusCode::BAD_REQUEST,
-                    Json(ApiResponse::err("Missing 'value' for volume action")),
+                    Json(ApiResponse::err("Falta el parámetro 'value' para la acción de volumen")),
                 ))
             }
         }
@@ -767,18 +767,18 @@ pub async fn player_control(
                 let duration = std::time::Duration::from_secs_f64(pos_secs);
                 match track.seek_async(duration).await {
                     Ok(actual) => Ok(Json(ApiResponse::ok(format!(
-                        "Seeked to {:.2}s",
+                        "Posición cambiada a {:.2}s",
                         actual.as_secs_f64()
                     )))),
                     Err(e) => Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse::err(format!("Seek failed: {:?}", e))),
+                        Json(ApiResponse::err(format!("Fallo al cambiar posición: {:?}", e))),
                     )),
                 }
             } else {
                 Err((
                     StatusCode::NOT_FOUND,
-                    Json(ApiResponse::err("No track currently playing to seek")),
+                    Json(ApiResponse::err("No hay ninguna pista reproduciéndose actualmente para cambiar de posición")),
                 ))
             }
         }
@@ -792,7 +792,7 @@ pub async fn player_control(
                     return Err((
                         StatusCode::BAD_REQUEST,
                         Json(ApiResponse::err(format!(
-                            "Unknown loop mode '{}'. Use 'track', 'queue', or 'off'",
+                            "Modo de bucle desconocido '{}'. Use 'track', 'queue', u 'off'",
                             other
                         ))),
                     ))
@@ -810,7 +810,7 @@ pub async fn player_control(
             }
 
             Ok(Json(ApiResponse::ok(format!(
-                "Loop mode set to '{}'",
+                "Modo de bucle configurado en '{}'",
                 mode.as_str()
             ))))
         }
@@ -837,7 +837,7 @@ pub async fn player_control(
             }
 
             Ok(Json(ApiResponse::ok(format!(
-                "Queue shuffled: {} upcoming track(s) randomized",
+                "Cola mezclada: {} pista(s) aleatorizada(s)",
                 upcoming_count
             ))))
         }
@@ -847,7 +847,7 @@ pub async fn player_control(
                 None => {
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        Json(ApiResponse::err("Missing 'index' parameter for remove action")),
+                        Json(ApiResponse::err("Falta el parámetro 'index' para la acción de eliminar")),
                     ))
                 }
             };
@@ -877,11 +877,11 @@ pub async fn player_control(
             }
 
             match removed_title {
-                Some(title) => Ok(Json(ApiResponse::ok(format!("Removed '{}' from queue", title)))),
+                Some(title) => Ok(Json(ApiResponse::ok(format!("Se eliminó '{}' de la cola", title)))),
                 None => Err((
                     StatusCode::NOT_FOUND,
                     Json(ApiResponse::err(format!(
-                        "Index {} out of bounds for upcoming queue",
+                        "Índice {} fuera de los límites de la cola",
                         target_idx
                     ))),
                 )),
@@ -893,7 +893,7 @@ pub async fn player_control(
                 None => {
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        Json(ApiResponse::err("Missing 'from_index' for move action")),
+                        Json(ApiResponse::err("Falta 'from_index' para la acción de mover")),
                     ))
                 }
             };
@@ -902,7 +902,7 @@ pub async fn player_control(
                 None => {
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        Json(ApiResponse::err("Missing 'to_index' for move action")),
+                        Json(ApiResponse::err("Falta 'to_index' para la acción de mover")),
                     ))
                 }
             };
@@ -923,12 +923,12 @@ pub async fn player_control(
 
             match moved_title {
                 Some(title) => Ok(Json(ApiResponse::ok(format!(
-                    "Moved '{}' from position {} to {}",
+                    "Se movió '{}' de la posición {} a la {}",
                     title, from, to
                 )))),
                 None => Err((
                     StatusCode::BAD_REQUEST,
-                    Json(ApiResponse::err("Invalid 'from_index' or 'to_index' for active queue")),
+                    Json(ApiResponse::err("Parámetros 'from_index' o 'to_index' inválidos para la cola activa")),
                 )),
             }
         }
@@ -952,12 +952,12 @@ pub async fn player_control(
 
             Ok(Json(ApiResponse::ok(format!(
                 "Autoplay {}",
-                if new_val { "enabled" } else { "disabled" }
+                if new_val { "activado" } else { "desactivado" }
             ))))
         }
         other => Err((
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::err(format!("Unknown control action: '{}'", other))),
+            Json(ApiResponse::err(format!("Acción de control desconocida: '{}'", other))),
         )),
     }
 }
@@ -1027,11 +1027,11 @@ pub async fn voice_leave(
         let mut driver = driver_ref.lock().await;
         driver.stop();
         driver.leave();
-        info!(guild = payload.guild_id, "Driver disconnected and player removed");
-        Ok(Json(ApiResponse::ok("Disconnected and cleaned up player")))
+        info!(guild = payload.guild_id, "Driver desconectado y reproductor eliminado");
+        Ok(Json(ApiResponse::ok("Desconectado y reproductor limpiado")))
     } else {
-        warn!(guild = payload.guild_id, "Attempted to leave non-existent voice session");
-        Ok(Json(ApiResponse::ok("Session was not active")))
+        warn!(guild = payload.guild_id, "Intento de abandonar una sesión de voz inexistente");
+        Ok(Json(ApiResponse::ok("La sesión no estaba activa")))
     }
 }
 
@@ -1045,7 +1045,7 @@ pub async fn ws_events(
 async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
     let mut rx = state.event_tx.subscribe();
     let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-    info!("🔌 Client connected to axAudio WebSocket /v1/events");
+    info!("Cliente conectado al WebSocket /v1/events");
 
     loop {
         tokio::select! {
@@ -1064,7 +1064,7 @@ async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
-                        warn!("WebSocket client lagged behind, skipped {} events", missed);
+                        warn!("Cliente WebSocket atrasado, se omitieron {} eventos", missed);
                         let resync = serde_json::json!({
                             "type": "resync",
                             "missed_events": missed
@@ -1092,7 +1092,7 @@ async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
         }
     }
 
-    info!("🔌 Client disconnected from axAudio WebSocket /v1/events");
+    info!("Cliente desconectado del WebSocket /v1/events");
 }
 
 pub async fn player_eq(
@@ -1290,7 +1290,7 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
 
         if let Some(seed_url) = seed_opt {
             let clean_id = SourceResolver::extract_video_id(&seed_url).unwrap_or_else(|| seed_url.clone());
-            info!(guild = guild_id, seed = %clean_id, "📻 Autoplay activo: consultando recomendaciones en InnerTube (WEB_REMIX radio)...");
+            info!(guild = guild_id, seed = %clean_id, "Autoplay activo: consultando recomendaciones en InnerTube (radio WEB_REMIX)...");
             if let Ok(items) = state.resolver.related_innertube(&clean_id, 25).await {
                 let mut fresh: Vec<_> = items
                     .into_iter()
@@ -1317,7 +1317,7 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
                         guild = guild_id,
                         count = fresh.len(),
                         next = %fresh[0].title,
-                        "📻 Autoplay: recomendaciones obtenidas y añadidas a la cola pendiente"
+                        "Autoplay: recomendaciones obtenidas y añadidas a la cola pendiente"
                     );
                     let mut list = state.pending_playlists.entry(guild_id).or_insert_with(Vec::new);
                     list.extend(fresh);
@@ -1353,7 +1353,7 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
             guild = guild_id,
             next_title = %next_item.title,
             trigger = %reason,
-            "⚡ Prefetch anticipado activado: resolviendo y precalentando flujo de audio (gapless)..."
+            "Prefetch anticipado activado: resolviendo y precalentando flujo de audio (gapless)..."
         );
 
         let resolve_res = state_clone
@@ -1404,7 +1404,7 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
                 info!(
                     guild = guild_id,
                     title = %track.title,
-                    "✅ Prefetch exitoso: decodificador y stream listos en cola Songbird (transición gapless)"
+                    "Prefetch exitoso: decodificador y stream listos en cola Songbird (transición gapless)"
                 );
             }
             Err(err) => {

@@ -42,18 +42,31 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    info!("⚡ Starting axAudio Native Audio Engine (Lavalink Replacement in Rust)...");
+    println!(r#"
+ ▄▄▄      ▒██   ██▒    ███▄ ▄███▓ █    ██   ██████  ██▓ ▄████▄  
+▒████▄    ▒▒ █ █ ▒░   ▓██▒▀█▀ ██▒ ██  ▓██▒▒██    ▒ ▓██▒▒██▀ ▀█  
+▒██  ▀█▄  ░░  █   ░   ▓██    ▓██░▓██  ▒██░░ ▓██▄   ▒██▒▒▓█    ▄ 
+░██▄▄▄▄██  ░ █ █ ▒    ▒██    ▒██ ▓▓█  ░██░  ▒   ██▒░██░▒▓▓▄ ▄██▒
+ ▓█   ▓██▒▒██▒ ▒██▒   ▒██▒   ░██▒▒▒█████▓ ▒██████▒▒░██░▒ ▓███▀ ░
+ ▒▒   ▓▒█░▒▒ ░ ░▓ ░   ░ ▒░   ░  ░░▒▓▒ ▒ ▒ ▒ ▒▓▒ ▒ ░░▓  ░ ░▒ ▒  ░
+  ▒   ▒▒ ░░░   ░▒ ░   ░  ░      ░░░▒░ ░ ░ ░ ░▒  ░ ░ ▒ ░  ░  ▒   
+  ░   ▒    ░    ░     ░      ░    ░░░ ░ ░ ░  ░  ░   ▒ ░░        
+      ░  ░ ░    ░            ░      ░           ░   ░  ░ ░      
+                                                       ░        
+"#);
+
+    info!("Iniciando axAudio Native Audio Engine (Reemplazo nativo de Lavalink)...");
 
     let state = AppState::new();
 
     if let Some(ref pw) = state.auth_token {
         if pw.as_str() == "youshallnotpass" {
-            warn!("⚠️ axAudio running with DEFAULT password 'youshallnotpass'. Set AXAUDIO_PASSWORD environment variable for production!");
+            warn!("axAudio ejecutándose con la contraseña POR DEFECTO 'youshallnotpass'. ¡Configure la variable AXAUDIO_PASSWORD para producción!");
         } else {
-            info!("🔒 axAudio authentication enabled via AXAUDIO_PASSWORD");
+            info!("Autenticación de axAudio activada mediante AXAUDIO_PASSWORD");
         }
     } else {
-        warn!("⚠️ axAudio running WITHOUT authentication (AXAUDIO_PASSWORD is empty or 'none')");
+        warn!("axAudio ejecutándose SIN autenticación (AXAUDIO_PASSWORD está vacía o 'none')");
     }
 
     // Tarea en segundo plano para purgar entradas de caché expiradas cada 10 minutos
@@ -105,7 +118,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(2333);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("🚀 axAudio server listening on http://{}", addr);
+    info!("Servidor axAudio escuchando en http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
@@ -137,5 +150,5 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 
-    info!("🛑 Graceful shutdown signal received, terminating axAudio safely...");
+    info!("Señal de apagado seguro recibida, finalizando axAudio de forma ordenada...");
 }

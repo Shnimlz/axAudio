@@ -448,7 +448,7 @@ impl SourceResolver {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             warn!(query = %query_trimmed, stderr = %stderr, "yt-dlp falló al resolver la fuente");
-            return Err(format!("yt-dlp failed: {}", stderr.trim()));
+            return Err(format!("Fallo de yt-dlp: {}", stderr.trim()));
         }
 
         let json_str = String::from_utf8_lossy(&output.stdout);
@@ -546,7 +546,7 @@ impl SourceResolver {
             if let Some(entry) = self.cache.get(&cache_key) {
                 let (meta, cached_at) = entry.value();
                 if cached_at.elapsed() < self.ttl {
-                    info!(query = %query_trimmed, title = %meta.title, "Source resolver cache hit");
+                    info!(query = %query_trimmed, title = %meta.title, "Acierto en caché del resolvedor de fuentes");
                     return Ok(meta.clone());
                 }
             }
@@ -596,7 +596,7 @@ impl SourceResolver {
             if let Some(entry) = self.cache.get(&target_cache_key) {
                 let (meta, cached_at) = entry.value();
                 if cached_at.elapsed() < self.ttl {
-                    info!(query = %query_trimmed, resolved = %resolved_target, title = %meta.title, "Source resolver cache hit post-InnerTube");
+                    info!(query = %query_trimmed, resolved = %resolved_target, title = %meta.title, "Acierto en caché del resolvedor tras resolución InnerTube");
                     self.cache.insert(cache_key, (meta.clone(), Instant::now()));
                     return Ok(meta.clone());
                 }
