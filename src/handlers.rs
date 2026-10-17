@@ -1106,6 +1106,13 @@ pub async fn player_dsp(
         }
     }
 
+    if let Some(loudness) = payload.loudness {
+        params.set_loudness(loudness);
+        if message.is_empty() {
+            message = "Normalización de volumen EBU R128 actualizada".to_string();
+        }
+    }
+
     if let Some(ref bands) = payload.bands {
         params.set_bands(bands);
     }

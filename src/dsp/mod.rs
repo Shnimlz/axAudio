@@ -8,6 +8,7 @@
 pub mod biquad;
 pub mod decoder;
 pub mod equalizer;
+pub mod loudness;
 pub mod modulation;
 pub mod presets;
 pub mod spatial;
@@ -15,6 +16,7 @@ pub mod spatial;
 pub use biquad::{FilterType, StereoBiquad};
 pub use decoder::{inject_dsp, DspDecoder};
 pub use equalizer::{BandSetting, Equalizer, EQ_FREQUENCIES};
+pub use loudness::{LoudnessNormalizer, LoudnessSettings};
 pub use modulation::{
     ModulationProcessor, ModulationSettings, RotationProcessor, TremoloProcessor, VibratoProcessor,
 };
@@ -29,6 +31,7 @@ pub struct DspParams {
     pub gains_db: [f32; 15],
     pub spatial: SpatialSettings,
     pub modulation: ModulationSettings,
+    pub loudness: LoudnessSettings,
     pub active_preset: Option<String>,
     pub version: u64,
 }
@@ -39,6 +42,7 @@ impl Default for DspParams {
             gains_db: [0.0; 15],
             spatial: SpatialSettings::default(),
             modulation: ModulationSettings::default(),
+            loudness: LoudnessSettings::default(),
             active_preset: None,
             version: 0,
         }
@@ -77,6 +81,12 @@ impl DspParams {
         self.version += 1;
     }
 
+    pub fn set_loudness(&mut self, loudness: LoudnessSettings) {
+        self.loudness = loudness;
+        self.active_preset = None;
+        self.version += 1;
+    }
+
     pub fn get_status(&self) -> DspStatus {
         DspStatus {
             active_preset: self.active_preset.clone(),
@@ -88,6 +98,8 @@ impl DspParams {
             rotation_speed_hz: self.modulation.rotation_speed_hz,
             tremolo: self.modulation.tremolo,
             vibrato: self.modulation.vibrato,
+            loudness: self.loudness.enabled,
+            target_lufs: self.loudness.target_lufs,
         }
     }
 }
@@ -103,6 +115,8 @@ pub struct DspStatus {
     pub rotation_speed_hz: f32,
     pub tremolo: bool,
     pub vibrato: bool,
+    pub loudness: bool,
+    pub target_lufs: f32,
 }
 
 /// Cadena de procesamiento maestro en tiempo real (poseída localmente por cada decodificador)
@@ -111,6 +125,7 @@ pub struct DspChain {
     pub equalizer: Equalizer,
     pub spatial: SpatialProcessor,
     pub modulation: ModulationProcessor,
+    pub loudness: LoudnessNormalizer,
     pub sample_rate: f32,
     pub preamp: f32,
 }
@@ -121,6 +136,7 @@ impl DspChain {
             equalizer: Equalizer::new(sample_rate),
             spatial: SpatialProcessor::new(sample_rate),
             modulation: ModulationProcessor::new(sample_rate),
+            loudness: LoudnessNormalizer::new(sample_rate),
             sample_rate,
             preamp: 1.0,
         }
@@ -138,6 +154,9 @@ impl DspChain {
 
         self.modulation.update_sample_rate(sample_rate);
         self.modulation.set_settings(params.modulation.clone());
+
+        self.loudness.update_sample_rate(sample_rate);
+        self.loudness.set_settings(params.loudness.clone());
 
         // Cálculo analítico exacto de pico de magnitud combinada para pre-amp headroom:
         // Evaluamos la curva combinada de los 15 filtros más la ganancia lateral Mid/Side
@@ -159,12 +178,16 @@ impl DspChain {
         self.equalizer.reset();
         self.spatial.reset();
         self.modulation.reset();
+        self.loudness.reset();
     }
 
     /// Verifica si hay algún procesamiento activo en la cadena DSP
     #[inline]
     pub fn is_active(&self) -> bool {
-        self.equalizer.is_active || self.spatial.is_active() || self.modulation.is_active()
+        self.equalizer.is_active
+            || self.spatial.is_active()
+            || self.modulation.is_active()
+            || self.loudness.is_active()
     }
 
     /// Procesa un bloque de audio estéreo planar in-place a través de toda la cadena DSP
@@ -192,5 +215,8 @@ impl DspChain {
 
         // 4. Modulación y espacialización dinámica (Vibrato -> Tremolo -> 8D Orbital Rotation)
         self.modulation.process_planar(left, right);
+
+        // 5. Normalizador perceptual de volumen EBU R128 (K-weighting + Smooth AGC + True Peak Limiter)
+        self.loudness.process_planar(left, right);
     }
 }

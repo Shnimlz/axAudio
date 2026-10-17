@@ -1,8 +1,9 @@
 //! Presets de ecualización y procesamiento 3D calibrados para audiófilos
 //!
-//! Curvas de respuesta acústica de estudio, ampliación Mid/Side y sonido envolvente.
+//! Curvas de respuesta acústica de estudio, ampliación Mid/Side, sonido envolvente y normalización EBU R128.
 
 use super::equalizer::Equalizer;
+use super::loudness::LoudnessSettings;
 use super::modulation::ModulationSettings;
 use super::spatial::{SpatialProcessor, SpatialSettings};
 
@@ -12,6 +13,7 @@ pub struct DspPreset {
     pub eq_bands: [f32; 15], // dB por banda (25Hz a 16kHz)
     pub spatial: SpatialSettings,
     pub modulation: ModulationSettings,
+    pub loudness: LoudnessSettings,
 }
 
 pub fn get_preset(name: &str) -> Option<DspPreset> {
@@ -30,6 +32,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter_drive: 0.15,
             },
             modulation: ModulationSettings::default(),
+            loudness: LoudnessSettings::default(),
         }),
 
         // --- Cinema 3D / Dolby Atmos ---
@@ -45,6 +48,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter_drive: 0.22,
             },
             modulation: ModulationSettings::default(),
+            loudness: LoudnessSettings::default(),
         }),
 
         // --- Bass Boost 3D ---
@@ -60,6 +64,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter_drive: 0.30,
             },
             modulation: ModulationSettings::default(),
+            loudness: LoudnessSettings::default(),
         }),
 
         // --- Vocal Clarity ---
@@ -75,6 +80,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter_drive: 0.0,
             },
             modulation: ModulationSettings::default(),
+            loudness: LoudnessSettings::default(),
         }),
 
         // --- Gaming 3D ---
@@ -90,6 +96,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter_drive: 0.20,
             },
             modulation: ModulationSettings::default(),
+            loudness: LoudnessSettings::default(),
         }),
 
         // --- Concert Hall ---
@@ -105,6 +112,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter_drive: 0.10,
             },
             modulation: ModulationSettings::default(),
+            loudness: LoudnessSettings::default(),
         }),
 
         // --- Nightcore ---
@@ -120,6 +128,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter_drive: 0.25,
             },
             modulation: ModulationSettings::default(),
+            loudness: LoudnessSettings::default(),
         }),
 
         // --- 8D Audio ---
@@ -144,6 +153,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 vibrato_freq_hz: 5.0,
                 vibrato_depth: 0.3,
             },
+            loudness: LoudnessSettings::default(),
         }),
 
         // --- Tremolo ---
@@ -162,6 +172,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 vibrato_freq_hz: 5.0,
                 vibrato_depth: 0.3,
             },
+            loudness: LoudnessSettings::default(),
         }),
 
         // --- Vibrato ---
@@ -180,6 +191,28 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 vibrato_freq_hz: 5.0,
                 vibrato_depth: 0.35,
             },
+            loudness: LoudnessSettings::default(),
+        }),
+
+        // --- Broadcast / EBU R128 Loudness Normalized ---
+        "broadcast" | "radio" | "ebur128" | "normalize" | "normalized" => Some(DspPreset {
+            name: "broadcast",
+            description: "Transmisión broadcast EBU R128: nivel de sonoridad objetivo a -14.0 LUFS con control anti-pumping y ecualización de estudio",
+            eq_bands: [1.5, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0, 1.5, 1.5, 1.5],
+            spatial: SpatialSettings {
+                stereo_width: 1.10,
+                binaural_crossfeed: true,
+                crossfeed_level: 0.10,
+                bass_exciter: true,
+                bass_exciter_drive: 0.12,
+            },
+            modulation: ModulationSettings::default(),
+            loudness: LoudnessSettings {
+                enabled: true,
+                target_lufs: -14.0,
+                max_gain_db: 9.0,
+                min_gain_db: -12.0,
+            },
         }),
 
         // --- Flat / Reset / Bypass ---
@@ -195,6 +228,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter_drive: 0.0,
             },
             modulation: ModulationSettings::default(),
+            loudness: LoudnessSettings::default(),
         }),
 
         _ => None,
@@ -204,7 +238,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
 pub fn apply_preset(name: &str, eq: &mut Equalizer, spatial: &mut SpatialProcessor) -> Result<String, String> {
     let preset = get_preset(name).ok_or_else(|| {
         format!(
-            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, 8d, tremolo, vibrato, flat",
+            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, 8d, tremolo, vibrato, broadcast (ebur128), flat",
             name
         )
     })?;
@@ -220,7 +254,7 @@ pub fn apply_preset(name: &str, eq: &mut Equalizer, spatial: &mut SpatialProcess
 pub fn apply_preset_to_params(name: &str, params: &mut super::DspParams) -> Result<String, String> {
     let preset = get_preset(name).ok_or_else(|| {
         format!(
-            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, 8d, tremolo, vibrato, flat",
+            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, 8d, tremolo, vibrato, broadcast (ebur128), flat",
             name
         )
     })?;
@@ -228,6 +262,7 @@ pub fn apply_preset_to_params(name: &str, params: &mut super::DspParams) -> Resu
     params.gains_db = preset.eq_bands;
     params.spatial = preset.spatial;
     params.modulation = preset.modulation;
+    params.loudness = preset.loudness;
     params.active_preset = Some(preset.name.to_string());
     params.version += 1;
 
@@ -242,7 +277,7 @@ mod tests {
     fn test_presets_exist() {
         let preset_names = [
             "music", "bass-boost-3d", "cinema-3d", "dolby-atmos",
-            "vocal-clarity", "gaming-3d", "concert-hall", "nightcore", "flat",
+            "vocal-clarity", "gaming-3d", "concert-hall", "nightcore", "8d", "tremolo", "vibrato", "broadcast", "flat",
         ];
         for name in preset_names {
             assert!(get_preset(name).is_some(), "Preset {} not found", name);
