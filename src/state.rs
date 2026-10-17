@@ -19,6 +19,7 @@ pub struct AppState {
     pub start_time: Instant,
     pub load_epochs: Arc<DashMap<u64, Arc<AtomicU64>>>,
     pub pending_playlists: Arc<DashMap<u64, Vec<FlatPlaylistItem>>>,
+    pub guild_volumes: Arc<DashMap<u64, f32>>,
     pub event_tx: broadcast::Sender<PlayerEvent>,
 }
 
@@ -36,8 +37,20 @@ impl AppState {
             start_time: Instant::now(),
             load_epochs: Arc::new(DashMap::new()),
             pending_playlists: Arc::new(DashMap::new()),
+            guild_volumes: Arc::new(DashMap::new()),
             event_tx,
         }
+    }
+
+    pub fn get_volume(&self, guild_id: u64) -> f32 {
+        self.guild_volumes
+            .get(&guild_id)
+            .map(|v| *v)
+            .unwrap_or(1.0)
+    }
+
+    pub fn set_volume(&self, guild_id: u64, vol: f32) {
+        self.guild_volumes.insert(guild_id, vol);
     }
 
     pub fn get_dsp(&self, guild_id: u64) -> Arc<Mutex<DspChain>> {

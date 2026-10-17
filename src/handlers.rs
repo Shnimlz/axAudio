@@ -59,8 +59,21 @@ struct TrackEndNotifier {
 
 #[async_trait]
 impl EventHandler for TrackEndNotifier {
-    async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
-        info!(guild = self.guild_id, title = %self.meta.title, "TrackEnd event fired");
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        let reason = match ctx {
+            EventContext::Track(slice) => slice
+                .first()
+                .map(|(state, _)| match state.playing {
+                    songbird::tracks::PlayMode::Stop => "stopped",
+                    songbird::tracks::PlayMode::End => "finished",
+                    songbird::tracks::PlayMode::Errored(_) => "error",
+                    _ => "finished",
+                })
+                .unwrap_or("finished"),
+            _ => "finished",
+        };
+
+        info!(guild = self.guild_id, title = %self.meta.title, reason = %reason, "TrackEnd event fired");
         let _ = self.event_tx.send(PlayerEvent::TrackEnd {
             guild_id: self.guild_id,
             track: Some(TrackResponse {
@@ -71,7 +84,7 @@ impl EventHandler for TrackEndNotifier {
                 author: self.meta.author.clone(),
                 thumbnail: self.meta.thumbnail.clone(),
             }),
-            reason: "finished".to_string(),
+            reason: reason.to_string(),
         });
         None
     }
@@ -272,7 +285,7 @@ pub async fn voice_join(
 
     // Audio Fidelity Tuning: use_softclip(true) aplica limitador tanh suave a picos > 0 dBFS,
     // eliminando la distorsión armónica cuadrada (chillidos/estridencias) y reteniendo los graves intactos
-    let driver_entry = state
+    let driver_ref = state
         .players
         .entry(payload.guild_id)
         .or_insert_with(|| {
@@ -280,9 +293,11 @@ pub async fn voice_join(
             config.preallocated_tracks = 1;
             config.use_softclip = true;
             Arc::new(Mutex::new(Driver::new(config)))
-        });
+        })
+        .value()
+        .clone();
 
-    let mut driver = driver_entry.lock().await;
+    let mut driver = driver_ref.lock().await;
 
     // Configuración de Bitrate Opus de alta definición (por defecto 128 kbps, o variable AUDIO_BITRATE)
     let bitrate_bps = std::env::var("AUDIO_BITRATE")
@@ -374,23 +389,24 @@ pub async fn player_play(
         }
     };
 
-    let mut driver = driver_ref.lock().await;
-
     // Si se solicita reemplazar explícitamente, se detiene la cola y el stream actual
     if payload.replace == Some(true) {
         state.next_epoch(payload.guild_id);
         state.pending_playlists.remove(&payload.guild_id);
-        driver.stop();
-        driver.queue().stop();
+        let mut d = driver_ref.lock().await;
+        d.stop();
+        d.queue().stop();
     }
 
-    let initial_queue_len = driver.queue().len();
-    let target_volume = payload.volume.unwrap_or(1.0);
+    let target_volume = payload.volume.unwrap_or_else(|| state.get_volume(payload.guild_id));
+    state.set_volume(payload.guild_id, target_volume);
     let effective_volume = (target_volume * 0.95).clamp(0.0, 2.0);
 
     let dsp_chain = state.get_dsp(payload.guild_id);
 
     // Encolar inmediatamente la pista 1 con el pipeline DSP inyectado
+    // IMPORTANTE: create_track_with_dsp conecta vía HTTP para resolver headers del stream.
+    // Lo ejecutamos FUERA del lock del Driver para no bloquear /queue, /control ni /leave.
     let first_meta = Arc::new(batch.first_track.clone());
     let songbird_track = create_track_with_dsp(
         state.http_client.clone(),
@@ -399,12 +415,16 @@ pub async fn player_play(
         dsp_chain.clone(),
     )
     .await;
-    let handle = driver.enqueue(songbird_track).await;
-    let _ = handle.set_volume(effective_volume);
-    attach_track_events(payload.guild_id, first_meta, &handle, &state.event_tx);
 
-    let total_queue_len = driver.queue().len();
-    drop(driver); // Liberar lock antes de despachar tareas asíncronas
+    let (handle, initial_queue_len, total_queue_len) = {
+        let mut driver = driver_ref.lock().await;
+        let init_len = driver.queue().len();
+        let h = driver.enqueue(songbird_track).await;
+        let _ = h.set_volume(effective_volume);
+        let tot_len = driver.queue().len();
+        (h, init_len, tot_len)
+    };
+    attach_track_events(payload.guild_id, first_meta, &handle, &state.event_tx);
 
     // Si es una playlist/mix con pistas pendientes, iniciar background worker
     if !batch.remaining_entries.is_empty() {
@@ -491,7 +511,6 @@ pub async fn player_play(
                             break;
                         }
 
-                        let mut d = driver_clone.lock().await;
                         let track_meta = Arc::new(track.clone());
                         let trk = create_track_with_dsp(
                             http_client.clone(),
@@ -500,8 +519,14 @@ pub async fn player_play(
                             dsp_chain_clone.clone(),
                         )
                         .await;
-                        let h = d.enqueue(trk).await;
-                        let _ = h.set_volume(effective_volume);
+
+                        let (h, in_queue_len) = {
+                            let mut d = driver_clone.lock().await;
+                            let handle = d.enqueue(trk).await;
+                            let _ = handle.set_volume(effective_volume);
+                            let len = d.queue().len();
+                            (handle, len)
+                        };
                         attach_track_events(guild_id, track_meta, &h, &event_tx_clone);
 
                         if let Some(mut pend) = pending_map.get_mut(&guild_id) {
@@ -510,7 +535,7 @@ pub async fn player_play(
                         info!(
                             guild = guild_id,
                             title = %track.title,
-                            in_queue = d.queue().len(),
+                            in_queue = in_queue_len,
                             "Pista de playlist resuelta y encolada en segundo plano"
                         );
                     }
@@ -670,8 +695,9 @@ pub async fn player_control(
         "volume" => {
             if let Some(val) = payload.value {
                 let clamped = val.clamp(0.0, 2.0);
+                state.set_volume(payload.guild_id, clamped);
                 if let Some(track) = driver.queue().current() {
-                    let _ = track.set_volume(clamped);
+                    let _ = track.set_volume(clamped * 0.95);
                 }
                 Ok(Json(ApiResponse::ok("Volume updated")))
             } else {
@@ -694,6 +720,10 @@ pub async fn voice_leave(
 ) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<&'static str>>)> {
     state.next_epoch(payload.guild_id);
     state.pending_playlists.remove(&payload.guild_id);
+    state.dsp_chains.remove(&payload.guild_id);
+    state.load_epochs.remove(&payload.guild_id);
+    state.guild_volumes.remove(&payload.guild_id);
+
     if let Some((_, driver_ref)) = state.players.remove(&payload.guild_id) {
         let mut driver = driver_ref.lock().await;
         driver.stop();
@@ -715,10 +745,16 @@ pub async fn ws_events(
 
 async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
     let mut rx = state.event_tx.subscribe();
+    let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
     info!("🔌 Client connected to axAudio WebSocket /v1/events");
 
     loop {
         tokio::select! {
+            _ = ping_interval.tick() => {
+                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+            }
             event = rx.recv() => {
                 match event {
                     Ok(evt) => {
@@ -730,6 +766,13 @@ async fn handle_ws_events(mut socket: WebSocket, state: AppState) {
                     }
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
                         warn!("WebSocket client lagged behind, skipped {} events", missed);
+                        let resync = serde_json::json!({
+                            "type": "resync",
+                            "missed_events": missed
+                        });
+                        if let Ok(json) = serde_json::to_string(&resync) {
+                            let _ = socket.send(Message::Text(json.into())).await;
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         break;

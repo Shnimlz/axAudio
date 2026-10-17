@@ -92,24 +92,46 @@ impl SourceResolver {
             cache: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(3600 * 4), // 4 horas de TTL para streams de audio
             cookie_rotation_index: Arc::new(AtomicUsize::new(0)),
-            process_semaphore: Arc::new(Semaphore::new(1)),
+            process_semaphore: Arc::new(Semaphore::new(2)),
             http_client,
         }
     }
 
+    /// Limpia entradas expiradas de la caché en memoria según el TTL
+    pub fn prune_cache(&self) {
+        self.cache.retain(|_, (_, ts)| ts.elapsed() < self.ttl);
+    }
+
+    /// Filtra argumentos de CLI para prevenir inyección de comandos arbitrarios
+    fn is_safe_extra_arg(arg: &str) -> bool {
+        let lower = arg.to_lowercase();
+        !lower.starts_with("--exec")
+            && !lower.starts_with("--config-location")
+            && !lower.starts_with("--plugin")
+            && !lower.starts_with("--compat-options")
+            && !lower.starts_with("--alias")
+            && !lower.contains(';')
+            && !lower.contains('&')
+            && !lower.contains('|')
+            && !lower.contains('`')
+            && !lower.contains('$')
+            && !lower.contains('\n')
+            && !lower.contains('\r')
+    }
+
     /// Determina si una URL ya apunta a un flujo HTTP/S directo de audio sin requerir extractor
     pub fn is_direct_stream(url: &str) -> bool {
-        let lower = url.to_lowercase();
-        lower.ends_with(".mp3")
-            || lower.ends_with(".ogg")
-            || lower.ends_with(".flac")
-            || lower.ends_with(".aac")
-            || lower.ends_with(".wav")
-            || lower.ends_with(".m4a")
-            || lower.ends_with(".opus")
-            || lower.contains("stream.zeno.fm")
-            || lower.contains("icecast")
-            || lower.contains("shoutcast")
+        let clean = url.split('?').next().unwrap_or(url).to_lowercase();
+        clean.ends_with(".mp3")
+            || clean.ends_with(".ogg")
+            || clean.ends_with(".flac")
+            || clean.ends_with(".aac")
+            || clean.ends_with(".wav")
+            || clean.ends_with(".m4a")
+            || clean.ends_with(".opus")
+            || clean.contains("stream.zeno.fm")
+            || clean.contains("icecast")
+            || clean.contains("shoutcast")
     }
 
     /// Detecta si una consulta o URL corresponde a una lista de reproducción, Mix o Radio
@@ -217,6 +239,7 @@ impl SourceResolver {
         let query_trimmed = query.trim();
         let _permit = self.process_semaphore.acquire().await.map_err(|e| format!("Fallo adquiriendo semáforo de proceso para flat-playlist: {}", e))?;
         let mut cmd = Command::new("yt-dlp");
+        cmd.kill_on_drop(true);
         cmd.arg("--flat-playlist");
         cmd.arg("--dump-single-json");
 
@@ -252,7 +275,7 @@ impl SourceResolver {
 
         if let Ok(env_extra) = std::env::var("YTDLP_EXTRA_ARGS") {
             for arg in env_extra.split_whitespace() {
-                if !arg.is_empty() {
+                if !arg.is_empty() && Self::is_safe_extra_arg(arg) {
                     cmd.arg(arg);
                 }
             }
@@ -260,17 +283,20 @@ impl SourceResolver {
 
         if let Some(extra) = custom_extra_args {
             for arg in extra.split_whitespace() {
-                if !arg.is_empty() {
+                if !arg.is_empty() && Self::is_safe_extra_arg(arg) {
                     cmd.arg(arg);
+                } else if !arg.is_empty() {
+                    warn!(arg = %arg, "Flag bloqueada en custom_extra_args por seguridad");
                 }
             }
         }
 
-        cmd.arg(query_trimmed);
+        cmd.arg("--").arg(query_trimmed);
 
-        let output = cmd.output().await.map_err(|e| {
-            format!("Error ejecutando subproceso yt-dlp flat playlist: {:?}", e)
-        })?;
+        let output = tokio::time::timeout(Duration::from_secs(25), cmd.output())
+            .await
+            .map_err(|_| "Timeout (25s) esperando respuesta de yt-dlp flat-playlist".to_string())?
+            .map_err(|e| format!("Error ejecutando subproceso yt-dlp flat playlist: {:?}", e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -352,6 +378,7 @@ impl SourceResolver {
         let query_trimmed = query.trim();
         let _permit = self.process_semaphore.acquire().await.map_err(|e| format!("Fallo adquiriendo semáforo de proceso para pista individual: {}", e))?;
         let mut cmd = Command::new("yt-dlp");
+        cmd.kill_on_drop(true);
         cmd.arg("--no-playlist");
         cmd.arg("--dump-single-json");
 
@@ -388,7 +415,7 @@ impl SourceResolver {
 
         if let Ok(env_extra) = std::env::var("YTDLP_EXTRA_ARGS") {
             for arg in env_extra.split_whitespace() {
-                if !arg.is_empty() {
+                if !arg.is_empty() && Self::is_safe_extra_arg(arg) {
                     cmd.arg(arg);
                 }
             }
@@ -396,17 +423,20 @@ impl SourceResolver {
 
         if let Some(extra) = custom_extra_args {
             for arg in extra.split_whitespace() {
-                if !arg.is_empty() {
+                if !arg.is_empty() && Self::is_safe_extra_arg(arg) {
                     cmd.arg(arg);
+                } else if !arg.is_empty() {
+                    warn!(arg = %arg, "Flag bloqueada en custom_extra_args por seguridad");
                 }
             }
         }
 
-        cmd.arg(query_trimmed);
+        cmd.arg("--").arg(query_trimmed);
 
-        let output = cmd.output().await.map_err(|e| {
-            format!("Error al ejecutar subproceso yt-dlp: {:?}", e)
-        })?;
+        let output = tokio::time::timeout(Duration::from_secs(25), cmd.output())
+            .await
+            .map_err(|_| "Timeout (25s) esperando respuesta de yt-dlp".to_string())?
+            .map_err(|e| format!("Error al ejecutar subproceso yt-dlp: {:?}", e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

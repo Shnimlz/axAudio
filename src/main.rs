@@ -46,6 +46,16 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState::new();
 
+    // Tarea en segundo plano para purgar entradas de caché expiradas cada 10 minutos
+    let resolver_for_cleanup = state.resolver.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(600));
+        loop {
+            interval.tick().await;
+            resolver_for_cleanup.prune_cache();
+        }
+    });
+
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/v1/stats", get(handlers::get_stats))
@@ -70,7 +80,34 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     info!("🚀 axAudio server listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut stream) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            stream.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("🛑 Graceful shutdown signal received, terminating axAudio safely...");
 }
