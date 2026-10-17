@@ -1194,6 +1194,13 @@ pub async fn player_dsp(
         }
     }
 
+    if let Some(modulation) = payload.modulation {
+        params.set_modulation(modulation);
+        if message.is_empty() {
+            message = "Configuración de modulación (8D/Tremolo/Vibrato) actualizada".to_string();
+        }
+    }
+
     if let Some(ref bands) = payload.bands {
         params.set_bands(bands);
     }

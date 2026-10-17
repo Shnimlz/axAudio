@@ -3,6 +3,7 @@
 //! Curvas de respuesta acústica de estudio, ampliación Mid/Side y sonido envolvente.
 
 use super::equalizer::Equalizer;
+use super::modulation::ModulationSettings;
 use super::spatial::{SpatialProcessor, SpatialSettings};
 
 pub struct DspPreset {
@@ -10,6 +11,7 @@ pub struct DspPreset {
     pub description: &'static str,
     pub eq_bands: [f32; 15], // dB por banda (25Hz a 16kHz)
     pub spatial: SpatialSettings,
+    pub modulation: ModulationSettings,
 }
 
 pub fn get_preset(name: &str) -> Option<DspPreset> {
@@ -27,6 +29,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter: true,
                 bass_exciter_drive: 0.15,
             },
+            modulation: ModulationSettings::default(),
         }),
 
         // --- Cinema 3D / Dolby Atmos ---
@@ -41,6 +44,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter: true,
                 bass_exciter_drive: 0.22,
             },
+            modulation: ModulationSettings::default(),
         }),
 
         // --- Bass Boost 3D ---
@@ -55,6 +59,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter: true,
                 bass_exciter_drive: 0.30,
             },
+            modulation: ModulationSettings::default(),
         }),
 
         // --- Vocal Clarity ---
@@ -69,6 +74,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter: false,
                 bass_exciter_drive: 0.0,
             },
+            modulation: ModulationSettings::default(),
         }),
 
         // --- Gaming 3D ---
@@ -83,6 +89,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter: true,
                 bass_exciter_drive: 0.20,
             },
+            modulation: ModulationSettings::default(),
         }),
 
         // --- Concert Hall ---
@@ -97,6 +104,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter: false,
                 bass_exciter_drive: 0.10,
             },
+            modulation: ModulationSettings::default(),
         }),
 
         // --- Nightcore ---
@@ -110,6 +118,67 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 crossfeed_level: 0.10,
                 bass_exciter: true,
                 bass_exciter_drive: 0.25,
+            },
+            modulation: ModulationSettings::default(),
+        }),
+
+        // --- 8D Audio ---
+        "8d" | "8d-audio" | "orbit" => Some(DspPreset {
+            name: "8d",
+            description: "Inmersión 8D Audio: rotación orbital continua a 0.15 Hz, apertura espacial y crossfeed binaural",
+            eq_bands: [3.0, 2.5, 1.5, 0.5, 0.0, 0.0, 0.5, 0.5, 1.0, 1.5, 1.5, 2.0, 2.0, 2.5, 2.5],
+            spatial: SpatialSettings {
+                stereo_width: 1.28,
+                binaural_crossfeed: true,
+                crossfeed_level: 0.16,
+                bass_exciter: true,
+                bass_exciter_drive: 0.20,
+            },
+            modulation: ModulationSettings {
+                rotation: true,
+                rotation_speed_hz: 0.15,
+                tremolo: false,
+                tremolo_freq_hz: 4.0,
+                tremolo_depth: 0.5,
+                vibrato: false,
+                vibrato_freq_hz: 5.0,
+                vibrato_depth: 0.3,
+            },
+        }),
+
+        // --- Tremolo ---
+        "tremolo" => Some(DspPreset {
+            name: "tremolo",
+            description: "Modulación clásica de amplitud Tremolo a 4.5 Hz con ecualización cálida",
+            eq_bands: [1.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.5, 1.5, 1.5],
+            spatial: SpatialSettings::default(),
+            modulation: ModulationSettings {
+                rotation: false,
+                rotation_speed_hz: 0.15,
+                tremolo: true,
+                tremolo_freq_hz: 4.5,
+                tremolo_depth: 0.55,
+                vibrato: false,
+                vibrato_freq_hz: 5.0,
+                vibrato_depth: 0.3,
+            },
+        }),
+
+        // --- Vibrato ---
+        "vibrato" => Some(DspPreset {
+            name: "vibrato",
+            description: "Modulación analógica de tono Vibrato a 5.0 Hz con calidez sutil",
+            eq_bands: [0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.5, 1.5, 1.5, 2.0, 2.0],
+            spatial: SpatialSettings::default(),
+            modulation: ModulationSettings {
+                rotation: false,
+                rotation_speed_hz: 0.15,
+                tremolo: false,
+                tremolo_freq_hz: 4.0,
+                tremolo_depth: 0.5,
+                vibrato: true,
+                vibrato_freq_hz: 5.0,
+                vibrato_depth: 0.35,
             },
         }),
 
@@ -125,6 +194,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 bass_exciter: false,
                 bass_exciter_drive: 0.0,
             },
+            modulation: ModulationSettings::default(),
         }),
 
         _ => None,
@@ -134,7 +204,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
 pub fn apply_preset(name: &str, eq: &mut Equalizer, spatial: &mut SpatialProcessor) -> Result<String, String> {
     let preset = get_preset(name).ok_or_else(|| {
         format!(
-            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, flat",
+            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, 8d, tremolo, vibrato, flat",
             name
         )
     })?;
@@ -150,13 +220,14 @@ pub fn apply_preset(name: &str, eq: &mut Equalizer, spatial: &mut SpatialProcess
 pub fn apply_preset_to_params(name: &str, params: &mut super::DspParams) -> Result<String, String> {
     let preset = get_preset(name).ok_or_else(|| {
         format!(
-            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, flat",
+            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, 8d, tremolo, vibrato, flat",
             name
         )
     })?;
 
     params.gains_db = preset.eq_bands;
     params.spatial = preset.spatial;
+    params.modulation = preset.modulation;
     params.active_preset = Some(preset.name.to_string());
     params.version += 1;
 
