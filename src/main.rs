@@ -13,6 +13,9 @@ use std::net::SocketAddr;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Sintonización de CPU para entornos VPS con 2 vCPUs:
     // Limitar worker_threads a 2 y max_blocking_threads a 4 para prevenir contención de cores
