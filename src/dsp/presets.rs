@@ -147,6 +147,22 @@ pub fn apply_preset(name: &str, eq: &mut Equalizer, spatial: &mut SpatialProcess
     Ok(format!("{}: {}", preset.name, preset.description))
 }
 
+pub fn apply_preset_to_params(name: &str, params: &mut super::DspParams) -> Result<String, String> {
+    let preset = get_preset(name).ok_or_else(|| {
+        format!(
+            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, flat",
+            name
+        )
+    })?;
+
+    params.gains_db = preset.eq_bands;
+    params.spatial = preset.spatial;
+    params.active_preset = Some(preset.name.to_string());
+    params.version += 1;
+
+    Ok(format!("{}: {}", preset.name, preset.description))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -95,6 +95,16 @@ impl SpatialProcessor {
         self.settings = settings;
     }
 
+    /// Adapta los filtros espaciales si la tasa de muestreo del audio cambia
+    pub fn update_sample_rate(&mut self, sample_rate: f32) {
+        if (self.sample_rate - sample_rate).abs() > 1.0 {
+            self.sample_rate = sample_rate;
+            self.head_filter_l = OnePoleLowPass::new(700.0, sample_rate);
+            self.head_filter_r = OnePoleLowPass::new(700.0, sample_rate);
+            self.bass_filter = StereoBiquad::new(FilterType::LowPass, 85.0, 0.0, sample_rate);
+        }
+    }
+
     #[inline]
     pub fn is_active(&self) -> bool {
         (self.settings.stereo_width - 1.0).abs() > 0.02
@@ -159,13 +169,13 @@ impl SpatialProcessor {
                 r = mid * gain_mid - side * gain_side;
             }
 
-            // 3. Crossfeed Acústico Natural (Sombra craneal analógica, sin retardos)
+            // 3. Crossfeed Acústico Natural (Conserva ganancia unitaria exacta 1.0 en mono/graves)
             if do_binaural {
                 let shadow_l = self.head_filter_l.process(l);
                 let shadow_r = self.head_filter_r.process(r);
 
-                l = l * (1.0 - crossfeed * 0.5) + shadow_r * crossfeed;
-                r = r * (1.0 - crossfeed * 0.5) + shadow_l * crossfeed;
+                l = l * (1.0 - crossfeed) + shadow_r * crossfeed;
+                r = r * (1.0 - crossfeed) + shadow_l * crossfeed;
             }
 
             left[i] = l;

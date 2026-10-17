@@ -33,7 +33,10 @@ pub fn get_band_q(band: usize) -> f32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BandSetting {
     pub band: usize,
-    pub gain: f32, // en dB (-15.0 a +15.0) o lineal Lavalink (-0.25 a +1.0)
+    #[serde(default)]
+    pub gain: Option<f32>,     // Lineal Lavalink (-0.25 a +1.0)
+    #[serde(default)]
+    pub gain_db: Option<f32>,  // Decibelios directos (-15.0 a +15.0)
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +64,22 @@ impl Equalizer {
             gains_db: [0.0; 15],
             sample_rate,
             is_active: false,
+        }
+    }
+
+    /// Adapta los filtros si la tasa de muestreo cambia
+    pub fn update_sample_rate(&mut self, sample_rate: f32) {
+        if (self.sample_rate - sample_rate).abs() > 1.0 {
+            self.sample_rate = sample_rate;
+            for (i, filter) in self.filters.iter_mut().enumerate() {
+                let freq = EQ_FREQUENCIES[i];
+                filter.update(
+                    FilterType::Peaking { q: get_band_q(i) },
+                    freq,
+                    self.gains_db[i],
+                    sample_rate,
+                );
+            }
         }
     }
 
@@ -93,17 +112,44 @@ impl Equalizer {
         }
     }
 
-    /// Aplica una lista de bandas de forma atómica
+    /// Aplica una lista de bandas de forma atómica sin ambigüedades de escala
     pub fn set_bands(&mut self, bands: &[BandSetting]) {
         for b in bands {
-            // Si el valor está entre -0.5 y 1.0, interpretamos como escala Lavalink; si es > 1.0 o < -0.5, como dB directos
-            if b.gain.abs() <= 1.0 && b.gain != 0.0 {
-                self.set_band_lavalink(b.band, b.gain);
-            } else {
-                self.set_band_db(b.band, b.gain);
+            if let Some(db) = b.gain_db {
+                self.set_band_db(b.band, db);
+            } else if let Some(linear) = b.gain {
+                self.set_band_lavalink(b.band, linear);
             }
         }
         self.check_active();
+    }
+
+    /// Calcula la ganancia pico real de la curva combinada de los 15 filtros
+    /// para pre-amplificación exacta contra saturación
+    pub fn compute_max_peak_gain_db(&self) -> f32 {
+        let active_filters: Vec<&StereoBiquad> = self.filters.iter().filter(|f| f.active).collect();
+        if active_filters.is_empty() {
+            return 0.0;
+        }
+
+        let mut max_gain_db = 0.0f64;
+        let sr = self.sample_rate as f64;
+        let min_freq = 20.0f64;
+        let max_freq = 20000.0f64.min(sr * 0.49);
+        let steps = 64;
+        let log_min = min_freq.ln();
+        let log_max = max_freq.ln();
+
+        for i in 0..=steps {
+            let f = (log_min + (log_max - log_min) * (i as f64 / steps as f64)).exp();
+            let w = 2.0 * std::f64::consts::PI * f / sr;
+            let sum_db: f64 = active_filters.iter().map(|filter| filter.coeffs.mag_db(w)).sum();
+            if sum_db > max_gain_db {
+                max_gain_db = sum_db;
+            }
+        }
+
+        max_gain_db as f32
     }
 
     /// Restablece todas las bandas a plano (0 dB)
@@ -122,32 +168,28 @@ impl Equalizer {
         self.is_active = false;
     }
 
+    pub fn reset(&mut self) {
+        for filter in self.filters.iter_mut() {
+            filter.reset();
+        }
+    }
+
     pub fn check_active(&mut self) {
         self.is_active = self.gains_db.iter().any(|g| g.abs() > 0.05);
     }
 
-    /// Procesa un bloque de muestras estéreo en formato planar (Left y Right slices)
+    /// Procesa un bloque de muestras estéreo en formato planar
+    /// Inversión de bucles (filtro exterior, buffer interior) para vectorización SIMD nativa
     #[inline]
     pub fn process_planar(&mut self, left: &mut [f32], right: &mut [f32]) {
         if !self.is_active {
             return;
         }
 
-        let len = left.len().min(right.len());
-        for i in 0..len {
-            let mut l = left[i];
-            let mut r = right[i];
-
-            for filter in &mut self.filters {
-                if filter.active {
-                    let (fl, fr) = filter.process_pair(l, r);
-                    l = fl;
-                    r = fr;
-                }
+        for filter in self.filters.iter_mut() {
+            if filter.active {
+                filter.process_buffer(left, right);
             }
-
-            left[i] = l;
-            right[i] = r;
         }
     }
 
@@ -158,15 +200,12 @@ impl Equalizer {
             return;
         }
 
-        for sample in mono.iter_mut() {
-            let mut s = *sample;
-            for filter in &mut self.filters {
-                if filter.active {
-                    let (fl, _) = filter.process_pair(s, s);
-                    s = fl;
+        for filter in self.filters.iter_mut() {
+            if filter.active {
+                for sample in mono.iter_mut() {
+                    *sample = filter.left.process_sample(&filter.coeffs, *sample);
                 }
             }
-            *sample = s;
         }
     }
 }

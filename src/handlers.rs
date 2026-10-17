@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
-use crate::dsp::inject_dsp;
+use crate::dsp::{apply_preset_to_params, inject_dsp, DspParams};
 use crate::models::{
     ApiResponse, ControlPayload, DspPayload, DspResponse, EqPayload, JoinPayload, LeavePayload,
     PlayPayload, PlayResponse, PlayerEvent, QueuePayload, QueueResponse, ResolvePayload,
@@ -325,7 +325,7 @@ async fn create_track_with_dsp(
     http_client: reqwest::Client,
     stream_url: String,
     meta: Arc<TrackMetadata>,
-    dsp_chain: Arc<std::sync::Mutex<crate::dsp::DspChain>>,
+    dsp_params: Arc<std::sync::RwLock<DspParams>>,
 ) -> Track {
     let source = HttpRequest::new(http_client.clone(), stream_url.clone());
     let input: songbird::input::Input = source.into();
@@ -339,7 +339,7 @@ async fn create_track_with_dsp(
     {
         Ok(mut playable) => {
             if let Some(parsed) = playable.parsed_mut() {
-                inject_dsp(parsed, dsp_chain);
+                inject_dsp(parsed, dsp_params);
             }
             Track::new_with_data(playable, meta)
         }
@@ -402,7 +402,7 @@ pub async fn player_play(
     state.set_volume(payload.guild_id, target_volume);
     let effective_volume = (target_volume * 0.95).clamp(0.0, 2.0);
 
-    let dsp_chain = state.get_dsp(payload.guild_id);
+    let dsp_params = state.get_dsp_params(payload.guild_id);
 
     // Encolar inmediatamente la pista 1 con el pipeline DSP inyectado
     // IMPORTANTE: create_track_with_dsp conecta vía HTTP para resolver headers del stream.
@@ -412,7 +412,7 @@ pub async fn player_play(
         state.http_client.clone(),
         batch.first_track.stream_url.clone(),
         first_meta.clone(),
-        dsp_chain.clone(),
+        dsp_params.clone(),
     )
     .await;
 
@@ -438,7 +438,7 @@ pub async fn player_play(
         let pending_map = state.pending_playlists.clone();
         let epochs = state.load_epochs.clone();
         let event_tx_clone = state.event_tx.clone();
-        let dsp_chain_clone = dsp_chain.clone();
+        let dsp_params_clone = dsp_params.clone();
         let remaining = batch.remaining_entries;
         let extractor_args = payload.extractor_args.clone();
         let extra_args = payload.extra_args.clone();
@@ -516,7 +516,7 @@ pub async fn player_play(
                             http_client.clone(),
                             track.stream_url.clone(),
                             track_meta.clone(),
-                            dsp_chain_clone.clone(),
+                            dsp_params_clone.clone(),
                         )
                         .await;
 
@@ -720,7 +720,7 @@ pub async fn voice_leave(
 ) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<&'static str>>)> {
     state.next_epoch(payload.guild_id);
     state.pending_playlists.remove(&payload.guild_id);
-    state.dsp_chains.remove(&payload.guild_id);
+    state.dsp_params.remove(&payload.guild_id);
     state.load_epochs.remove(&payload.guild_id);
     state.guild_volumes.remove(&payload.guild_id);
 
@@ -800,8 +800,8 @@ pub async fn player_eq(
     State(state): State<AppState>,
     Json(payload): Json<EqPayload>,
 ) -> Result<Json<ApiResponse<DspResponse>>, (StatusCode, Json<ApiResponse<DspResponse>>)> {
-    let dsp_chain = state.get_dsp(payload.guild_id);
-    let mut dsp = match dsp_chain.lock() {
+    let dsp_params = state.get_dsp_params(payload.guild_id);
+    let mut params = match dsp_params.write() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -809,20 +809,20 @@ pub async fn player_eq(
     let mut message = String::new();
 
     if let Some(ref preset) = payload.preset {
-        match dsp.apply_preset(preset) {
+        match apply_preset_to_params(preset, &mut params) {
             Ok(desc) => message = format!("Preset '{}' aplicado: {}", preset, desc),
             Err(e) => return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::err(e)))),
         }
     }
 
     if let Some(ref bands) = payload.bands {
-        dsp.set_bands(bands);
+        params.set_bands(bands);
         if message.is_empty() {
             message = format!("Se actualizaron {} bandas de ecualización", bands.len());
         }
     }
 
-    let status = dsp.get_status();
+    let status = params.get_status();
     let res = DspResponse {
         guild_id: payload.guild_id,
         status,
@@ -836,8 +836,8 @@ pub async fn player_dsp(
     State(state): State<AppState>,
     Json(payload): Json<DspPayload>,
 ) -> Result<Json<ApiResponse<DspResponse>>, (StatusCode, Json<ApiResponse<DspResponse>>)> {
-    let dsp_chain = state.get_dsp(payload.guild_id);
-    let mut dsp = match dsp_chain.lock() {
+    let dsp_params = state.get_dsp_params(payload.guild_id);
+    let mut params = match dsp_params.write() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -845,24 +845,24 @@ pub async fn player_dsp(
     let mut message = String::new();
 
     if let Some(ref preset) = payload.preset {
-        match dsp.apply_preset(preset) {
+        match apply_preset_to_params(preset, &mut params) {
             Ok(desc) => message = format!("Preset '{}' aplicado: {}", preset, desc),
             Err(e) => return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::err(e)))),
         }
     }
 
     if let Some(spatial) = payload.spatial {
-        dsp.set_spatial(spatial);
+        params.set_spatial(spatial);
         if message.is_empty() {
             message = "Configuración espacial y 3D actualizada".to_string();
         }
     }
 
     if let Some(ref bands) = payload.bands {
-        dsp.set_bands(bands);
+        params.set_bands(bands);
     }
 
-    let status = dsp.get_status();
+    let status = params.get_status();
     let res = DspResponse {
         guild_id: payload.guild_id,
         status,

@@ -15,11 +15,11 @@ pub enum FilterType {
 
 #[derive(Debug, Clone)]
 pub struct BiquadCoefficients {
-    pub b0: f32,
-    pub b1: f32,
-    pub b2: f32,
-    pub a1: f32,
-    pub a2: f32,
+    pub b0: f64,
+    pub b1: f64,
+    pub b2: f64,
+    pub a1: f64,
+    pub a2: f64,
 }
 
 impl Default for BiquadCoefficients {
@@ -35,35 +35,25 @@ impl Default for BiquadCoefficients {
 }
 
 impl BiquadCoefficients {
-    /// Calcula los coeficientes biquad para una frecuencia central, ganancia en dB y frecuencia de muestreo
+    /// Calcula los coeficientes biquad en f64 para máxima estabilidad en subgraves
     pub fn compute(filter_type: FilterType, freq_hz: f32, gain_db: f32, sample_rate: f32) -> Self {
-        // Zero-gain bypass: si la ganancia es prácticamente nula en un filtro peaking o shelf,
-        // devolvemos ganancia unitaria directa sin alterar la señal
         if matches!(filter_type, FilterType::Peaking { .. } | FilterType::LowShelf | FilterType::HighShelf)
             && gain_db.abs() < 0.01
         {
             return Self::default();
         }
 
-        let f0 = freq_hz.clamp(10.0, sample_rate * 0.49);
-        let a = 10.0f32.powf(gain_db / 40.0);
-        let w0 = 2.0 * std::f32::consts::PI * f0 / sample_rate;
+        let sr = sample_rate as f64;
+        let f0 = (freq_hz as f64).clamp(10.0, sr * 0.49);
+        let a = 10.0f64.powf((gain_db as f64) / 40.0);
+        let w0 = 2.0 * std::f64::consts::PI * f0 / sr;
         let cos_w0 = w0.cos();
         let sin_w0 = w0.sin();
 
         match filter_type {
             FilterType::Peaking { q } => {
-                // Estabilización de Q en graves:
-                // En frecuencias subgraves (< 60 Hz), un Q alto causa inestabilidad numérica
-                // severa y siseo/estática en coma flotante de 32 bits. Tapering suave hacia 0.8 en 20 Hz.
-                let effective_q = if f0 < 60.0 {
-                    let max_q = (f0 - 20.0).max(0.0) * ((q - 0.8) / 40.0) + 0.8;
-                    q.min(max_q).max(0.2)
-                } else {
-                    q.max(0.1)
-                };
-
-                let alpha = sin_w0 / (2.0 * effective_q);
+                let q_f64 = (q as f64).max(0.1);
+                let alpha = sin_w0 / (2.0 * q_f64);
                 let a0 = 1.0 + alpha / a;
                 let a1 = -2.0 * cos_w0;
                 let a2 = 1.0 - alpha / a;
@@ -80,7 +70,7 @@ impl BiquadCoefficients {
                 }
             }
             FilterType::LowShelf => {
-                let s = 1.0; // slope
+                let s = 1.0f64;
                 let alpha = sin_w0 / 2.0 * ((a + 1.0 / a) * (1.0 / s - 1.0) + 2.0).sqrt();
                 let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
 
@@ -100,7 +90,7 @@ impl BiquadCoefficients {
                 }
             }
             FilterType::HighShelf => {
-                let s = 1.0;
+                let s = 1.0f64;
                 let alpha = sin_w0 / 2.0 * ((a + 1.0 / a) * (1.0 / s - 1.0) + 2.0).sqrt();
                 let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
 
@@ -120,7 +110,7 @@ impl BiquadCoefficients {
                 }
             }
             FilterType::LowPass => {
-                let q = 0.7071; // Butterworth Q
+                let q = 0.7071067811865475f64;
                 let alpha = sin_w0 / (2.0 * q);
                 let a0 = 1.0 + alpha;
                 let b1 = 1.0 - cos_w0;
@@ -138,7 +128,7 @@ impl BiquadCoefficients {
                 }
             }
             FilterType::HighPass => {
-                let q = 0.7071;
+                let q = 0.7071067811865475f64;
                 let alpha = sin_w0 / (2.0 * q);
                 let a0 = 1.0 + alpha;
                 let b1 = -(1.0 + cos_w0);
@@ -157,35 +147,41 @@ impl BiquadCoefficients {
             }
         }
     }
+
+    /// Calcula la ganancia en dB en una frecuencia angular w = 2*pi*f/fs
+    pub fn mag_db(&self, w: f64) -> f64 {
+        let (c1, c2) = (w.cos(), (2.0 * w).cos());
+        let num = self.b0 * self.b0 + self.b1 * self.b1 + self.b2 * self.b2
+            + 2.0 * (self.b0 * self.b1 + self.b1 * self.b2) * c1
+            + 2.0 * self.b0 * self.b2 * c2;
+        let den = 1.0 + self.a1 * self.a1 + self.a2 * self.a2
+            + 2.0 * (self.a1 + self.a1 * self.a2) * c1
+            + 2.0 * self.a2 * c2;
+        if den <= 1e-12 {
+            return 0.0;
+        }
+        10.0 * (num / den).log10()
+    }
 }
 
-/// Estado del filtro biquad en Transposed Direct Form II (TDF-II)
-///
-/// A diferencia de Direct Form I (que mantiene x1, x2, y1, y2), TDF-II solo almacena dos
-/// variables de estado integradas (s1, s2). Esta topología reduce drásticamente el ruido
-/// de cuantización y cancelación en f32, eliminando ruidos de fondo y estática en frecuencias bajas.
+/// Estado del filtro biquad en Transposed Direct Form II (TDF-II) en f64
 #[derive(Debug, Clone, Default)]
 pub struct BiquadState {
-    pub s1: f32,
-    pub s2: f32,
+    pub s1: f64,
+    pub s2: f64,
 }
 
 impl BiquadState {
     #[inline(always)]
     pub fn process_sample(&mut self, coeffs: &BiquadCoefficients, sample: f32) -> f32 {
-        // Ecuaciones Transposed Direct Form II:
-        // y[n] = b0 * x[n] + s1
-        // s1   = b1 * x[n] - a1 * y[n] + s2
-        // s2   = b2 * x[n] - a2 * y[n]
-        let out = coeffs.b0 * sample + self.s1;
-
-        // Anti-denormal flush con umbral microscópico para evitar sobrecarga en CPU
+        let in_val = sample as f64;
+        let out = coeffs.b0 * in_val + self.s1;
         let clean_out = if out.abs() < 1e-15 { 0.0 } else { out };
 
-        self.s1 = coeffs.b1 * sample - coeffs.a1 * clean_out + self.s2;
-        self.s2 = coeffs.b2 * sample - coeffs.a2 * clean_out;
+        self.s1 = coeffs.b1 * in_val - coeffs.a1 * clean_out + self.s2;
+        self.s2 = coeffs.b2 * in_val - coeffs.a2 * clean_out;
 
-        clean_out
+        clean_out as f32
     }
 
     pub fn reset(&mut self) {
@@ -194,7 +190,7 @@ impl BiquadState {
     }
 }
 
-/// Filtro biquad estéreo completo (mantiene coeficientes y estados L/R en TDF-II)
+/// Filtro biquad estéreo completo (mantiene coeficientes y estados L/R en f64)
 #[derive(Debug, Clone)]
 pub struct StereoBiquad {
     pub coeffs: BiquadCoefficients,
@@ -228,6 +224,19 @@ impl StereoBiquad {
             self.left.process_sample(&self.coeffs, l),
             self.right.process_sample(&self.coeffs, r),
         )
+    }
+
+    /// Procesa un bloque de buffer contiguo para máxima vectorización SIMD
+    #[inline]
+    pub fn process_buffer(&mut self, left: &mut [f32], right: &mut [f32]) {
+        if !self.active {
+            return;
+        }
+        let len = left.len().min(right.len());
+        for i in 0..len {
+            left[i] = self.left.process_sample(&self.coeffs, left[i]);
+            right[i] = self.right.process_sample(&self.coeffs, right[i]);
+        }
     }
 
     pub fn reset(&mut self) {

@@ -5,7 +5,7 @@
 //! Garantiza procesamiento determinista y continuo sin pérdidas de tramas por contención.
 
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal, SignalSpec};
 use symphonia::core::codecs::{
     CodecDescriptor, CodecParameters, Decoder, DecoderOptions, FinalizeResult,
@@ -13,11 +13,13 @@ use symphonia::core::codecs::{
 use symphonia::core::errors::{Error as SymphError, Result as SymphResult};
 use symphonia::core::formats::Packet;
 
-use super::DspChain;
+use super::{DspChain, DspParams};
 
 pub struct DspDecoder {
     inner: Box<dyn Decoder>,
-    dsp: Arc<Mutex<DspChain>>,
+    params: Arc<RwLock<DspParams>>,
+    seen_version: u64,
+    chain: DspChain,
     f32_buf: Option<AudioBuffer<f32>>,
     last_was_dsp: bool,
 }
@@ -58,17 +60,30 @@ impl Decoder for DummyDecoder {
     }
 }
 
-pub fn inject_dsp(parsed: &mut songbird::input::Parsed, dsp: Arc<Mutex<DspChain>>) {
+pub fn inject_dsp(parsed: &mut songbird::input::Parsed, params: Arc<RwLock<DspParams>>) {
     let dummy = Box::new(DummyDecoder);
     let original = std::mem::replace(&mut parsed.decoder, dummy);
-    parsed.decoder = Box::new(DspDecoder::new(original, dsp));
+    parsed.decoder = Box::new(DspDecoder::new(original, params));
 }
 
 impl DspDecoder {
-    pub fn new(inner: Box<dyn Decoder>, dsp: Arc<Mutex<DspChain>>) -> Self {
+    pub fn new(inner: Box<dyn Decoder>, params: Arc<RwLock<DspParams>>) -> Self {
+        let (initial_params, initial_version) = match params.read() {
+            Ok(p) => (p.clone(), p.version),
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                (guard.clone(), guard.version)
+            }
+        };
+
+        let mut chain = DspChain::new(48000.0);
+        chain.rebuild(&initial_params, 48000.0);
+
         Self {
             inner,
-            dsp,
+            params,
+            seen_version: initial_version,
+            chain,
             f32_buf: None,
             last_was_dsp: false,
         }
@@ -93,8 +108,7 @@ impl Decoder for DspDecoder {
     fn reset(&mut self) {
         self.inner.reset();
         self.last_was_dsp = false;
-        let mut dsp = self.dsp.lock().unwrap_or_else(|e| e.into_inner());
-        dsp.spatial.reset();
+        self.chain.reset();
     }
 
     fn codec_params(&self) -> &CodecParameters {
@@ -106,24 +120,28 @@ impl Decoder for DspDecoder {
     }
 
     fn decode(&mut self, packet: &Packet) -> SymphResult<AudioBufferRef<'_>> {
-        // 1. Decodificar la trama con el códec subyacente (sin retener locks innecesarios)
+        // 1. Decodificar la trama con el códec subyacente
         let decoded = self.inner.decode(packet)?;
+        let rate = decoded.spec().rate as f32;
 
-        // 2. Adquirir lock determinista del DSP (operaciones en microsegundos, sin saltos por try_lock)
-        let mut dsp = self.dsp.lock().unwrap_or_else(|e| e.into_inner());
+        // 2. Comprobación lock-free (try_read nunca bloquea el hilo de audio en tiempo real)
+        // y adaptación automática a la tasa de muestreo nativa del stream
+        if let Ok(p) = self.params.try_read() {
+            if p.version != self.seen_version || (rate - self.chain.sample_rate).abs() > 1.0 {
+                self.chain.rebuild(&p, rate);
+                self.seen_version = p.version;
+            }
+        }
 
-        // 3. Si el DSP está completamente desactivado (modo flat/neutro), retornar directo
-        // CERO sobrecarga o alteración de señal en modo neutro
-        if !dsp.is_active() {
+        // 3. Si el DSP está completamente desactivado (modo plano/neutro), retornar directo
+        if !self.chain.is_active() {
             self.last_was_dsp = false;
             return Ok(decoded);
         }
 
         self.last_was_dsp = true;
 
-        // 4. Asegurar que f32_buf tenga EXACTAMENTE la misma capacidad y especificación que decoded
-        // (CRUCIAL: Symphonia convert() usa dest.buf[c * self.n_capacity], por lo que
-        // dest.n_capacity DEBE ser idéntico a self.n_capacity para no corromper el canal derecho)
+        // 4. Asegurar que f32_buf tenga la capacidad y especificación exacta
         let need_realloc = match self.f32_buf {
             Some(ref buf) => buf.capacity() != decoded.capacity() || buf.spec() != decoded.spec(),
             None => true,
@@ -140,10 +158,10 @@ impl Decoder for DspDecoder {
         // 5. Aplicar la cadena DSP sobre los canales de audio plano
         if f32_buf.spec().channels.count() >= 2 {
             let (left, right) = f32_buf.chan_pair_mut(0, 1);
-            dsp.process_planar(left, right);
+            self.chain.process_planar(left, right);
         } else if f32_buf.spec().channels.count() == 1 {
             let mono = f32_buf.chan_mut(0);
-            dsp.equalizer.process_mono(mono);
+            self.chain.equalizer.process_mono(mono);
         }
 
         Ok(AudioBufferRef::F32(Cow::Borrowed(f32_buf)))
