@@ -84,6 +84,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/player/seek", post(handlers::player_seek))
         .route("/v1/player/shuffle", post(handlers::player_shuffle))
         .route("/v1/player/loop", post(handlers::player_loop))
+        .route("/v1/player/autoplay", post(handlers::player_autoplay))
         .route("/v1/player/queue", post(handlers::player_queue))
         .route("/v1/player/eq", post(handlers::player_eq))
         .route("/v1/player/dsp", post(handlers::player_dsp))

@@ -94,6 +94,14 @@ pub struct ControlPayload {
     pub index: Option<usize>,         // remove index (0-based in upcoming queue)
     pub from_index: Option<usize>,    // move source index
     pub to_index: Option<usize>,      // move destination index
+    pub enabled: Option<bool>,        // autoplay enable/disable toggle
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AutoplayPayload {
+    #[serde(deserialize_with = "deserialize_u64_flexible")]
+    pub guild_id: u64,
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +175,7 @@ pub struct QueueResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_position_secs: Option<f64>,
     pub loop_mode: String,
+    pub autoplay: bool,
     pub queue: Vec<TrackResponse>,
     pub total_tracks: usize,
 }

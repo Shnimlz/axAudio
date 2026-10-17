@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 
 use crate::dsp::DspParams;
 use crate::models::{LoopMode, PlayerEvent};
-use crate::sources::{FlatPlaylistItem, SourceResolver};
+use crate::sources::{FlatPlaylistItem, SourceResolver, TrackMetadata};
 
 #[derive(Clone, Debug, Default)]
 pub struct GuildPlayOptions {
@@ -29,6 +29,9 @@ pub struct AppState {
     pub pending_playlists: Arc<DashMap<u64, Vec<FlatPlaylistItem>>>,
     pub guild_volumes: Arc<DashMap<u64, f32>>,
     pub loop_modes: Arc<DashMap<u64, LoopMode>>,
+    pub autoplay_guilds: Arc<DashSet<u64>>,
+    pub seen_tracks: Arc<DashMap<u64, Vec<String>>>,
+    pub last_tracks: Arc<DashMap<u64, TrackMetadata>>,
     pub prefetching_guilds: Arc<DashSet<u64>>,
     pub guild_play_options: Arc<DashMap<u64, GuildPlayOptions>>,
     pub event_tx: broadcast::Sender<PlayerEvent>,
@@ -63,6 +66,9 @@ impl AppState {
             pending_playlists: Arc::new(DashMap::new()),
             guild_volumes: Arc::new(DashMap::new()),
             loop_modes: Arc::new(DashMap::new()),
+            autoplay_guilds: Arc::new(DashSet::new()),
+            seen_tracks: Arc::new(DashMap::new()),
+            last_tracks: Arc::new(DashMap::new()),
             prefetching_guilds: Arc::new(DashSet::new()),
             guild_play_options: Arc::new(DashMap::new()),
             event_tx,
@@ -90,6 +96,49 @@ impl AppState {
 
     pub fn set_loop_mode(&self, guild_id: u64, mode: LoopMode) {
         self.loop_modes.insert(guild_id, mode);
+    }
+
+    pub fn is_autoplay(&self, guild_id: u64) -> bool {
+        self.autoplay_guilds.contains(&guild_id)
+    }
+
+    pub fn set_autoplay(&self, guild_id: u64, enabled: bool) {
+        if enabled {
+            self.autoplay_guilds.insert(guild_id);
+        } else {
+            self.autoplay_guilds.remove(&guild_id);
+        }
+    }
+
+    pub fn is_track_seen(&self, guild_id: u64, video_id: &str) -> bool {
+        if let Some(list) = self.seen_tracks.get(&guild_id) {
+            list.contains(&video_id.to_string())
+        } else {
+            false
+        }
+    }
+
+    pub fn record_seen_track(&self, guild_id: u64, video_id: &str) {
+        let mut entry = self.seen_tracks.entry(guild_id).or_insert_with(Vec::new);
+        if !entry.contains(&video_id.to_string()) {
+            entry.push(video_id.to_string());
+            if entry.len() > 60 {
+                let overflow = entry.len() - 60;
+                entry.drain(0..overflow);
+            }
+        }
+    }
+
+    pub fn clear_seen_tracks(&self, guild_id: u64) {
+        self.seen_tracks.remove(&guild_id);
+    }
+
+    pub fn set_last_track(&self, guild_id: u64, track: TrackMetadata) {
+        self.last_tracks.insert(guild_id, track);
+    }
+
+    pub fn get_last_track(&self, guild_id: u64) -> Option<TrackMetadata> {
+        self.last_tracks.get(&guild_id).map(|t| t.clone())
     }
 
     pub fn is_prefetching(&self, guild_id: u64) -> bool {

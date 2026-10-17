@@ -53,6 +53,7 @@ pub struct ResolvedBatch {
 #[derive(Clone)]
 pub struct SourceResolver {
     cache: Arc<DashMap<String, (TrackMetadata, Instant)>>,
+    related_cache: Arc<DashMap<String, (Vec<FlatPlaylistItem>, Instant)>>,
     ttl: Duration,
     cookie_rotation_index: Arc<AtomicUsize>,
     process_semaphore: Arc<Semaphore>,
@@ -90,6 +91,7 @@ impl SourceResolver {
 
         Self {
             cache: Arc::new(DashMap::new()),
+            related_cache: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(3600 * 4), // 4 horas de TTL para streams de audio
             cookie_rotation_index: Arc::new(AtomicUsize::new(0)),
             process_semaphore: Arc::new(Semaphore::new(2)),
@@ -100,6 +102,7 @@ impl SourceResolver {
     /// Limpia entradas expiradas de la caché en memoria según el TTL
     pub fn prune_cache(&self) {
         self.cache.retain(|_, (_, ts)| ts.elapsed() < self.ttl);
+        self.related_cache.retain(|_, (_, ts)| ts.elapsed() < Duration::from_secs(1200));
     }
 
     /// Filtra argumentos de CLI para prevenir inyección de comandos arbitrarios
@@ -835,6 +838,299 @@ impl SourceResolver {
                                     return Ok(results);
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Extrae de forma limpia el ID de un video de YouTube a partir de una URL o cadena cruda
+    pub fn extract_video_id(input: &str) -> Option<String> {
+        let trimmed = input.trim();
+        if trimmed.len() == 11 && trimmed.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            return Some(trimmed.to_string());
+        }
+
+        if let Some(pos) = trimmed.find("watch?v=") {
+            let after = &trimmed[pos + 8..];
+            let id = after.split('&').next().unwrap_or(after);
+            if id.len() == 11 {
+                return Some(id.to_string());
+            }
+        }
+
+        if let Some(pos) = trimmed.find("youtu.be/") {
+            let after = &trimmed[pos + 9..];
+            let id = after.split('?').next().and_then(|s| s.split('&').next()).unwrap_or(after);
+            if id.len() == 11 {
+                return Some(id.to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Obtiene recomendaciones afines tipo radio de YouTube Music mediante InnerTube (~35ms)
+    /// con fallback automático al cliente WEB si YouTube Music no retorna recomendaciones.
+    pub async fn related_innertube(&self, video_or_url: &str, limit: usize) -> Result<Vec<FlatPlaylistItem>, String> {
+        let clean_id = Self::extract_video_id(video_or_url)
+            .unwrap_or_else(|| video_or_url.trim().to_string());
+
+        if clean_id.is_empty() {
+            return Err("Identificador de video inválido para related_innertube".to_string());
+        }
+
+        // 1. Comprobar caché en memoria (TTL de 20 minutos)
+        if let Some(entry) = self.related_cache.get(&clean_id) {
+            let (ref items, ts) = *entry;
+            if ts.elapsed() < Duration::from_secs(1200) && !items.is_empty() {
+                return Ok(items.iter().take(limit).cloned().collect());
+            }
+        }
+
+        let target_limit = limit.clamp(1, 50);
+
+        // 2. Intentar primero con el cliente de YouTube Music (WEB_REMIX + RDAMVM)
+        match self.fetch_related_music(&clean_id, target_limit).await {
+            Ok(items) if !items.is_empty() => {
+                self.related_cache.insert(clean_id, (items.clone(), Instant::now()));
+                return Ok(items);
+            }
+            Ok(_) => {
+                // Si WEB_REMIX retornó 0 items, continuar al fallback WEB
+            }
+            Err(e) => {
+                warn!(video_id = %clean_id, error = %e, "Fallo en YouTube Music InnerTube, intentando fallback WEB");
+            }
+        }
+
+        // 3. Fallback al cliente estándar de YouTube (WEB)
+        let fallback_items = self.fetch_related_web(&clean_id, target_limit).await?;
+        if !fallback_items.is_empty() {
+            self.related_cache.insert(clean_id, (fallback_items.clone(), Instant::now()));
+        }
+
+        Ok(fallback_items)
+    }
+
+    /// Petición directa a YouTube Music InnerTube (/youtubei/v1/next con cliente WEB_REMIX y playlistId RDAMVM)
+    async fn fetch_related_music(&self, clean_id: &str, target_limit: usize) -> Result<Vec<FlatPlaylistItem>, String> {
+        let endpoint = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false";
+        let body = serde_json::json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": "1.20240101.01.00",
+                    "hl": "es",
+                    "gl": "US",
+                    "utcOffsetMinutes": 0
+                }
+            },
+            "videoId": clean_id,
+            "playlistId": format!("RDAMVM{}", clean_id)
+        });
+
+        let body_str = serde_json::to_string(&body).unwrap_or_default();
+        let response = self
+            .http_client
+            .post(endpoint)
+            .header("Content-Type", "application/json")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            .header("X-YouTube-Client-Name", "67")
+            .header("X-YouTube-Client-Version", "1.20240101.01.00")
+            .header("Referer", "https://music.youtube.com/")
+            .body(body_str)
+            .send()
+            .await
+            .map_err(|e| format!("Error conectando a YouTube Music InnerTube: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("InnerTube Radio devolvió status HTTP {}", response.status()));
+        }
+
+        let resp_text = response
+            .text()
+            .await
+            .map_err(|e| format!("Error leyendo respuesta de YouTube Music InnerTube: {}", e))?;
+
+        let json_data: serde_json::Value = serde_json::from_str(&resp_text)
+            .map_err(|e| format!("Error decodificando JSON de YouTube Music InnerTube: {}", e))?;
+
+        let mut results = Vec::new();
+
+        let panel_contents = json_data
+            .pointer("/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs/0/tabRenderer/content/musicQueueRenderer/content/playlistPanelRenderer/contents")
+            .and_then(|c| c.as_array());
+
+        if let Some(items) = panel_contents {
+            for item in items {
+                if let Some(video) = item.get("playlistPanelVideoRenderer") {
+                    let next_id = video.get("videoId").and_then(|v| v.as_str());
+
+                    if let Some(id) = next_id {
+                        if id == clean_id {
+                            continue;
+                        }
+
+                        let title = video
+                            .pointer("/title/runs/0/text")
+                            .or_else(|| video.pointer("/title/simpleText"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("Pista Desconocida")
+                            .to_string();
+
+                        let duration_secs = video
+                            .pointer("/lengthText/runs/0/text")
+                            .or_else(|| video.pointer("/lengthText/simpleText"))
+                            .and_then(|s| s.as_str())
+                            .and_then(parse_duration_string);
+
+                        if let Some(dur) = duration_secs {
+                            if dur < 45 || dur > 1200 {
+                                continue;
+                            }
+                        }
+
+                        let author = video
+                            .pointer("/longBylineText/runs/0/text")
+                            .or_else(|| video.pointer("/shortBylineText/runs/0/text"))
+                            .and_then(|a| a.as_str())
+                            .map(|s| s.to_string());
+
+                        let thumbnail = video
+                            .pointer("/thumbnail/thumbnails")
+                            .and_then(|t| t.as_array())
+                            .and_then(|arr| arr.last())
+                            .and_then(|t| t.get("url"))
+                            .and_then(|u| u.as_str())
+                            .map(|s| s.to_string());
+
+                        results.push(FlatPlaylistItem {
+                            title,
+                            url: format!("https://www.youtube.com/watch?v={}", id),
+                            duration_secs,
+                            author,
+                            thumbnail,
+                        });
+
+                        if results.len() >= target_limit {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Fallback a YouTube WEB tradicional (/youtubei/v1/next con cliente WEB)
+    async fn fetch_related_web(&self, clean_id: &str, target_limit: usize) -> Result<Vec<FlatPlaylistItem>, String> {
+        let endpoint = "https://www.youtube.com/youtubei/v1/next?prettyPrint=false";
+        let body = serde_json::json!({
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20240101.00.00",
+                    "hl": "es",
+                    "gl": "US",
+                    "utcOffsetMinutes": 0
+                }
+            },
+            "videoId": clean_id
+        });
+
+        let body_str = serde_json::to_string(&body).unwrap_or_default();
+        let response = self
+            .http_client
+            .post(endpoint)
+            .header("Content-Type", "application/json")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            .body(body_str)
+            .send()
+            .await
+            .map_err(|e| format!("Error conectando a YouTube WEB InnerTube: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("InnerTube WEB devolvió status HTTP {}", response.status()));
+        }
+
+        let resp_text = response
+            .text()
+            .await
+            .map_err(|e| format!("Error leyendo respuesta de YouTube WEB InnerTube: {}", e))?;
+
+        let json_data: serde_json::Value = serde_json::from_str(&resp_text)
+            .map_err(|e| format!("Error decodificando JSON de YouTube WEB InnerTube: {}", e))?;
+
+        let mut results = Vec::new();
+
+        let items_opt = json_data
+            .pointer("/contents/twoColumnWatchNextResults/secondaryResults/secondaryResults/results")
+            .and_then(|c| c.as_array());
+
+        if let Some(items) = items_opt {
+            for item in items {
+                if let Some(video) = item.get("compactVideoRenderer") {
+                    let next_id = video.get("videoId").and_then(|v| v.as_str());
+
+                    if let Some(id) = next_id {
+                        if id == clean_id {
+                            continue;
+                        }
+
+                        let title = video
+                            .pointer("/title/runs/0/text")
+                            .or_else(|| video.pointer("/title/simpleText"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("Pista Desconocida")
+                            .to_string();
+
+                        let duration_secs = video
+                            .pointer("/lengthText/simpleText")
+                            .or_else(|| video.pointer("/lengthText/runs/0/text"))
+                            .and_then(|s| s.as_str())
+                            .and_then(parse_duration_string);
+
+                        if let Some(dur) = duration_secs {
+                            if dur < 45 || dur > 1200 {
+                                continue;
+                            }
+                        }
+
+                        let author = video
+                            .pointer("/shortBylineText/runs/0/text")
+                            .or_else(|| video.pointer("/longBylineText/runs/0/text"))
+                            .and_then(|a| a.as_str())
+                            .map(|s| s.to_string());
+
+                        let thumbnail = video
+                            .pointer("/thumbnail/thumbnails")
+                            .and_then(|t| t.as_array())
+                            .and_then(|arr| arr.last())
+                            .and_then(|t| t.get("url"))
+                            .and_then(|u| u.as_str())
+                            .map(|s| s.to_string());
+
+                        results.push(FlatPlaylistItem {
+                            title,
+                            url: format!("https://www.youtube.com/watch?v={}", id),
+                            duration_secs,
+                            author,
+                            thumbnail,
+                        });
+
+                        if results.len() >= target_limit {
+                            break;
                         }
                     }
                 }

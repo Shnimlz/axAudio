@@ -20,23 +20,30 @@ use tracing::{error, info, warn};
 
 use crate::dsp::{apply_preset_to_params, inject_dsp, DspParams};
 use crate::models::{
-    ApiResponse, ControlPayload, DspPayload, DspResponse, EqPayload, JoinPayload, LeavePayload,
+    ApiResponse, AutoplayPayload, ControlPayload, DspPayload, DspResponse, EqPayload, JoinPayload, LeavePayload,
     LoopMode, PlayPayload, PlayResponse, PlayerEvent, QueuePayload, QueueResponse, ResolvePayload,
     SearchPayload, SearchResponse, StatsResponse, TrackResponse,
 };
-use crate::sources::TrackMetadata;
+use crate::sources::{SourceResolver, TrackMetadata};
 use crate::state::AppState;
 
 struct TrackPlayNotifier {
     guild_id: u64,
     meta: Arc<TrackMetadata>,
     event_tx: broadcast::Sender<PlayerEvent>,
+    state: Option<AppState>,
 }
 
 #[async_trait]
 impl EventHandler for TrackPlayNotifier {
     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
         info!(guild = self.guild_id, title = %self.meta.title, "TrackPlay event fired");
+        if let Some(ref st) = self.state {
+            st.set_last_track(self.guild_id, (*self.meta).clone());
+            if let Some(vid) = SourceResolver::extract_video_id(&self.meta.source_url) {
+                st.record_seen_track(self.guild_id, &vid);
+            }
+        }
         let _ = self.event_tx.send(PlayerEvent::TrackStart {
             guild_id: self.guild_id,
             track: TrackResponse {
@@ -207,6 +214,7 @@ fn attach_track_events(
             guild_id,
             meta: meta.clone(),
             event_tx: event_tx.clone(),
+            state: state.clone(),
         },
     );
     let _ = handle.add_event(
@@ -667,6 +675,7 @@ pub async fn player_queue(
 
     let total = (if current.is_some() { 1 } else { 0 }) + all_tracks.len();
     let loop_mode = state.get_loop_mode(payload.guild_id).as_str().to_string();
+    let autoplay = state.is_autoplay(payload.guild_id);
 
     let res = QueueResponse {
         guild_id: payload.guild_id,
@@ -674,6 +683,7 @@ pub async fn player_queue(
         current,
         current_position_secs,
         loop_mode,
+        autoplay,
         queue: all_tracks,
         total_tracks: total,
     };
@@ -922,6 +932,29 @@ pub async fn player_control(
                 )),
             }
         }
+        "autoplay" => {
+            let new_val = if let Some(e) = payload.enabled {
+                state.set_autoplay(payload.guild_id, e);
+                e
+            } else {
+                let toggled = !state.is_autoplay(payload.guild_id);
+                state.set_autoplay(payload.guild_id, toggled);
+                toggled
+            };
+
+            if new_val {
+                let st_clone = state.clone();
+                let guild_id = payload.guild_id;
+                tokio::spawn(async move {
+                    maybe_prefetch_next_track(&st_clone, guild_id).await;
+                });
+            }
+
+            Ok(Json(ApiResponse::ok(format!(
+                "Autoplay {}",
+                if new_val { "enabled" } else { "disabled" }
+            ))))
+        }
         other => Err((
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::err(format!("Unknown control action: '{}'", other))),
@@ -951,6 +984,30 @@ pub async fn player_loop(
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
     payload.action = "loop".to_string();
     player_control(State(state), Json(payload)).await
+}
+
+pub async fn player_autoplay(
+    State(state): State<AppState>,
+    Json(payload): Json<AutoplayPayload>,
+) -> Result<Json<ApiResponse<bool>>, (StatusCode, Json<ApiResponse<bool>>)> {
+    let new_val = if let Some(e) = payload.enabled {
+        state.set_autoplay(payload.guild_id, e);
+        e
+    } else {
+        let toggled = !state.is_autoplay(payload.guild_id);
+        state.set_autoplay(payload.guild_id, toggled);
+        toggled
+    };
+
+    if new_val {
+        let st_clone = state.clone();
+        let guild_id = payload.guild_id;
+        tokio::spawn(async move {
+            maybe_prefetch_next_track(&st_clone, guild_id).await;
+        });
+    }
+
+    Ok(Json(ApiResponse::ok(new_val)))
 }
 
 pub async fn voice_leave(
@@ -1148,14 +1205,14 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
         return;
     }
 
-    // 3. Verificar si hay pistas pendientes en la lista de reproducción
+    // 3. Verificar si hay pistas pendientes en la lista de reproducción o si autoplay está activo
     let has_pending = state
         .pending_playlists
         .get(&guild_id)
         .map(|p| !p.is_empty())
         .unwrap_or(false);
 
-    if !has_pending {
+    if !has_pending && !state.is_autoplay(guild_id) {
         return;
     }
 
@@ -1177,7 +1234,7 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
         (true, "cola vacía, iniciando siguiente pista de inmediato".to_string())
     } else if q_len == 1 {
         // Solo hay 1 pista en Songbird (la que suena) y 0 pistas siguientes encoladas
-        if let Some(current) = current_track {
+        if let Some(ref current) = current_track {
             let meta: Arc<TrackMetadata> = current.data();
             if let Ok(info) = current.get_info().await {
                 if info.playing == songbird::tracks::PlayMode::Play {
@@ -1222,7 +1279,54 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
         return;
     }
 
-    // 6. Activar flag de prefetch y extraer la siguiente pista de pending_playlists
+    // 6. Si no hay pistas pendientes pero autoplay está activo, generar recomendaciones vía InnerTube
+    if !has_pending && state.is_autoplay(guild_id) {
+        let seed_opt = if let Some(ref curr) = current_track {
+            let meta: Arc<TrackMetadata> = curr.data();
+            Some(meta.source_url.clone())
+        } else {
+            state.get_last_track(guild_id).map(|t| t.source_url)
+        };
+
+        if let Some(seed_url) = seed_opt {
+            let clean_id = SourceResolver::extract_video_id(&seed_url).unwrap_or_else(|| seed_url.clone());
+            info!(guild = guild_id, seed = %clean_id, "📻 Autoplay activo: consultando recomendaciones en InnerTube (WEB_REMIX radio)...");
+            if let Ok(items) = state.resolver.related_innertube(&clean_id, 25).await {
+                let mut fresh: Vec<_> = items
+                    .into_iter()
+                    .filter(|item| {
+                        if let Some(vid) = SourceResolver::extract_video_id(&item.url) {
+                            !state.is_track_seen(guild_id, &vid) && vid != clean_id
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+
+                if fresh.is_empty() {
+                    state.clear_seen_tracks(guild_id);
+                    fresh = state
+                        .resolver
+                        .related_innertube(&clean_id, 25)
+                        .await
+                        .unwrap_or_default();
+                }
+
+                if !fresh.is_empty() {
+                    info!(
+                        guild = guild_id,
+                        count = fresh.len(),
+                        next = %fresh[0].title,
+                        "📻 Autoplay: recomendaciones obtenidas y añadidas a la cola pendiente"
+                    );
+                    let mut list = state.pending_playlists.entry(guild_id).or_insert_with(Vec::new);
+                    list.extend(fresh);
+                }
+            }
+        }
+    }
+
+    // 7. Activar flag de prefetch y extraer la siguiente pista de pending_playlists
     if !state.start_prefetch(guild_id) {
         return;
     }
