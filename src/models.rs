@@ -223,7 +223,9 @@ pub enum PlayerEvent {
     },
 }
 
-use crate::dsp::{BandSetting, DspStatus, LoudnessSettings, ModulationSettings, SpatialSettings};
+use crate::dsp::{
+    BandSetting, DspStatus, LoudnessSettings, ModulationSettings, SpatialSettings, TimescaleSettings,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct EqPayload {
@@ -241,6 +243,7 @@ pub struct DspPayload {
     pub spatial: Option<SpatialSettings>,
     pub modulation: Option<ModulationSettings>,
     pub loudness: Option<LoudnessSettings>,
+    pub timescale: Option<TimescaleSettings>,
     pub bands: Option<Vec<BandSetting>>,
 }
 

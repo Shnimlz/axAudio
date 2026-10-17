@@ -22,6 +22,8 @@ pub struct DspDecoder {
     chain: DspChain,
     f32_buf: Option<AudioBuffer<f32>>,
     last_was_dsp: bool,
+    out_l: Vec<f32>,
+    out_r: Vec<f32>,
 }
 
 pub struct DummyDecoder;
@@ -86,6 +88,8 @@ impl DspDecoder {
             chain,
             f32_buf: None,
             last_was_dsp: false,
+            out_l: Vec::with_capacity(4096),
+            out_r: Vec::with_capacity(4096),
         }
     }
 }
@@ -109,6 +113,8 @@ impl Decoder for DspDecoder {
         self.inner.reset();
         self.last_was_dsp = false;
         self.chain.reset();
+        self.out_l.clear();
+        self.out_r.clear();
     }
 
     fn codec_params(&self) -> &CodecParameters {
@@ -142,13 +148,15 @@ impl Decoder for DspDecoder {
         self.last_was_dsp = true;
 
         // 4. Asegurar que f32_buf tenga la capacidad y especificación exacta
+        // Con timescale activo, la trama de salida puede requerir mayor capacidad (e.g. desaceleración 0.25x -> 4x frames)
+        let min_cap = (decoded.capacity() * 4).max(8192);
         let need_realloc = match self.f32_buf {
-            Some(ref buf) => buf.capacity() != decoded.capacity() || buf.spec() != decoded.spec(),
+            Some(ref buf) => buf.capacity() < min_cap || buf.spec() != decoded.spec(),
             None => true,
         };
 
         if need_realloc {
-            self.f32_buf = Some(decoded.make_equivalent::<f32>());
+            self.f32_buf = Some(AudioBuffer::new(min_cap as u64, *decoded.spec()));
         }
 
         let f32_buf = self.f32_buf.as_mut().unwrap();
@@ -157,8 +165,31 @@ impl Decoder for DspDecoder {
 
         // 5. Aplicar la cadena DSP sobre los canales de audio plano
         if f32_buf.spec().channels.count() >= 2 {
-            let (left, right) = f32_buf.chan_pair_mut(0, 1);
-            self.chain.process_planar(left, right);
+            if self.chain.timescale.is_active() {
+                self.out_l.clear();
+                self.out_r.clear();
+                {
+                    let (left, right) = f32_buf.chan_pair_mut(0, 1);
+                    self.chain.process_planar(left, right);
+                    self.chain.timescale.process(left, right, &mut self.out_l, &mut self.out_r);
+                }
+
+                let out_len = self.out_l.len();
+                if out_len > 0 {
+                    if out_len > f32_buf.capacity() {
+                        let new_cap = (out_len * 2).max(8192);
+                        *f32_buf = AudioBuffer::new(new_cap as u64, *f32_buf.spec());
+                    }
+                    f32_buf.clear();
+                    f32_buf.render_reserved(Some(out_len));
+                    let (new_left, new_right) = f32_buf.chan_pair_mut(0, 1);
+                    new_left.copy_from_slice(&self.out_l);
+                    new_right.copy_from_slice(&self.out_r);
+                }
+            } else {
+                let (left, right) = f32_buf.chan_pair_mut(0, 1);
+                self.chain.process_planar(left, right);
+            }
         } else if f32_buf.spec().channels.count() == 1 {
             let mono = f32_buf.chan_mut(0);
             self.chain.equalizer.process_mono(mono);

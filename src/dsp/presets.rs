@@ -6,6 +6,7 @@ use super::equalizer::Equalizer;
 use super::loudness::LoudnessSettings;
 use super::modulation::ModulationSettings;
 use super::spatial::{SpatialProcessor, SpatialSettings};
+use super::timescale::TimescaleSettings;
 
 pub struct DspPreset {
     pub name: &'static str,
@@ -14,6 +15,7 @@ pub struct DspPreset {
     pub spatial: SpatialSettings,
     pub modulation: ModulationSettings,
     pub loudness: LoudnessSettings,
+    pub timescale: TimescaleSettings,
 }
 
 pub fn get_preset(name: &str) -> Option<DspPreset> {
@@ -33,6 +35,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
             },
             modulation: ModulationSettings::default(),
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings::default(),
         }),
 
         // --- Cinema 3D / Dolby Atmos ---
@@ -49,6 +52,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
             },
             modulation: ModulationSettings::default(),
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings::default(),
         }),
 
         // --- Bass Boost 3D ---
@@ -65,6 +69,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
             },
             modulation: ModulationSettings::default(),
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings::default(),
         }),
 
         // --- Vocal Clarity ---
@@ -81,6 +86,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
             },
             modulation: ModulationSettings::default(),
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings::default(),
         }),
 
         // --- Gaming 3D ---
@@ -97,6 +103,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
             },
             modulation: ModulationSettings::default(),
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings::default(),
         }),
 
         // --- Concert Hall ---
@@ -113,12 +120,13 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
             },
             modulation: ModulationSettings::default(),
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings::default(),
         }),
 
         // --- Nightcore ---
         "nightcore" => Some(DspPreset {
             name: "nightcore",
-            description: "Curva V-Shape dinámica para música electrónica con graves contundentes y brillo enérgico",
+            description: "Efecto Nightcore real: velocidad y tono acelerados (+25% pitch y tempo con remuestreador Hermite) y EQ V-Shape electrónica",
             eq_bands: [3.5, 3.0, 2.0, 1.0, 0.0, -0.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5],
             spatial: SpatialSettings {
                 stereo_width: 1.20,
@@ -129,6 +137,32 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
             },
             modulation: ModulationSettings::default(),
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings {
+                speed: 1.25,
+                pitch: 1.25,
+                rate: 1.0,
+            },
+        }),
+
+        // --- Vaporwave ---
+        "vaporwave" | "slowed" | "slowed-reverb" => Some(DspPreset {
+            name: "vaporwave",
+            description: "Efecto Vaporwave real: tempo y tono ralentizados (-18% pitch y tempo analógico con remuestreador Hermite) y amplitud espacial",
+            eq_bands: [2.0, 2.5, 2.0, 1.0, 0.5, 0.0, -0.5, -1.0, -1.5, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0],
+            spatial: SpatialSettings {
+                stereo_width: 1.30,
+                binaural_crossfeed: true,
+                crossfeed_level: 0.15,
+                bass_exciter: true,
+                bass_exciter_drive: 0.20,
+            },
+            modulation: ModulationSettings::default(),
+            loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings {
+                speed: 0.82,
+                pitch: 0.82,
+                rate: 1.0,
+            },
         }),
 
         // --- 8D Audio ---
@@ -154,6 +188,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 vibrato_depth: 0.3,
             },
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings::default(),
         }),
 
         // --- Tremolo ---
@@ -173,6 +208,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 vibrato_depth: 0.3,
             },
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings::default(),
         }),
 
         // --- Vibrato ---
@@ -192,6 +228,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 vibrato_depth: 0.35,
             },
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings::default(),
         }),
 
         // --- Broadcast / EBU R128 Loudness Normalized ---
@@ -213,6 +250,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
                 max_gain_db: 9.0,
                 min_gain_db: -12.0,
             },
+            timescale: TimescaleSettings::default(),
         }),
 
         // --- Flat / Reset / Bypass ---
@@ -229,6 +267,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
             },
             modulation: ModulationSettings::default(),
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings::default(),
         }),
 
         _ => None,
@@ -238,7 +277,7 @@ pub fn get_preset(name: &str) -> Option<DspPreset> {
 pub fn apply_preset(name: &str, eq: &mut Equalizer, spatial: &mut SpatialProcessor) -> Result<String, String> {
     let preset = get_preset(name).ok_or_else(|| {
         format!(
-            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, 8d, tremolo, vibrato, broadcast (ebur128), flat",
+            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, vaporwave, 8d, tremolo, vibrato, broadcast (ebur128), flat",
             name
         )
     })?;
@@ -254,7 +293,7 @@ pub fn apply_preset(name: &str, eq: &mut Equalizer, spatial: &mut SpatialProcess
 pub fn apply_preset_to_params(name: &str, params: &mut super::DspParams) -> Result<String, String> {
     let preset = get_preset(name).ok_or_else(|| {
         format!(
-            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, 8d, tremolo, vibrato, broadcast (ebur128), flat",
+            "Preset '{}' desconocido. Presets disponibles: music, bass-boost-3d, cinema-3d (dolby-atmos), vocal-clarity, gaming-3d, concert-hall, nightcore, vaporwave, 8d, tremolo, vibrato, broadcast (ebur128), flat",
             name
         )
     })?;
@@ -263,6 +302,7 @@ pub fn apply_preset_to_params(name: &str, params: &mut super::DspParams) -> Resu
     params.spatial = preset.spatial;
     params.modulation = preset.modulation;
     params.loudness = preset.loudness;
+    params.timescale = preset.timescale;
     params.active_preset = Some(preset.name.to_string());
     params.version += 1;
 
@@ -277,7 +317,7 @@ mod tests {
     fn test_presets_exist() {
         let preset_names = [
             "music", "bass-boost-3d", "cinema-3d", "dolby-atmos",
-            "vocal-clarity", "gaming-3d", "concert-hall", "nightcore", "8d", "tremolo", "vibrato", "broadcast", "flat",
+            "vocal-clarity", "gaming-3d", "concert-hall", "nightcore", "vaporwave", "8d", "tremolo", "vibrato", "broadcast", "flat",
         ];
         for name in preset_names {
             assert!(get_preset(name).is_some(), "Preset {} not found", name);

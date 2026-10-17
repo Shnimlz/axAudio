@@ -12,6 +12,7 @@ pub mod loudness;
 pub mod modulation;
 pub mod presets;
 pub mod spatial;
+pub mod timescale;
 
 pub use biquad::{FilterType, StereoBiquad};
 pub use decoder::{inject_dsp, DspDecoder};
@@ -22,6 +23,7 @@ pub use modulation::{
 };
 pub use presets::{apply_preset, apply_preset_to_params, get_preset, DspPreset};
 pub use spatial::{SpatialProcessor, SpatialSettings};
+pub use timescale::{TimescaleProcessor, TimescaleSettings};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +34,7 @@ pub struct DspParams {
     pub spatial: SpatialSettings,
     pub modulation: ModulationSettings,
     pub loudness: LoudnessSettings,
+    pub timescale: TimescaleSettings,
     pub active_preset: Option<String>,
     pub version: u64,
 }
@@ -43,6 +46,7 @@ impl Default for DspParams {
             spatial: SpatialSettings::default(),
             modulation: ModulationSettings::default(),
             loudness: LoudnessSettings::default(),
+            timescale: TimescaleSettings::default(),
             active_preset: None,
             version: 0,
         }
@@ -87,6 +91,12 @@ impl DspParams {
         self.version += 1;
     }
 
+    pub fn set_timescale(&mut self, timescale: TimescaleSettings) {
+        self.timescale = timescale;
+        self.active_preset = None;
+        self.version += 1;
+    }
+
     pub fn get_status(&self) -> DspStatus {
         DspStatus {
             active_preset: self.active_preset.clone(),
@@ -100,6 +110,9 @@ impl DspParams {
             vibrato: self.modulation.vibrato,
             loudness: self.loudness.enabled,
             target_lufs: self.loudness.target_lufs,
+            speed: self.timescale.speed,
+            pitch: self.timescale.pitch,
+            rate: self.timescale.rate,
         }
     }
 }
@@ -117,6 +130,9 @@ pub struct DspStatus {
     pub vibrato: bool,
     pub loudness: bool,
     pub target_lufs: f32,
+    pub speed: f32,
+    pub pitch: f32,
+    pub rate: f32,
 }
 
 /// Cadena de procesamiento maestro en tiempo real (poseída localmente por cada decodificador)
@@ -126,6 +142,7 @@ pub struct DspChain {
     pub spatial: SpatialProcessor,
     pub modulation: ModulationProcessor,
     pub loudness: LoudnessNormalizer,
+    pub timescale: TimescaleProcessor,
     pub sample_rate: f32,
     pub preamp: f32,
 }
@@ -137,6 +154,7 @@ impl DspChain {
             spatial: SpatialProcessor::new(sample_rate),
             modulation: ModulationProcessor::new(sample_rate),
             loudness: LoudnessNormalizer::new(sample_rate),
+            timescale: TimescaleProcessor::new(),
             sample_rate,
             preamp: 1.0,
         }
@@ -157,6 +175,8 @@ impl DspChain {
 
         self.loudness.update_sample_rate(sample_rate);
         self.loudness.set_settings(params.loudness.clone());
+
+        self.timescale.set_settings(params.timescale.clone());
 
         // Cálculo analítico exacto de pico de magnitud combinada para pre-amp headroom:
         // Evaluamos la curva combinada de los 15 filtros más la ganancia lateral Mid/Side
@@ -179,6 +199,7 @@ impl DspChain {
         self.spatial.reset();
         self.modulation.reset();
         self.loudness.reset();
+        self.timescale.reset();
     }
 
     /// Verifica si hay algún procesamiento activo en la cadena DSP
@@ -188,6 +209,7 @@ impl DspChain {
             || self.spatial.is_active()
             || self.modulation.is_active()
             || self.loudness.is_active()
+            || self.timescale.is_active()
     }
 
     /// Procesa un bloque de audio estéreo planar in-place a través de toda la cadena DSP

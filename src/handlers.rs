@@ -1113,6 +1113,13 @@ pub async fn player_dsp(
         }
     }
 
+    if let Some(timescale) = payload.timescale {
+        params.set_timescale(timescale);
+        if message.is_empty() {
+            message = "Ajuste de velocidad/pitch (Timescale) actualizado".to_string();
+        }
+    }
+
     if let Some(ref bands) = payload.bands {
         params.set_bands(bands);
     }
