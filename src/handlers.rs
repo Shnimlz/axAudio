@@ -125,6 +125,17 @@ impl EventHandler for TrackEndNotifier {
             }
         }
 
+        // Activación de prefetch de seguridad: Si la cola se vació (por ejemplo, tras un skip
+        // o corte antes de la ventana de 15s), avanzar inmediatamente a la siguiente pista pendiente
+        if let Some(ref st) = self.state {
+            let st_clone = st.clone();
+            let guild_id = self.guild_id;
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                maybe_prefetch_next_track(&st_clone, guild_id).await;
+            });
+        }
+
         None
     }
 }
@@ -538,143 +549,33 @@ pub async fn player_play(
         let _ = handle.enable_loop();
     }
 
-    // Si es una playlist/mix con pistas pendientes, iniciar background worker
+    // Si es una playlist/mix con pistas pendientes, registrar en cola pendiente y opciones de reproducción.
+    // El motor global de prefetch anticipado preparará cada pista 10-15s antes del final de la pista activa,
+    // garantizando streams HTTP frescos, cero saturación de sockets y transiciones 100% gapless.
     if !batch.remaining_entries.is_empty() {
         let guild_id = payload.guild_id;
-        let epoch = state.next_epoch(guild_id);
+        state.next_epoch(guild_id);
         state.pending_playlists.insert(guild_id, batch.remaining_entries.clone());
+        state.guild_play_options.insert(
+            guild_id,
+            crate::state::GuildPlayOptions {
+                extractor_args: payload.extractor_args.clone(),
+                extra_args: payload.extra_args.clone(),
+                cookies: payload.cookies.clone(),
+                format: payload.format.clone(),
+            },
+        );
 
-        let driver_clone = driver_ref.clone();
-        let resolver_clone = state.resolver.clone();
-        let http_client = state.http_client.clone();
-        let pending_map = state.pending_playlists.clone();
-        let epochs = state.load_epochs.clone();
-        let event_tx_clone = state.event_tx.clone();
-        let dsp_params_clone = dsp_params.clone();
-        let state_worker = state.clone();
-        let remaining = batch.remaining_entries;
-        let extractor_args = payload.extractor_args.clone();
-        let extra_args = payload.extra_args.clone();
-        let cookies = payload.cookies.clone();
-        let format_opt = payload.format.clone();
+        info!(
+            guild = guild_id,
+            pending_count = batch.remaining_entries.len(),
+            "Playlist registrada en cola pendiente: el motor de prefetch anticipado resolverá cada pista 10-15s antes de su corte"
+        );
 
+        // Si la pista inicial es corta (<= 20s), evaluar prefetch inmediatamente
+        let state_trigger = state.clone();
         tokio::spawn(async move {
-            info!(
-                guild = guild_id,
-                count = remaining.len(),
-                epoch = epoch,
-                "Iniciando carga asíncrona de playlist en segundo plano..."
-            );
-
-            for item in remaining {
-                // 1. Control de saturación de CPU y Buffer de cola:
-                // Si la cola de Songbird ya tiene 3 o más pistas listas, pausar la resolución
-                // hasta que la reproducción avance, evitando quemar CPU innecesariamente.
-                loop {
-                    let current_epoch = epochs
-                        .get(&guild_id)
-                        .map(|e| e.load(std::sync::atomic::Ordering::SeqCst))
-                        .unwrap_or(0);
-                    if current_epoch != epoch {
-                        info!(guild = guild_id, "Carga de playlist en segundo plano cancelada");
-                        return;
-                    }
-
-                    let in_queue = {
-                        let d = driver_clone.lock().await;
-                        d.queue().len()
-                    };
-
-                    if in_queue < 3 {
-                        break;
-                    }
-
-                    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-                }
-
-                // 2. Cooldown para respirar la CPU entre llamadas a yt-dlp
-                tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-
-                // Verificar si la sesión fue detenida o reemplazada
-                let current_epoch = epochs
-                    .get(&guild_id)
-                    .map(|e| e.load(std::sync::atomic::Ordering::SeqCst))
-                    .unwrap_or(0);
-                if current_epoch != epoch {
-                    info!(guild = guild_id, "Carga de playlist en segundo plano cancelada");
-                    break;
-                }
-
-                match resolver_clone
-                    .resolve_single(
-                        &item.url,
-                        extractor_args.as_deref(),
-                        extra_args.as_deref(),
-                        cookies.as_deref(),
-                        format_opt.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(track) => {
-                        let cur_check = epochs
-                            .get(&guild_id)
-                            .map(|e| e.load(std::sync::atomic::Ordering::SeqCst))
-                            .unwrap_or(0);
-                        if cur_check != epoch {
-                            break;
-                        }
-
-                        let track_meta = Arc::new(track.clone());
-                        let trk = create_track_with_dsp(
-                            http_client.clone(),
-                            track.stream_url.clone(),
-                            track_meta.clone(),
-                            dsp_params_clone.clone(),
-                        )
-                        .await;
-
-                        let (h, in_queue_len) = {
-                            let mut d = driver_clone.lock().await;
-                            let handle = d.enqueue(trk).await;
-                            let _ = handle.set_volume(effective_volume);
-                            let len = d.queue().len();
-                            (handle, len)
-                        };
-                        attach_track_events(
-                            guild_id,
-                            track_meta,
-                            &h,
-                            &event_tx_clone,
-                            Some(state_worker.clone()),
-                        );
-                        if state_worker.get_loop_mode(guild_id) == LoopMode::Track {
-                            let _ = h.enable_loop();
-                        }
-
-                        if let Some(mut pend) = pending_map.get_mut(&guild_id) {
-                            pend.retain(|p| p.url != item.url);
-                        }
-                        info!(
-                            guild = guild_id,
-                            title = %track.title,
-                            in_queue = in_queue_len,
-                            "Pista de playlist resuelta y encolada en segundo plano"
-                        );
-                    }
-                    Err(err) => {
-                        warn!(
-                            guild = guild_id,
-                            url = %item.url,
-                            error = %err,
-                            "Fallo al resolver pista de playlist en background"
-                        );
-                        if let Some(mut pend) = pending_map.get_mut(&guild_id) {
-                            pend.retain(|p| p.url != item.url);
-                        }
-                    }
-                }
-            }
-            info!(guild = guild_id, "Carga en segundo plano de playlist completada");
+            maybe_prefetch_next_track(&state_trigger, guild_id).await;
         });
     }
 
@@ -807,6 +708,7 @@ pub async fn player_control(
         "stop" => {
             state.next_epoch(payload.guild_id);
             state.pending_playlists.remove(&payload.guild_id);
+            state.end_prefetch(payload.guild_id);
             driver.queue().stop();
             driver.stop();
             Ok(Json(ApiResponse::ok("Player stopped".to_string())))
@@ -818,6 +720,7 @@ pub async fn player_control(
         "clear" => {
             state.next_epoch(payload.guild_id);
             state.pending_playlists.remove(&payload.guild_id);
+            state.end_prefetch(payload.guild_id);
             driver.queue().modify_queue(|q| {
                 if q.len() > 1 {
                     let first = q.pop_front().unwrap();
@@ -1055,6 +958,8 @@ pub async fn voice_leave(
 ) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<&'static str>>)> {
     state.next_epoch(payload.guild_id);
     state.pending_playlists.remove(&payload.guild_id);
+    state.end_prefetch(payload.guild_id);
+    state.guild_play_options.remove(&payload.guild_id);
     state.dsp_params.remove(&payload.guild_id);
     state.load_epochs.remove(&payload.guild_id);
     state.guild_volumes.remove(&payload.guild_id);
@@ -1213,5 +1118,205 @@ pub async fn player_dsp(
     };
 
     Ok(Json(ApiResponse::ok(res)))
+}
+
+/// Evalúa el estado del reproductor del guild y, si restan 10-15s para el final de la pista actual
+/// (o si la cola está vacía tras un salto), pre-resuelve y encola la siguiente pista de la cola.
+pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
+    // 1. Si el modo de repetición es 'track', la pista actual se repite indefinidamente
+    if state.get_loop_mode(guild_id) == LoopMode::Track {
+        return;
+    }
+
+    // 2. Si ya hay una operación de prefetch en curso para este guild, evitar llamadas concurrentes
+    if state.is_prefetching(guild_id) {
+        return;
+    }
+
+    // 3. Verificar si hay pistas pendientes en la lista de reproducción
+    let has_pending = state
+        .pending_playlists
+        .get(&guild_id)
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
+
+    if !has_pending {
+        return;
+    }
+
+    // 4. Obtener el reproductor activo del guild
+    let driver_ref = match state.players.get(&guild_id) {
+        Some(d) => d.clone(),
+        None => return,
+    };
+
+    // 5. Analizar el estado de reproducción y cola de Songbird
+    // Minimizar el tiempo de retención del lock de driver: se extrae current_track y q_len
+    let (current_track, q_len) = {
+        let driver = driver_ref.lock().await;
+        (driver.queue().current(), driver.queue().len())
+    };
+
+    let (should_prefetch, reason) = if q_len == 0 {
+        // Cola vacía (por ejemplo tras skip o final abrupto): prefetch y arranque inmediato
+        (true, "cola vacía, iniciando siguiente pista de inmediato".to_string())
+    } else if q_len == 1 {
+        // Solo hay 1 pista en Songbird (la que suena) y 0 pistas siguientes encoladas
+        if let Some(current) = current_track {
+            let meta: Arc<TrackMetadata> = current.data();
+            if let Ok(info) = current.get_info().await {
+                if info.playing == songbird::tracks::PlayMode::Play {
+                    let pos_secs = info.position.as_secs();
+                    if let Some(dur_secs) = meta.duration_secs {
+                        let remaining = dur_secs.saturating_sub(pos_secs);
+                        // Ventana óptima de prefetch: 10 a 15 segundos antes de terminar
+                        // (o si la pista completa dura <= 20 segundos)
+                        if remaining <= 15 || dur_secs <= 20 {
+                            (
+                                true,
+                                format!("pista '{}' próxima a finalizar (restan {}s)", meta.title, remaining),
+                            )
+                        } else {
+                            (false, String::new())
+                        }
+                    } else if pos_secs >= 5 {
+                        // Duración desconocida (stream continuo o falta de header):
+                        // Aseguramos 1 pista de buffer tras 5s de reproducción estable
+                        (
+                            true,
+                            format!("pista '{}' con duración no reportada (pos: {}s)", meta.title, pos_secs),
+                        )
+                    } else {
+                        (false, String::new())
+                    }
+                } else {
+                    (false, String::new())
+                }
+            } else {
+                (false, String::new())
+            }
+        } else {
+            (false, String::new())
+        }
+    } else {
+        // q_len >= 2: Ya existe al menos una pista pre-cargada lista en memoria
+        (false, String::new())
+    };
+
+    if !should_prefetch {
+        return;
+    }
+
+    // 6. Activar flag de prefetch y extraer la siguiente pista de pending_playlists
+    if !state.start_prefetch(guild_id) {
+        return;
+    }
+
+    let next_item = match state.pending_playlists.get_mut(&guild_id) {
+        Some(mut list) if !list.is_empty() => list.remove(0),
+        _ => {
+            state.end_prefetch(guild_id);
+            return;
+        }
+    };
+
+    let play_opts = state
+        .guild_play_options
+        .get(&guild_id)
+        .map(|o| o.clone())
+        .unwrap_or_default();
+
+    let state_clone = state.clone();
+    let driver_clone = driver_ref.clone();
+
+    tokio::spawn(async move {
+        info!(
+            guild = guild_id,
+            next_title = %next_item.title,
+            trigger = %reason,
+            "⚡ Prefetch anticipado activado: resolviendo y precalentando flujo de audio (gapless)..."
+        );
+
+        let resolve_res = state_clone
+            .resolver
+            .resolve_single(
+                &next_item.url,
+                play_opts.extractor_args.as_deref(),
+                play_opts.extra_args.as_deref(),
+                play_opts.cookies.as_deref(),
+                play_opts.format.as_deref(),
+            )
+            .await;
+
+        match resolve_res {
+            Ok(track) => {
+                let dsp_params = state_clone.get_dsp_params(guild_id);
+                let target_vol = state_clone.get_volume(guild_id);
+                let effective_vol = (target_vol * 0.95).clamp(0.0, 2.0);
+                let track_meta = Arc::new(track.clone());
+
+                let songbird_track = create_track_with_dsp(
+                    state_clone.http_client.clone(),
+                    track.stream_url.clone(),
+                    track_meta.clone(),
+                    dsp_params,
+                )
+                .await;
+
+                let handle = {
+                    let mut driver = driver_clone.lock().await;
+                    let h = driver.enqueue(songbird_track).await;
+                    let _ = h.set_volume(effective_vol);
+                    h
+                };
+
+                attach_track_events(
+                    guild_id,
+                    track_meta,
+                    &handle,
+                    &state_clone.event_tx,
+                    Some(state_clone.clone()),
+                );
+
+                if state_clone.get_loop_mode(guild_id) == LoopMode::Track {
+                    let _ = handle.enable_loop();
+                }
+
+                info!(
+                    guild = guild_id,
+                    title = %track.title,
+                    "✅ Prefetch exitoso: decodificador y stream listos en cola Songbird (transición gapless)"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    guild = guild_id,
+                    url = %next_item.url,
+                    title = %next_item.title,
+                    error = %err,
+                    "Fallo al resolver pista durante prefetch anticipado; continuará con la siguiente de la cola"
+                );
+            }
+        }
+
+        state_clone.end_prefetch(guild_id);
+    });
+}
+
+/// Tarea global de monitoreo de prefetch anticipado.
+/// Inspecciona cada segundo los reproductores activos para detectar pistas que entran
+/// en la ventana de 10-15s previa al corte y pre-cargar el siguiente tema.
+pub async fn run_prefetch_monitor(state: AppState) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+
+        let guild_ids: Vec<u64> = state.players.iter().map(|entry| *entry.key()).collect();
+        for guild_id in guild_ids {
+            maybe_prefetch_next_track(&state, guild_id).await;
+        }
+    }
 }
 

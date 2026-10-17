@@ -66,6 +66,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Motor de prefetch anticipado (gapless): Monitorea la posición de reproducción
+    // cada segundo y pre-resuelve y encola la siguiente pista 10-15s antes del final.
+    let prefetch_state = state.clone();
+    tokio::spawn(async move {
+        handlers::run_prefetch_monitor(prefetch_state).await;
+    });
+
     let protected_routes = Router::new()
         .route("/v1/stats", get(handlers::get_stats))
         .route("/v1/tracks/resolve", post(handlers::resolve_track))

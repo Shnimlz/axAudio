@@ -1,7 +1,7 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use reqwest::Client;
 use songbird::driver::Driver;
 use tokio::sync::broadcast;
@@ -9,6 +9,14 @@ use tokio::sync::broadcast;
 use crate::dsp::DspParams;
 use crate::models::{LoopMode, PlayerEvent};
 use crate::sources::{FlatPlaylistItem, SourceResolver};
+
+#[derive(Clone, Debug, Default)]
+pub struct GuildPlayOptions {
+    pub extractor_args: Option<String>,
+    pub extra_args: Option<String>,
+    pub cookies: Option<String>,
+    pub format: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -21,6 +29,8 @@ pub struct AppState {
     pub pending_playlists: Arc<DashMap<u64, Vec<FlatPlaylistItem>>>,
     pub guild_volumes: Arc<DashMap<u64, f32>>,
     pub loop_modes: Arc<DashMap<u64, LoopMode>>,
+    pub prefetching_guilds: Arc<DashSet<u64>>,
+    pub guild_play_options: Arc<DashMap<u64, GuildPlayOptions>>,
     pub event_tx: broadcast::Sender<PlayerEvent>,
     pub auth_token: Option<Arc<String>>,
 }
@@ -53,6 +63,8 @@ impl AppState {
             pending_playlists: Arc::new(DashMap::new()),
             guild_volumes: Arc::new(DashMap::new()),
             loop_modes: Arc::new(DashMap::new()),
+            prefetching_guilds: Arc::new(DashSet::new()),
+            guild_play_options: Arc::new(DashMap::new()),
             event_tx,
             auth_token,
         }
@@ -78,6 +90,18 @@ impl AppState {
 
     pub fn set_loop_mode(&self, guild_id: u64, mode: LoopMode) {
         self.loop_modes.insert(guild_id, mode);
+    }
+
+    pub fn is_prefetching(&self, guild_id: u64) -> bool {
+        self.prefetching_guilds.contains(&guild_id)
+    }
+
+    pub fn start_prefetch(&self, guild_id: u64) -> bool {
+        self.prefetching_guilds.insert(guild_id)
+    }
+
+    pub fn end_prefetch(&self, guild_id: u64) {
+        self.prefetching_guilds.remove(&guild_id);
     }
 
     pub fn get_dsp_params(&self, guild_id: u64) -> Arc<RwLock<DspParams>> {
