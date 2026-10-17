@@ -1,10 +1,11 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Request, State,
     },
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{header, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Json, Response},
 };
 use async_trait::async_trait;
 use songbird::driver::Driver;
@@ -163,6 +164,47 @@ pub const AXAUDIO_VERSION: &str = match option_env!("AXAUDIO_VERSION") {
 
 pub async fn health() -> Json<ApiResponse<&'static str>> {
     Json(ApiResponse::ok("axAudio engine operational"))
+}
+
+pub async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(ref expected_pw) = state.auth_token {
+        let header_authorized = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .map(|val| {
+                let token = val.strip_prefix("Bearer ").unwrap_or(val).trim();
+                token == expected_pw.as_str()
+            })
+            .unwrap_or(false);
+
+        let query_authorized = if !header_authorized {
+            req.uri().query().map(|q| {
+                q.split('&').any(|pair| {
+                    let mut parts = pair.splitn(2, '=');
+                    let key = parts.next().unwrap_or("");
+                    let val = parts.next().unwrap_or("");
+                    (key == "auth" || key == "password") && val == expected_pw.as_str()
+                })
+            }).unwrap_or(false)
+        } else {
+            true
+        };
+
+        if !query_authorized {
+            warn!(uri = %req.uri(), "🚫 Unauthorized request rejected by auth middleware");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiResponse::<()>::err("Unauthorized: invalid or missing authorization token")),
+            ).into_response();
+        }
+    }
+
+    next.run(req).await
 }
 
 pub async fn get_stats(State(state): State<AppState>) -> Json<ApiResponse<StatsResponse>> {

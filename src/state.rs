@@ -21,11 +21,24 @@ pub struct AppState {
     pub pending_playlists: Arc<DashMap<u64, Vec<FlatPlaylistItem>>>,
     pub guild_volumes: Arc<DashMap<u64, f32>>,
     pub event_tx: broadcast::Sender<PlayerEvent>,
+    pub auth_token: Option<Arc<String>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(256);
+        let auth_token = match std::env::var("AXAUDIO_PASSWORD") {
+            Ok(val) => {
+                let trimmed = val.trim().to_string();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+                    None
+                } else {
+                    Some(Arc::new(trimmed))
+                }
+            }
+            Err(_) => Some(Arc::new("youshallnotpass".to_string())),
+        };
+
         Self {
             players: Arc::new(DashMap::new()),
             dsp_params: Arc::new(DashMap::new()),
@@ -39,6 +52,7 @@ impl AppState {
             pending_playlists: Arc::new(DashMap::new()),
             guild_volumes: Arc::new(DashMap::new()),
             event_tx,
+            auth_token,
         }
     }
 

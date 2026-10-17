@@ -10,7 +10,7 @@ use axum::{
 };
 use state::AppState;
 use std::net::SocketAddr;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[global_allocator]
@@ -46,6 +46,16 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState::new();
 
+    if let Some(ref pw) = state.auth_token {
+        if pw.as_str() == "youshallnotpass" {
+            warn!("⚠️ axAudio running with DEFAULT password 'youshallnotpass'. Set AXAUDIO_PASSWORD environment variable for production!");
+        } else {
+            info!("🔒 axAudio authentication enabled via AXAUDIO_PASSWORD");
+        }
+    } else {
+        warn!("⚠️ axAudio running WITHOUT authentication (AXAUDIO_PASSWORD is empty or 'none')");
+    }
+
     // Tarea en segundo plano para purgar entradas de caché expiradas cada 10 minutos
     let resolver_for_cleanup = state.resolver.clone();
     tokio::spawn(async move {
@@ -56,8 +66,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let app = Router::new()
-        .route("/health", get(handlers::health))
+    let protected_routes = Router::new()
         .route("/v1/stats", get(handlers::get_stats))
         .route("/v1/tracks/resolve", post(handlers::resolve_track))
         .route("/v1/tracks/search", post(handlers::search_tracks))
@@ -69,6 +78,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/player/eq", post(handlers::player_eq))
         .route("/v1/player/dsp", post(handlers::player_dsp))
         .route("/v1/events", get(handlers::ws_events))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            handlers::auth_middleware,
+        ));
+
+    let app = Router::new()
+        .route("/health", get(handlers::health))
+        .merge(protected_routes)
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")
