@@ -64,12 +64,36 @@ pub struct PlayPayload {
     pub format: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopMode {
+    #[default]
+    Off,
+    Track,
+    Queue,
+}
+
+impl LoopMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LoopMode::Off => "off",
+            LoopMode::Track => "track",
+            LoopMode::Queue => "queue",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ControlPayload {
     #[serde(deserialize_with = "deserialize_u64_flexible")]
     pub guild_id: u64,
-    pub action: String, // "pause", "resume", "stop", "skip", "volume", "clear"
-    pub value: Option<f32>, // used when action is "volume" (0.0 to 2.0)
+    pub action: String, // "pause", "resume", "stop", "skip", "volume", "clear", "seek", "loop", "shuffle", "remove", "move"
+    pub value: Option<f32>,           // volume (0.0 to 2.0) or seek seconds
+    pub position_secs: Option<f64>,   // seek position in seconds
+    pub mode: Option<String>,         // loop mode: "off" / "none", "track", "queue"
+    pub index: Option<usize>,         // remove index (0-based in upcoming queue)
+    pub from_index: Option<usize>,    // move source index
+    pub to_index: Option<usize>,      // move destination index
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +164,9 @@ pub struct QueueResponse {
     pub guild_id: u64,
     pub is_playing: bool,
     pub current: Option<TrackResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_position_secs: Option<f64>,
+    pub loop_mode: String,
     pub queue: Vec<TrackResponse>,
     pub total_tracks: usize,
 }

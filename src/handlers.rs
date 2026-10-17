@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 use crate::dsp::{apply_preset_to_params, inject_dsp, DspParams};
 use crate::models::{
     ApiResponse, ControlPayload, DspPayload, DspResponse, EqPayload, JoinPayload, LeavePayload,
-    PlayPayload, PlayResponse, PlayerEvent, QueuePayload, QueueResponse, ResolvePayload,
+    LoopMode, PlayPayload, PlayResponse, PlayerEvent, QueuePayload, QueueResponse, ResolvePayload,
     SearchPayload, SearchResponse, StatsResponse, TrackResponse,
 };
 use crate::sources::TrackMetadata;
@@ -56,6 +56,7 @@ struct TrackEndNotifier {
     guild_id: u64,
     meta: Arc<TrackMetadata>,
     event_tx: broadcast::Sender<PlayerEvent>,
+    state: Option<AppState>,
 }
 
 #[async_trait]
@@ -87,6 +88,43 @@ impl EventHandler for TrackEndNotifier {
             }),
             reason: reason.to_string(),
         });
+
+        // Bucle de cola: Si la pista terminó con éxito y el modo es Queue, re-encolar al final
+        if reason == "finished" {
+            if let Some(ref st) = self.state {
+                if st.get_loop_mode(self.guild_id) == LoopMode::Queue {
+                    let st_clone = st.clone();
+                    let guild_id = self.guild_id;
+                    let meta = self.meta.clone();
+                    tokio::spawn(async move {
+                        if let Some(driver_ref) = st_clone.players.get(&guild_id) {
+                            let dsp_params = st_clone.get_dsp_params(guild_id);
+                            let target_volume = st_clone.get_volume(guild_id);
+                            let effective_volume = (target_volume * 0.95).clamp(0.0, 2.0);
+                            let trk = create_track_with_dsp(
+                                st_clone.http_client.clone(),
+                                meta.stream_url.clone(),
+                                meta.clone(),
+                                dsp_params,
+                            )
+                            .await;
+
+                            let mut driver = driver_ref.lock().await;
+                            let handle = driver.enqueue(trk).await;
+                            let _ = handle.set_volume(effective_volume);
+                            attach_track_events(
+                                guild_id,
+                                meta,
+                                &handle,
+                                &st_clone.event_tx,
+                                Some(st_clone.clone()),
+                            );
+                        }
+                    });
+                }
+            }
+        }
+
         None
     }
 }
@@ -124,11 +162,33 @@ impl EventHandler for TrackErrorNotifier {
     }
 }
 
+fn shuffle_slice<T>(slice: &mut [T]) {
+    if slice.len() <= 1 {
+        return;
+    }
+    let mut rng_state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    if rng_state == 0 {
+        rng_state = 0x853c49e6748fea9b;
+    }
+    for i in (1..slice.len()).rev() {
+        rng_state ^= rng_state >> 12;
+        rng_state ^= rng_state << 25;
+        rng_state ^= rng_state >> 27;
+        let rand_val = rng_state.wrapping_mul(0x2545F4914F6CDD1D);
+        let j = (rand_val as usize) % (i + 1);
+        slice.swap(i, j);
+    }
+}
+
 fn attach_track_events(
     guild_id: u64,
     meta: Arc<TrackMetadata>,
     handle: &TrackHandle,
     event_tx: &broadcast::Sender<PlayerEvent>,
+    state: Option<AppState>,
 ) {
     let _ = handle.add_event(
         Event::Track(TrackEvent::Play),
@@ -144,6 +204,7 @@ fn attach_track_events(
             guild_id,
             meta: meta.clone(),
             event_tx: event_tx.clone(),
+            state,
         },
     );
     let _ = handle.add_event(
@@ -466,7 +527,16 @@ pub async fn player_play(
         let tot_len = driver.queue().len();
         (h, init_len, tot_len)
     };
-    attach_track_events(payload.guild_id, first_meta, &handle, &state.event_tx);
+    attach_track_events(
+        payload.guild_id,
+        first_meta,
+        &handle,
+        &state.event_tx,
+        Some(state.clone()),
+    );
+    if state.get_loop_mode(payload.guild_id) == LoopMode::Track {
+        let _ = handle.enable_loop();
+    }
 
     // Si es una playlist/mix con pistas pendientes, iniciar background worker
     if !batch.remaining_entries.is_empty() {
@@ -481,6 +551,7 @@ pub async fn player_play(
         let epochs = state.load_epochs.clone();
         let event_tx_clone = state.event_tx.clone();
         let dsp_params_clone = dsp_params.clone();
+        let state_worker = state.clone();
         let remaining = batch.remaining_entries;
         let extractor_args = payload.extractor_args.clone();
         let extra_args = payload.extra_args.clone();
@@ -569,7 +640,16 @@ pub async fn player_play(
                             let len = d.queue().len();
                             (handle, len)
                         };
-                        attach_track_events(guild_id, track_meta, &h, &event_tx_clone);
+                        attach_track_events(
+                            guild_id,
+                            track_meta,
+                            &h,
+                            &event_tx_clone,
+                            Some(state_worker.clone()),
+                        );
+                        if state_worker.get_loop_mode(guild_id) == LoopMode::Track {
+                            let _ = h.enable_loop();
+                        }
 
                         if let Some(mut pend) = pending_map.get_mut(&guild_id) {
                             pend.retain(|p| p.url != item.url);
@@ -667,6 +747,16 @@ pub async fn player_queue(
         }
     }
 
+    let current_position_secs = if let Some(current_handle) = driver.queue().current() {
+        current_handle
+            .get_info()
+            .await
+            .ok()
+            .map(|info| info.position.as_secs_f64())
+    } else {
+        None
+    };
+
     let current = if !is_empty && !all_tracks.is_empty() {
         Some(all_tracks.remove(0))
     } else {
@@ -674,11 +764,14 @@ pub async fn player_queue(
     };
 
     let total = (if current.is_some() { 1 } else { 0 }) + all_tracks.len();
+    let loop_mode = state.get_loop_mode(payload.guild_id).as_str().to_string();
 
     let res = QueueResponse {
         guild_id: payload.guild_id,
         is_playing: current.is_some(),
         current,
+        current_position_secs,
+        loop_mode,
         queue: all_tracks,
         total_tracks: total,
     };
@@ -689,7 +782,7 @@ pub async fn player_queue(
 pub async fn player_control(
     State(state): State<AppState>,
     Json(payload): Json<ControlPayload>,
-) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<&'static str>>)> {
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
     let driver_ref = match state.players.get(&payload.guild_id) {
         Some(d) => d.clone(),
         None => {
@@ -705,22 +798,22 @@ pub async fn player_control(
     match payload.action.as_str() {
         "pause" => {
             let _ = driver.queue().pause();
-            Ok(Json(ApiResponse::ok("Player paused")))
+            Ok(Json(ApiResponse::ok("Player paused".to_string())))
         }
         "resume" => {
             let _ = driver.queue().resume();
-            Ok(Json(ApiResponse::ok("Player resumed")))
+            Ok(Json(ApiResponse::ok("Player resumed".to_string())))
         }
         "stop" => {
             state.next_epoch(payload.guild_id);
             state.pending_playlists.remove(&payload.guild_id);
             driver.queue().stop();
             driver.stop();
-            Ok(Json(ApiResponse::ok("Player stopped")))
+            Ok(Json(ApiResponse::ok("Player stopped".to_string())))
         }
         "skip" => {
             let _ = driver.queue().skip();
-            Ok(Json(ApiResponse::ok("Track skipped")))
+            Ok(Json(ApiResponse::ok("Track skipped".to_string())))
         }
         "clear" => {
             state.next_epoch(payload.guild_id);
@@ -732,7 +825,7 @@ pub async fn player_control(
                     q.push_front(first);
                 }
             });
-            Ok(Json(ApiResponse::ok("Queue cleared")))
+            Ok(Json(ApiResponse::ok("Queue cleared".to_string())))
         }
         "volume" => {
             if let Some(val) = payload.value {
@@ -741,7 +834,7 @@ pub async fn player_control(
                 if let Some(track) = driver.queue().current() {
                     let _ = track.set_volume(clamped * 0.95);
                 }
-                Ok(Json(ApiResponse::ok("Volume updated")))
+                Ok(Json(ApiResponse::ok(format!("Volume updated to {:.0}%", clamped * 100.0))))
             } else {
                 Err((
                     StatusCode::BAD_REQUEST,
@@ -749,11 +842,211 @@ pub async fn player_control(
                 ))
             }
         }
+        "seek" => {
+            let pos_secs = payload
+                .position_secs
+                .or_else(|| payload.value.map(|v| v as f64))
+                .unwrap_or(0.0)
+                .max(0.0);
+
+            if let Some(track) = driver.queue().current() {
+                let duration = std::time::Duration::from_secs_f64(pos_secs);
+                match track.seek_async(duration).await {
+                    Ok(actual) => Ok(Json(ApiResponse::ok(format!(
+                        "Seeked to {:.2}s",
+                        actual.as_secs_f64()
+                    )))),
+                    Err(e) => Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::err(format!("Seek failed: {:?}", e))),
+                    )),
+                }
+            } else {
+                Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ApiResponse::err("No track currently playing to seek")),
+                ))
+            }
+        }
+        "loop" => {
+            let mode_str = payload.mode.as_deref().unwrap_or("track").to_lowercase();
+            let mode = match mode_str.as_str() {
+                "track" | "single" | "song" => LoopMode::Track,
+                "queue" | "all" => LoopMode::Queue,
+                "off" | "none" | "disabled" => LoopMode::Off,
+                other => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::err(format!(
+                            "Unknown loop mode '{}'. Use 'track', 'queue', or 'off'",
+                            other
+                        ))),
+                    ))
+                }
+            };
+
+            state.set_loop_mode(payload.guild_id, mode);
+
+            if let Some(track) = driver.queue().current() {
+                if mode == LoopMode::Track {
+                    let _ = track.enable_loop();
+                } else {
+                    let _ = track.disable_loop();
+                }
+            }
+
+            Ok(Json(ApiResponse::ok(format!(
+                "Loop mode set to '{}'",
+                mode.as_str()
+            ))))
+        }
+        "shuffle" => {
+            let mut upcoming_count = 0;
+            driver.queue().modify_queue(|q| {
+                if q.len() > 2 {
+                    let current = q.pop_front().unwrap();
+                    let mut upcoming: Vec<_> = q.drain(..).collect();
+                    shuffle_slice(&mut upcoming);
+                    upcoming_count = upcoming.len();
+                    q.push_front(current);
+                    for track in upcoming {
+                        q.push_back(track);
+                    }
+                } else if q.len() == 2 {
+                    upcoming_count = 1;
+                }
+            });
+
+            if let Some(mut pend) = state.pending_playlists.get_mut(&payload.guild_id) {
+                shuffle_slice(&mut pend);
+                upcoming_count += pend.len();
+            }
+
+            Ok(Json(ApiResponse::ok(format!(
+                "Queue shuffled: {} upcoming track(s) randomized",
+                upcoming_count
+            ))))
+        }
+        "remove" => {
+            let target_idx = match payload.index {
+                Some(i) => i,
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::err("Missing 'index' parameter for remove action")),
+                    ))
+                }
+            };
+
+            let mut removed_title = None;
+            driver.queue().modify_queue(|q| {
+                let queue_idx = target_idx + 1;
+                if queue_idx < q.len() {
+                    if let Some(handle) = q.remove(queue_idx) {
+                        let meta: Arc<TrackMetadata> = handle.data();
+                        removed_title = Some(meta.title.clone());
+                    }
+                }
+            });
+
+            if removed_title.is_none() {
+                let q_upcoming_len = driver.queue().len().saturating_sub(1);
+                if target_idx >= q_upcoming_len {
+                    let pending_idx = target_idx - q_upcoming_len;
+                    if let Some(mut pend) = state.pending_playlists.get_mut(&payload.guild_id) {
+                        if pending_idx < pend.len() {
+                            let item = pend.remove(pending_idx);
+                            removed_title = Some(item.title);
+                        }
+                    }
+                }
+            }
+
+            match removed_title {
+                Some(title) => Ok(Json(ApiResponse::ok(format!("Removed '{}' from queue", title)))),
+                None => Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ApiResponse::err(format!(
+                        "Index {} out of bounds for upcoming queue",
+                        target_idx
+                    ))),
+                )),
+            }
+        }
+        "move" => {
+            let from = match payload.from_index {
+                Some(f) => f,
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::err("Missing 'from_index' for move action")),
+                    ))
+                }
+            };
+            let to = match payload.to_index {
+                Some(t) => t,
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::err("Missing 'to_index' for move action")),
+                    ))
+                }
+            };
+
+            let mut moved_title = None;
+            driver.queue().modify_queue(|q| {
+                let upcoming_count = q.len().saturating_sub(1);
+                if from < upcoming_count && to < upcoming_count {
+                    let from_q = from + 1;
+                    let to_q = to + 1;
+                    if let Some(handle) = q.remove(from_q) {
+                        let meta: Arc<TrackMetadata> = handle.data();
+                        moved_title = Some(meta.title.clone());
+                        q.insert(to_q, handle);
+                    }
+                }
+            });
+
+            match moved_title {
+                Some(title) => Ok(Json(ApiResponse::ok(format!(
+                    "Moved '{}' from position {} to {}",
+                    title, from, to
+                )))),
+                None => Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::err("Invalid 'from_index' or 'to_index' for active queue")),
+                )),
+            }
+        }
         other => Err((
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::err(format!("Unknown control action: '{}'", other))),
         )),
     }
+}
+
+pub async fn player_seek(
+    State(state): State<AppState>,
+    Json(mut payload): Json<ControlPayload>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    payload.action = "seek".to_string();
+    player_control(State(state), Json(payload)).await
+}
+
+pub async fn player_shuffle(
+    State(state): State<AppState>,
+    Json(mut payload): Json<ControlPayload>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    payload.action = "shuffle".to_string();
+    player_control(State(state), Json(payload)).await
+}
+
+pub async fn player_loop(
+    State(state): State<AppState>,
+    Json(mut payload): Json<ControlPayload>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    payload.action = "loop".to_string();
+    player_control(State(state), Json(payload)).await
 }
 
 pub async fn voice_leave(
@@ -765,6 +1058,7 @@ pub async fn voice_leave(
     state.dsp_params.remove(&payload.guild_id);
     state.load_epochs.remove(&payload.guild_id);
     state.guild_volumes.remove(&payload.guild_id);
+    state.loop_modes.remove(&payload.guild_id);
 
     if let Some((_, driver_ref)) = state.players.remove(&payload.guild_id) {
         let mut driver = driver_ref.lock().await;
