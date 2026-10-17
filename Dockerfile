@@ -38,7 +38,7 @@ FROM debian:bookworm-slim AS runner
 # - libopus0: librería compartida de códec de audio
 # - curl, unzip: utilidades
 # - python3 & yt-dlp: extractor de audio y resolución de URLs CDN directas
-# - deno: motor de JavaScript requerido por yt-dlp EJS para descifrar firmas de YouTube
+# - quickjs & deno: motor ultraligero QuickJS (~2MB RAM, ~3ms) como primario y Deno como fallback
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libopus0 \
@@ -47,17 +47,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     && ARCH=$(uname -m) \
-    && if [ "$ARCH" = "aarch64" ]; then DENO_ARCH="aarch64"; else DENO_ARCH="x86_64"; fi \
+    && if [ "$ARCH" = "aarch64" ]; then QJS_ARCH="aarch64"; DENO_ARCH="aarch64"; else QJS_ARCH="x86_64"; DENO_ARCH="x86_64"; fi \
+    && curl -fsSL "https://github.com/quickjs-ng/quickjs/releases/latest/download/qjs-linux-${QJS_ARCH}" -o /usr/local/bin/qjs \
+    && chmod a+rx /usr/local/bin/qjs \
+    && ln -s /usr/local/bin/qjs /usr/local/bin/quickjs \
     && curl -fsSL "https://github.com/denoland/deno/releases/latest/download/deno-${DENO_ARCH}-unknown-linux-gnu.zip" -o /tmp/deno.zip \
     && unzip /tmp/deno.zip -d /usr/local/bin \
     && rm /tmp/deno.zip \
     && pip install --break-system-packages -U yt-dlp bgutil-ytdlp-pot-provider \
     && chmod a+rx /usr/local/bin/deno \
+    && mkdir -p /tmp/yt-dlp-cache \
     && apt-get purge -y unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Seguridad: crear usuario no root
-RUN useradd -m -u 10001 -s /bin/sh axaudio
+RUN useradd -m -u 10001 -s /bin/sh axaudio \
+    && chown -R axaudio:axaudio /tmp/yt-dlp-cache
 USER axaudio
 
 WORKDIR /app

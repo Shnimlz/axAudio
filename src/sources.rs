@@ -9,6 +9,19 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SkipSegment {
+    pub start: f64,
+    pub end: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpotifyEntity {
+    Track(String),
+    Playlist(String),
+    Album(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackMetadata {
     pub title: String,
     pub source_url: String,
@@ -16,6 +29,8 @@ pub struct TrackMetadata {
     pub duration_secs: Option<u64>,
     pub author: Option<String>,
     pub thumbnail: Option<String>,
+    #[serde(default)]
+    pub skip_segments: Vec<SkipSegment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,12 +104,17 @@ impl SourceResolver {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
+        let max_concurrent: usize = std::env::var("AXAUDIO_MAX_CONCURRENT_RESOLVES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+
         Self {
             cache: Arc::new(DashMap::new()),
             related_cache: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(3600 * 4), // 4 horas de TTL para streams de audio
             cookie_rotation_index: Arc::new(AtomicUsize::new(0)),
-            process_semaphore: Arc::new(Semaphore::new(2)),
+            process_semaphore: Arc::new(Semaphore::new(max_concurrent)),
             http_client,
         }
     }
@@ -103,6 +123,54 @@ impl SourceResolver {
     pub fn prune_cache(&self) {
         self.cache.retain(|_, (_, ts)| ts.elapsed() < self.ttl);
         self.related_cache.retain(|_, (_, ts)| ts.elapsed() < Duration::from_secs(1200));
+    }
+
+    /// Invalida las entradas de la caché que coincidan o contengan la URL/query indicada
+    pub fn invalidate_cache(&self, query_or_url: &str) {
+        let q = query_or_url.trim();
+        if q.is_empty() {
+            return;
+        }
+        self.cache.retain(|k, _| k != q && !k.starts_with(q) && !k.contains(q));
+    }
+
+    /// Detecta y parsea identificadores y tipos de entidades de Spotify (web o URI spotify:...)
+    pub fn parse_spotify_url(url: &str) -> Option<SpotifyEntity> {
+        let clean = url.trim();
+        if clean.starts_with("spotify:") {
+            let parts: Vec<&str> = clean.split(':').collect();
+            if parts.len() >= 3 {
+                let entity_type = parts[1];
+                let id = parts[2].split('?').next().unwrap_or(parts[2]);
+                if !id.is_empty() {
+                    return match entity_type {
+                        "track" => Some(SpotifyEntity::Track(id.to_string())),
+                        "playlist" => Some(SpotifyEntity::Playlist(id.to_string())),
+                        "album" => Some(SpotifyEntity::Album(id.to_string())),
+                        _ => None,
+                    };
+                }
+            }
+        }
+
+        if clean.contains("spotify.com/") {
+            let path = clean.split('?').next().unwrap_or(clean);
+            for (seg, ctor) in [
+                ("/track/", SpotifyEntity::Track as fn(String) -> SpotifyEntity),
+                ("/playlist/", SpotifyEntity::Playlist as fn(String) -> SpotifyEntity),
+                ("/album/", SpotifyEntity::Album as fn(String) -> SpotifyEntity),
+            ] {
+                if let Some(pos) = path.find(seg) {
+                    let rest = &path[pos + seg.len()..];
+                    let id: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+                    if !id.is_empty() {
+                        return Some(ctor(id));
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Filtra argumentos de CLI para prevenir inyección de comandos arbitrarios
@@ -140,7 +208,10 @@ impl SourceResolver {
     /// Detecta si una consulta o URL corresponde a una lista de reproducción, Mix o Radio
     pub fn is_playlist_url(query: &str) -> bool {
         let q = query.trim();
-        q.contains("playlist?list=") || q.contains("&list=") || q.contains("?list=")
+        q.contains("playlist?list=")
+            || q.contains("&list=")
+            || q.contains("?list=")
+            || matches!(Self::parse_spotify_url(q), Some(SpotifyEntity::Playlist(_)) | Some(SpotifyEntity::Album(_)))
     }
 
     /// Extrae la URL del primer video si está presente en el parámetro `v=` o formato youtu.be
@@ -247,8 +318,16 @@ impl SourceResolver {
         let _permit = self.process_semaphore.acquire().await.map_err(|e| format!("Fallo adquiriendo semáforo de proceso para flat-playlist: {}", e))?;
         let mut cmd = Command::new("yt-dlp");
         cmd.kill_on_drop(true);
+        cmd.env("PYTHONOPTIMIZE", "1");
+        cmd.env("PYTHONDONTWRITEBYTECODE", "1");
         cmd.arg("--flat-playlist");
         cmd.arg("--dump-single-json");
+        cmd.arg("--no-warnings");
+
+        let cache_dir = std::env::var("YTDLP_CACHE_DIR").unwrap_or_else(|_| "/tmp/yt-dlp-cache".to_string());
+        if !cache_dir.is_empty() && cache_dir != "none" {
+            cmd.arg("--cache-dir").arg(cache_dir);
+        }
 
         let playlist_max = if let Some(m) = max_items {
             m.to_string()
@@ -265,6 +344,11 @@ impl SourceResolver {
             cmd.arg("--remote-components").arg(remote_components);
         }
 
+        let js_runtimes = std::env::var("YTDLP_JS_RUNTIMES").unwrap_or_else(|_| "quickjs,deno".to_string());
+        if !js_runtimes.is_empty() && js_runtimes != "none" {
+            cmd.arg("--js-runtimes").arg(js_runtimes);
+        }
+
         if let Some(args) = custom_extractor_args {
             cmd.arg("--extractor-args").arg(args);
         } else if let Ok(env_args) = std::env::var("YTDLP_EXTRACTOR_ARGS") {
@@ -272,8 +356,12 @@ impl SourceResolver {
         } else {
             let pot_provider_url = std::env::var("BGUTIL_POT_URL")
                 .unwrap_or_else(|_| "http://bgutil-pot:4416".to_string());
+            let default_clients = std::env::var("YTDLP_PLAYER_CLIENTS")
+                .unwrap_or_else(|_| if cookie_path.is_some() { "default,mweb".to_string() } else { "android,web".to_string() });
             cmd.arg("--extractor-args")
-                .arg(format!("youtubepot-bgutilhttp:base_url={}", pot_provider_url));
+                .arg(format!("youtubepot-bgutilhttp:base_url={}", pot_provider_url))
+                .arg("--extractor-args")
+                .arg(format!("youtube:player_client={}", default_clients));
         }
 
         if let Some(path) = cookie_path {
@@ -386,8 +474,16 @@ impl SourceResolver {
         let _permit = self.process_semaphore.acquire().await.map_err(|e| format!("Fallo adquiriendo semáforo de proceso para pista individual: {}", e))?;
         let mut cmd = Command::new("yt-dlp");
         cmd.kill_on_drop(true);
+        cmd.env("PYTHONOPTIMIZE", "1");
+        cmd.env("PYTHONDONTWRITEBYTECODE", "1");
         cmd.arg("--no-playlist");
         cmd.arg("--dump-single-json");
+        cmd.arg("--no-warnings");
+
+        let cache_dir = std::env::var("YTDLP_CACHE_DIR").unwrap_or_else(|_| "/tmp/yt-dlp-cache".to_string());
+        if !cache_dir.is_empty() && cache_dir != "none" {
+            cmd.arg("--cache-dir").arg(cache_dir);
+        }
 
         let default_format = "ba[format_id=251]/ba[acodec=opus]/ba[ext=webm]/bestaudio[ext=m4a]/bestaudio/best";
         let format = if let Some(fmt) = custom_format {
@@ -405,6 +501,11 @@ impl SourceResolver {
             cmd.arg("--remote-components").arg(remote_components);
         }
 
+        let js_runtimes = std::env::var("YTDLP_JS_RUNTIMES").unwrap_or_else(|_| "quickjs,deno".to_string());
+        if !js_runtimes.is_empty() && js_runtimes != "none" {
+            cmd.arg("--js-runtimes").arg(js_runtimes);
+        }
+
         if let Some(args) = custom_extractor_args {
             cmd.arg("--extractor-args").arg(args);
         } else if let Ok(env_args) = std::env::var("YTDLP_EXTRACTOR_ARGS") {
@@ -412,8 +513,12 @@ impl SourceResolver {
         } else {
             let pot_provider_url = std::env::var("BGUTIL_POT_URL")
                 .unwrap_or_else(|_| "http://bgutil-pot:4416".to_string());
+            let default_clients = std::env::var("YTDLP_PLAYER_CLIENTS")
+                .unwrap_or_else(|_| if cookie_path.is_some() { "default,mweb".to_string() } else { "android,web".to_string() });
             cmd.arg("--extractor-args")
-                .arg(format!("youtubepot-bgutilhttp:base_url={}", pot_provider_url));
+                .arg(format!("youtubepot-bgutilhttp:base_url={}", pot_provider_url))
+                .arg("--extractor-args")
+                .arg(format!("youtube:player_client={}", default_clients));
         }
 
         if let Some(path) = cookie_path {
@@ -514,6 +619,12 @@ impl SourceResolver {
             })
             .map(|s| s.to_string());
 
+        let skip_segments = if let Some(vid) = Self::extract_video_id(&source_url) {
+            self.fetch_sponsorblock_segments(&vid).await
+        } else {
+            Vec::new()
+        };
+
         Ok(TrackMetadata {
             title,
             source_url,
@@ -521,6 +632,7 @@ impl SourceResolver {
             duration_secs,
             author,
             thumbnail,
+            skip_segments,
         })
     }
 
@@ -561,7 +673,51 @@ impl SourceResolver {
                 duration_secs: None,
                 author: None,
                 thumbnail: None,
+                skip_segments: Vec::new(),
             });
+        }
+
+        // 2.2. Si es un enlace o URI de Spotify
+        if let Some(spotify_entity) = Self::parse_spotify_url(query_trimmed) {
+            match spotify_entity {
+                SpotifyEntity::Track(ref id) => {
+                    return self
+                        .resolve_spotify_track(
+                            id,
+                            custom_extractor_args,
+                            custom_extra_args,
+                            custom_cookies,
+                            custom_format,
+                        )
+                        .await;
+                }
+                SpotifyEntity::Playlist(ref id) => {
+                    let batch = self
+                        .resolve_spotify_batch(
+                            "playlist",
+                            id,
+                            custom_extractor_args,
+                            custom_extra_args,
+                            custom_cookies,
+                            custom_format,
+                        )
+                        .await?;
+                    return Ok(batch.first_track);
+                }
+                SpotifyEntity::Album(ref id) => {
+                    let batch = self
+                        .resolve_spotify_batch(
+                            "album",
+                            id,
+                            custom_extractor_args,
+                            custom_extra_args,
+                            custom_cookies,
+                            custom_format,
+                        )
+                        .await?;
+                    return Ok(batch.first_track);
+                }
+            }
         }
 
         // 2.5. Si no es URL directa ni prefijo especial (scsearch:, bcsearch:), resolver video con InnerTube nativo (~30ms)
@@ -755,6 +911,283 @@ impl SourceResolver {
         custom_cookies: Option<&str>,
     ) -> Result<FlatPlaylist, String> {
         self.resolve_flat_playlist_with_limit(query, custom_extractor_args, custom_extra_args, custom_cookies, None).await
+    }
+
+    /// Consulta los segmentos de intro/outro no musicales (music_offtopic) en la API pública de SponsorBlock
+    pub async fn fetch_sponsorblock_segments(&self, video_id: &str) -> Vec<SkipSegment> {
+        let disabled = std::env::var("AXAUDIO_SPONSORBLOCK")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("disabled"))
+            .unwrap_or(false);
+        if disabled || video_id.is_empty() {
+            return Vec::new();
+        }
+
+        let url = format!(
+            "https://sponsor.ajay.app/api/skipSegments?videoID={}&categories=%5B%22music_offtopic%22%5D",
+            video_id
+        );
+
+        let resp = match self
+            .http_client
+            .get(&url)
+            .timeout(Duration::from_millis(800))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+
+        let val: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut segments = Vec::new();
+        if let Some(arr) = val.as_array() {
+            for item in arr {
+                if let Some(seg_arr) = item.get("segment").and_then(|s| s.as_array()) {
+                    if seg_arr.len() >= 2 {
+                        if let (Some(start), Some(end)) = (seg_arr[0].as_f64(), seg_arr[1].as_f64()) {
+                            if end > start {
+                                segments.push(SkipSegment { start, end });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !segments.is_empty() {
+            info!(
+                video_id = %video_id,
+                segments = segments.len(),
+                "SponsorBlock: segmentos no musicales identificados para auto-skip"
+            );
+        }
+
+        segments
+    }
+
+    /// Descarga y parsea el embed SSR público de Spotify (open.spotify.com/embed/{type}/{id})
+    /// extrayendo el JSON estructurado de __NEXT_DATA__ sin necesidad de API keys (~40ms)
+    async fn fetch_spotify_embed(&self, entity_type: &str, entity_id: &str) -> Result<serde_json::Value, String> {
+        let embed_url = format!("https://open.spotify.com/embed/{}/{}", entity_type, entity_id);
+        let resp = self
+            .http_client
+            .get(&embed_url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            )
+            .timeout(Duration::from_secs(6))
+            .send()
+            .await
+            .map_err(|e| format!("Error conectando a Spotify embed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Spotify embed devolvió status HTTP {}", resp.status()));
+        }
+
+        let html = resp
+            .text()
+            .await
+            .map_err(|e| format!("Error leyendo HTML de Spotify embed: {}", e))?;
+
+        let start_pos = if let Some(p) = html.find("id=\"__NEXT_DATA__\"") {
+            let after_id = &html[p..];
+            let tag_close = after_id
+                .find('>')
+                .ok_or_else(|| "Cierre de tag __NEXT_DATA__ no encontrado".to_string())?;
+            p + tag_close + 1
+        } else {
+            return Err("No se encontró etiqueta __NEXT_DATA__ en el embed de Spotify".to_string());
+        };
+
+        let end_pos = html[start_pos..]
+            .find("</script>")
+            .map(|p| start_pos + p)
+            .ok_or_else(|| "Cierre de </script> de __NEXT_DATA__ no encontrado en Spotify".to_string())?;
+
+        let json_text = html[start_pos..end_pos].trim();
+        let val: serde_json::Value = serde_json::from_str(json_text)
+            .map_err(|e| format!("Error decodificando __NEXT_DATA__ de Spotify: {}", e))?;
+
+        Ok(val)
+    }
+
+    /// Resuelve una pista individual de Spotify asociándola a YouTube mediante InnerTube nativo
+    pub async fn resolve_spotify_track(
+        &self,
+        track_id: &str,
+        custom_extractor_args: Option<&str>,
+        custom_extra_args: Option<&str>,
+        custom_cookies: Option<&str>,
+        custom_format: Option<&str>,
+    ) -> Result<TrackMetadata, String> {
+        let data = self.fetch_spotify_embed("track", track_id).await?;
+        let entity = data
+            .pointer("/props/pageProps/state/data/entity")
+            .ok_or_else(|| "Estructura de entidad no encontrada en embed de Spotify track".to_string())?;
+
+        let title = entity
+            .get("name")
+            .or_else(|| entity.get("title"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("Pista de Spotify")
+            .to_string();
+
+        let artists = entity
+            .get("artists")
+            .and_then(|arr| arr.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| a.get("name").and_then(|n| n.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+
+        let thumbnail = entity
+            .pointer("/visualIdentity/image")
+            .and_then(|arr| arr.as_array())
+            .and_then(|arr| arr.last())
+            .and_then(|img| img.get("url"))
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string());
+
+        let search_query = if !artists.is_empty() {
+            format!("{} - {}", artists, title)
+        } else {
+            title.clone()
+        };
+
+        info!(
+            title = %title,
+            artists = %artists,
+            search = %search_query,
+            "Pista de Spotify extraída de embed; asociando a YouTube mediante InnerTube..."
+        );
+
+        let yt_query = match self.search_innertube(&search_query, 1).await {
+            Ok(entries) if !entries.is_empty() => entries[0].url.clone(),
+            _ => format!("ytsearch:{}", search_query),
+        };
+
+        let mut meta = Box::pin(self.resolve_single(
+            &yt_query,
+            custom_extractor_args,
+            custom_extra_args,
+            custom_cookies,
+            custom_format,
+        ))
+        .await?;
+
+        if !artists.is_empty() && meta.author.is_none() {
+            meta.author = Some(artists);
+        }
+        if thumbnail.is_some() && meta.thumbnail.is_none() {
+            meta.thumbnail = thumbnail;
+        }
+
+        Ok(meta)
+    }
+
+    /// Resuelve un álbum o playlist de Spotify como batch: pista 1 inmediata (Fast Start) + restantes en cola
+    pub async fn resolve_spotify_batch(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        custom_extractor_args: Option<&str>,
+        custom_extra_args: Option<&str>,
+        custom_cookies: Option<&str>,
+        custom_format: Option<&str>,
+    ) -> Result<ResolvedPlaylistBatch, String> {
+        let data = self.fetch_spotify_embed(entity_type, entity_id).await?;
+        let entity = data
+            .pointer("/props/pageProps/state/data/entity")
+            .ok_or_else(|| "Estructura de entidad no encontrada en embed de Spotify playlist/album".to_string())?;
+
+        let playlist_title = entity
+            .get("name")
+            .or_else(|| entity.get("title"))
+            .and_then(|t| t.as_str())
+            .unwrap_or(if entity_type == "album" { "Álbum de Spotify" } else { "Playlist de Spotify" })
+            .to_string();
+
+        let track_list = entity
+            .get("trackList")
+            .and_then(|t| t.as_array())
+            .ok_or_else(|| "No se encontró lista de canciones (trackList) en Spotify embed".to_string())?;
+
+        if track_list.is_empty() {
+            return Err("La playlist/álbum de Spotify no contiene canciones".to_string());
+        }
+
+        let mut entries = Vec::new();
+        for item in track_list {
+            let item_title = item
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("Pista de Spotify")
+                .to_string();
+
+            let artist = item
+                .get("subtitle")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let duration_secs = item
+                .get("duration")
+                .and_then(|d| d.as_u64())
+                .map(|ms| ms / 1000);
+
+            let search_term = if !artist.is_empty() {
+                format!("{} - {}", artist, item_title)
+            } else {
+                item_title.clone()
+            };
+
+            entries.push(FlatPlaylistItem {
+                title: item_title,
+                url: format!("ytsearch:{}", search_term),
+                duration_secs,
+                author: if !artist.is_empty() { Some(artist) } else { None },
+                thumbnail: None,
+            });
+        }
+
+        let total_tracks_count = entries.len();
+        let first_entry = entries.remove(0);
+
+        info!(
+            playlist = %playlist_title,
+            total = total_tracks_count,
+            first = %first_entry.title,
+            "Playlist/álbum de Spotify extraído de embed; resolviendo primera pista con Fast Start..."
+        );
+
+        let first_track = Box::pin(self.resolve_single(
+            &first_entry.url,
+            custom_extractor_args,
+            custom_extra_args,
+            custom_cookies,
+            custom_format,
+        ))
+        .await?;
+
+        Ok(ResolvedPlaylistBatch {
+            first_track,
+            is_playlist: true,
+            playlist_title: Some(playlist_title),
+            total_tracks_count,
+            remaining_entries: entries,
+        })
     }
 
     /// Búsqueda nativa ultrarrápida (~30-50ms) usando la API directa de YouTube InnerTube sin Python/yt-dlp
@@ -1263,6 +1696,7 @@ impl SourceResolver {
                 duration_secs: None,
                 author: None,
                 thumbnail: None,
+                skip_segments: Vec::new(),
             };
             return Ok(ResolvedPlaylistBatch {
                 first_track: meta,
@@ -1271,6 +1705,54 @@ impl SourceResolver {
                 total_tracks_count: 1,
                 remaining_entries: vec![],
             });
+        }
+
+        // 1.5. Si es un enlace o URI de Spotify
+        if let Some(spotify_entity) = Self::parse_spotify_url(query_trimmed) {
+            match spotify_entity {
+                SpotifyEntity::Track(ref id) => {
+                    let first_track = self
+                        .resolve_spotify_track(
+                            id,
+                            custom_extractor_args,
+                            custom_extra_args,
+                            custom_cookies,
+                            custom_format,
+                        )
+                        .await?;
+                    return Ok(ResolvedPlaylistBatch {
+                        first_track,
+                        is_playlist: false,
+                        playlist_title: None,
+                        total_tracks_count: 1,
+                        remaining_entries: vec![],
+                    });
+                }
+                SpotifyEntity::Playlist(ref id) => {
+                    return self
+                        .resolve_spotify_batch(
+                            "playlist",
+                            id,
+                            custom_extractor_args,
+                            custom_extra_args,
+                            custom_cookies,
+                            custom_format,
+                        )
+                        .await;
+                }
+                SpotifyEntity::Album(ref id) => {
+                    return self
+                        .resolve_spotify_batch(
+                            "album",
+                            id,
+                            custom_extractor_args,
+                            custom_extra_args,
+                            custom_cookies,
+                            custom_format,
+                        )
+                        .await;
+                }
+            }
         }
 
         let is_playlist = Self::is_playlist_url(query_trimmed);

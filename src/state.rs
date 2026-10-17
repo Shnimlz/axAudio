@@ -32,6 +32,7 @@ pub struct AppState {
     pub autoplay_guilds: Arc<DashSet<u64>>,
     pub seen_tracks: Arc<DashMap<u64, Vec<String>>>,
     pub last_tracks: Arc<DashMap<u64, TrackMetadata>>,
+    pub last_activity: Arc<DashMap<u64, Instant>>,
     pub prefetching_guilds: Arc<DashSet<u64>>,
     pub guild_play_options: Arc<DashMap<u64, GuildPlayOptions>>,
     pub event_tx: broadcast::Sender<PlayerEvent>,
@@ -69,6 +70,7 @@ impl AppState {
             autoplay_guilds: Arc::new(DashSet::new()),
             seen_tracks: Arc::new(DashMap::new()),
             last_tracks: Arc::new(DashMap::new()),
+            last_activity: Arc::new(DashMap::new()),
             prefetching_guilds: Arc::new(DashSet::new()),
             guild_play_options: Arc::new(DashMap::new()),
             event_tx,
@@ -175,6 +177,17 @@ impl AppState {
             .get(&guild_id)
             .map(|e| e.load(std::sync::atomic::Ordering::SeqCst))
             .unwrap_or(0)
+    }
+
+    pub fn touch_activity(&self, guild_id: u64) {
+        self.last_activity.insert(guild_id, Instant::now());
+    }
+
+    pub fn get_last_activity(&self, guild_id: u64) -> Instant {
+        self.last_activity
+            .get(&guild_id)
+            .map(|t| *t.value())
+            .unwrap_or_else(Instant::now)
     }
 }
 

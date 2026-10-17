@@ -14,6 +14,7 @@ use songbird::input::HttpRequest;
 use songbird::tracks::{Track, TrackHandle};
 use songbird::ConnectionInfo;
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
@@ -24,7 +25,7 @@ use crate::models::{
     LoopMode, PlayPayload, PlayResponse, PlayerEvent, QueuePayload, QueueResponse, ResolvePayload,
     SearchPayload, SearchResponse, StatsResponse, TrackResponse,
 };
-use crate::sources::{SourceResolver, TrackMetadata};
+use crate::sources::{FlatPlaylistItem, SourceResolver, TrackMetadata};
 use crate::state::AppState;
 
 struct TrackPlayNotifier {
@@ -32,11 +33,13 @@ struct TrackPlayNotifier {
     meta: Arc<TrackMetadata>,
     event_tx: broadcast::Sender<PlayerEvent>,
     state: Option<AppState>,
+    has_played: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl EventHandler for TrackPlayNotifier {
     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        self.has_played.store(true, Ordering::SeqCst);
         info!(guild = self.guild_id, title = %self.meta.title, "Evento TrackPlay emitido");
         if let Some(ref st) = self.state {
             st.set_last_track(self.guild_id, (*self.meta).clone());
@@ -64,11 +67,21 @@ struct TrackEndNotifier {
     meta: Arc<TrackMetadata>,
     event_tx: broadcast::Sender<PlayerEvent>,
     state: Option<AppState>,
+    has_played: Arc<AtomicBool>,
+    is_retry_attempt: bool,
 }
 
 #[async_trait]
 impl EventHandler for TrackEndNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if !self.has_played.load(Ordering::SeqCst) {
+            info!(
+                guild = self.guild_id,
+                title = %self.meta.title,
+                "TrackEnd ignorado: la pista fue detenida/desalojada antes de sonar"
+            );
+            return None;
+        }
         let reason = match ctx {
             EventContext::Track(slice) => slice
                 .first()
@@ -81,6 +94,10 @@ impl EventHandler for TrackEndNotifier {
                 .unwrap_or("finished"),
             _ => "finished",
         };
+
+        if reason == "error" && self.state.is_some() && !self.is_retry_attempt {
+            return None;
+        }
 
         info!(guild = self.guild_id, title = %self.meta.title, reason = %reason, "Evento TrackEnd emitido");
         let _ = self.event_tx.send(PlayerEvent::TrackEnd {
@@ -151,6 +168,8 @@ struct TrackErrorNotifier {
     guild_id: u64,
     meta: Arc<TrackMetadata>,
     event_tx: broadcast::Sender<PlayerEvent>,
+    state: Option<AppState>,
+    retried: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -163,7 +182,121 @@ impl EventHandler for TrackErrorNotifier {
                 .unwrap_or_else(|| "Error de reproducción".to_string()),
             _ => "Error de reproducción".to_string(),
         };
-        warn!(guild = self.guild_id, title = %self.meta.title, error = %err_msg, "Evento TrackError emitido");
+
+        if let Some(ref st) = self.state {
+            if !self.retried.swap(true, Ordering::SeqCst) {
+                st.resolver.invalidate_cache(&self.meta.source_url);
+                st.resolver.invalidate_cache(&self.meta.stream_url);
+
+                warn!(
+                    guild = self.guild_id,
+                    title = %self.meta.title,
+                    url = %self.meta.source_url,
+                    error = %err_msg,
+                    "TrackError detectado (posible 403 o corte de CDN). Purgando caché y reintentando automáticamente..."
+                );
+
+                let st_clone = st.clone();
+                let guild_id = self.guild_id;
+                let source_url = self.meta.source_url.clone();
+                let event_tx_clone = self.event_tx.clone();
+
+                tokio::spawn(async move {
+                    let play_opts = st_clone
+                        .guild_play_options
+                        .get(&guild_id)
+                        .map(|p| p.clone())
+                        .unwrap_or_default();
+
+                    match st_clone
+                        .resolver
+                        .resolve_single(
+                            &source_url,
+                            play_opts.extractor_args.as_deref(),
+                            play_opts.extra_args.as_deref(),
+                            play_opts.cookies.as_deref(),
+                            play_opts.format.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(fresh_track) => {
+                            if let Some(driver_ref) = st_clone.players.get(&guild_id) {
+                                let dsp_params = st_clone.get_dsp_params(guild_id);
+                                let target_vol = st_clone.get_volume(guild_id);
+                                let effective_vol = (target_vol * 0.95).clamp(0.0, 2.0);
+                                let track_meta = Arc::new(fresh_track.clone());
+
+                                let songbird_track = create_track_with_dsp(
+                                    st_clone.http_client.clone(),
+                                    fresh_track.stream_url.clone(),
+                                    track_meta.clone(),
+                                    dsp_params,
+                                )
+                                .await;
+
+                                let handle = {
+                                    let mut driver = driver_ref.lock().await;
+                                    let h = driver.enqueue(songbird_track).await;
+                                    let _ = h.set_volume(effective_vol);
+                                    h
+                                };
+
+                                let retried_flag = Arc::new(AtomicBool::new(true));
+                                attach_track_events_with_retried(
+                                    guild_id,
+                                    track_meta,
+                                    &handle,
+                                    &event_tx_clone,
+                                    Some(st_clone.clone()),
+                                    retried_flag,
+                                );
+
+                                if st_clone.get_loop_mode(guild_id) == LoopMode::Track {
+                                    let _ = handle.enable_loop();
+                                }
+
+                                info!(
+                                    guild = guild_id,
+                                    title = %fresh_track.title,
+                                    "Auto-curación exitosa: pista re-resuelta con stream fresco y reanudada"
+                                );
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                guild = guild_id,
+                                error = %e,
+                                "Reintento de auto-curación falló al re-resolver la pista"
+                            );
+                        }
+                    }
+
+                    let _ = event_tx_clone.send(PlayerEvent::TrackError {
+                        guild_id,
+                        track: Some(TrackResponse {
+                            title: source_url.clone(),
+                            source_url,
+                            stream_url: String::new(),
+                            duration_secs: None,
+                            author: None,
+                            thumbnail: None,
+                        }),
+                        error: err_msg,
+                    });
+                    maybe_prefetch_next_track(&st_clone, guild_id).await;
+                });
+
+                return None;
+            }
+        }
+
+        warn!(
+            guild = self.guild_id,
+            title = %self.meta.title,
+            error = %err_msg,
+            "Evento TrackError emitido (sin más reintentos)"
+        );
         let _ = self.event_tx.send(PlayerEvent::TrackError {
             guild_id: self.guild_id,
             track: Some(TrackResponse {
@@ -208,6 +341,21 @@ fn attach_track_events(
     event_tx: &broadcast::Sender<PlayerEvent>,
     state: Option<AppState>,
 ) {
+    let retried = Arc::new(AtomicBool::new(false));
+    attach_track_events_with_retried(guild_id, meta, handle, event_tx, state, retried);
+}
+
+fn attach_track_events_with_retried(
+    guild_id: u64,
+    meta: Arc<TrackMetadata>,
+    handle: &TrackHandle,
+    event_tx: &broadcast::Sender<PlayerEvent>,
+    state: Option<AppState>,
+    retried: Arc<AtomicBool>,
+) {
+    let has_played = Arc::new(AtomicBool::new(false));
+    let is_retry_attempt = retried.load(Ordering::SeqCst);
+
     let _ = handle.add_event(
         Event::Track(TrackEvent::Play),
         TrackPlayNotifier {
@@ -215,6 +363,7 @@ fn attach_track_events(
             meta: meta.clone(),
             event_tx: event_tx.clone(),
             state: state.clone(),
+            has_played: has_played.clone(),
         },
     );
     let _ = handle.add_event(
@@ -223,7 +372,9 @@ fn attach_track_events(
             guild_id,
             meta: meta.clone(),
             event_tx: event_tx.clone(),
-            state,
+            state: state.clone(),
+            has_played,
+            is_retry_attempt,
         },
     );
     let _ = handle.add_event(
@@ -232,6 +383,8 @@ fn attach_track_events(
             guild_id,
             meta,
             event_tx: event_tx.clone(),
+            state,
+            retried,
         },
     );
 }
@@ -431,6 +584,7 @@ pub async fn voice_join(
 
     match driver.connect(connection_info).await {
         Ok(_) => {
+            state.touch_activity(payload.guild_id);
             info!(guild = payload.guild_id, "Conexión exitosa al canal de voz");
             Ok(Json(ApiResponse::ok("Conectado al canal de voz de Discord")))
         }
@@ -487,6 +641,8 @@ pub async fn player_play(
             ));
         }
     };
+
+    state.touch_activity(payload.guild_id);
 
     info!(guild = payload.guild_id, query = %payload.url, "Resolviendo fuente de audio (Pista/Playlist/Mix/Radio)...");
 
@@ -705,6 +861,8 @@ pub async fn player_control(
         }
     };
 
+    state.touch_activity(payload.guild_id);
+
     let mut driver = driver_ref.lock().await;
 
     match payload.action.as_str() {
@@ -735,7 +893,9 @@ pub async fn player_control(
             driver.queue().modify_queue(|q| {
                 if q.len() > 1 {
                     let first = q.pop_front().unwrap();
-                    q.clear();
+                    for handle in q.drain(..) {
+                        let _ = handle.stop();
+                    }
                     q.push_front(first);
                 }
             });
@@ -859,6 +1019,7 @@ pub async fn player_control(
                     if let Some(handle) = q.remove(queue_idx) {
                         let meta: Arc<TrackMetadata> = handle.data();
                         removed_title = Some(meta.title.clone());
+                        let _ = handle.stop();
                     }
                 }
             });
@@ -907,10 +1068,55 @@ pub async fn player_control(
                 }
             };
 
+            let q_upcoming_len = driver.queue().len().saturating_sub(1);
+            let pending_len = state
+                .pending_playlists
+                .get(&payload.guild_id)
+                .map(|p| p.len())
+                .unwrap_or(0);
+            let total_upcoming = q_upcoming_len + pending_len;
+
+            if from >= total_upcoming || to >= total_upcoming {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::err(format!(
+                        "Parámetros 'from_index' ({}) o 'to_index' ({}) fuera de los límites de la cola (total: {})",
+                        from, to, total_upcoming
+                    ))),
+                ));
+            }
+
+            if from == to {
+                let current_title = if from < q_upcoming_len {
+                    driver
+                        .queue()
+                        .modify_queue(|q| {
+                            q.get(from + 1).map(|h| {
+                                let meta: Arc<TrackMetadata> = h.data();
+                                meta.title.clone()
+                            })
+                        })
+                        .unwrap_or_else(|| "Pista".to_string())
+                } else {
+                    state
+                        .pending_playlists
+                        .get(&payload.guild_id)
+                        .and_then(|p| p.get(from - q_upcoming_len).map(|it| it.title.clone()))
+                        .unwrap_or_else(|| "Pista".to_string())
+                };
+
+                return Ok(Json(ApiResponse::ok(format!(
+                    "Se movió '{}' de la posición {} a la {}",
+                    current_title, from, to
+                ))));
+            }
+
             let mut moved_title = None;
-            driver.queue().modify_queue(|q| {
-                let upcoming_count = q.len().saturating_sub(1);
-                if from < upcoming_count && to < upcoming_count {
+            let mut trigger_prefetch = false;
+
+            if from < q_upcoming_len && to < q_upcoming_len {
+                // Caso 1: Ambas posiciones están en la cola interna precargada de Songbird
+                driver.queue().modify_queue(|q| {
                     let from_q = from + 1;
                     let to_q = to + 1;
                     if let Some(handle) = q.remove(from_q) {
@@ -918,8 +1124,95 @@ pub async fn player_control(
                         moved_title = Some(meta.title.clone());
                         q.insert(to_q, handle);
                     }
+                });
+            } else if from >= q_upcoming_len && to >= q_upcoming_len {
+                // Caso 2: Ambas posiciones están en state.pending_playlists
+                let from_p = from - q_upcoming_len;
+                let to_p = to - q_upcoming_len;
+                if let Some(mut pend) = state.pending_playlists.get_mut(&payload.guild_id) {
+                    if from_p < pend.len() && to_p < pend.len() {
+                        let item = pend.remove(from_p);
+                        moved_title = Some(item.title.clone());
+                        pend.insert(to_p, item);
+                    }
                 }
-            });
+            } else if from < q_upcoming_len && to >= q_upcoming_len {
+                // Caso 3: Mover desde la cola interna de Songbird hacia la cola pendiente
+                let mut moved_item = None;
+                driver.queue().modify_queue(|q| {
+                    let from_q = from + 1;
+                    if let Some(handle) = q.remove(from_q) {
+                        let meta: Arc<TrackMetadata> = handle.data();
+                        moved_title = Some(meta.title.clone());
+                        let _ = handle.stop();
+                        moved_item = Some(FlatPlaylistItem {
+                            title: meta.title.clone(),
+                            url: meta.source_url.clone(),
+                            duration_secs: meta.duration_secs,
+                            author: meta.author.clone(),
+                            thumbnail: meta.thumbnail.clone(),
+                        });
+                    }
+                });
+
+                if let Some(item) = moved_item {
+                    let new_q_upcoming_len = driver.queue().len().saturating_sub(1);
+                    let mut pend = state.pending_playlists.entry(payload.guild_id).or_default();
+                    let to_p = (to - new_q_upcoming_len).min(pend.len());
+                    pend.insert(to_p, item);
+                    trigger_prefetch = true;
+                }
+            } else {
+                // Caso 4: Mover desde la cola pendiente hacia la cola interna activa (to < q_upcoming_len)
+                let from_p = from - q_upcoming_len;
+                let item_opt = state
+                    .pending_playlists
+                    .get_mut(&payload.guild_id)
+                    .and_then(|mut pend| {
+                        if from_p < pend.len() {
+                            Some(pend.remove(from_p))
+                        } else {
+                            None
+                        }
+                    });
+
+                if let Some(item) = item_opt {
+                    moved_title = Some(item.title.clone());
+                    let mut displaced = Vec::new();
+                    driver.queue().modify_queue(|q| {
+                        while q.len() > to + 1 {
+                            if let Some(handle) = q.pop_back() {
+                                let meta: Arc<TrackMetadata> = handle.data();
+                                let _ = handle.stop();
+                                displaced.push(FlatPlaylistItem {
+                                    title: meta.title.clone(),
+                                    url: meta.source_url.clone(),
+                                    duration_secs: meta.duration_secs,
+                                    author: meta.author.clone(),
+                                    thumbnail: meta.thumbnail.clone(),
+                                });
+                            }
+                        }
+                    });
+                    displaced.reverse();
+
+                    let mut pend = state.pending_playlists.entry(payload.guild_id).or_default();
+                    pend.insert(0, item);
+                    for (i, d) in displaced.into_iter().enumerate() {
+                        pend.insert(1 + i, d);
+                    }
+                    state.end_prefetch(payload.guild_id);
+                    trigger_prefetch = true;
+                }
+            }
+
+            if trigger_prefetch {
+                let st_clone = state.clone();
+                let guild_id = payload.guild_id;
+                tokio::spawn(async move {
+                    maybe_prefetch_next_track(&st_clone, guild_id).await;
+                });
+            }
 
             match moved_title {
                 Some(title) => Ok(Json(ApiResponse::ok(format!(
@@ -927,8 +1220,8 @@ pub async fn player_control(
                     title, from, to
                 )))),
                 None => Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ApiResponse::err("Parámetros 'from_index' o 'to_index' inválidos para la cola activa")),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::err("Error al reordenar la pista en la cola")),
                 )),
             }
         }
@@ -1010,23 +1303,36 @@ pub async fn player_autoplay(
     Ok(Json(ApiResponse::ok(new_val)))
 }
 
+/// Desconecta el driver de Songbird y purga todos los registros del servidor en AppState
+pub async fn cleanup_guild_player(state: &AppState, guild_id: u64) -> bool {
+    state.next_epoch(guild_id);
+    state.pending_playlists.remove(&guild_id);
+    state.end_prefetch(guild_id);
+    state.guild_play_options.remove(&guild_id);
+    state.dsp_params.remove(&guild_id);
+    state.load_epochs.remove(&guild_id);
+    state.guild_volumes.remove(&guild_id);
+    state.loop_modes.remove(&guild_id);
+    state.autoplay_guilds.remove(&guild_id);
+    state.seen_tracks.remove(&guild_id);
+    state.last_tracks.remove(&guild_id);
+    state.last_activity.remove(&guild_id);
+
+    if let Some((_, driver_ref)) = state.players.remove(&guild_id) {
+        let mut driver = driver_ref.lock().await;
+        driver.stop();
+        driver.leave();
+        true
+    } else {
+        false
+    }
+}
+
 pub async fn voice_leave(
     State(state): State<AppState>,
     Json(payload): Json<LeavePayload>,
 ) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<&'static str>>)> {
-    state.next_epoch(payload.guild_id);
-    state.pending_playlists.remove(&payload.guild_id);
-    state.end_prefetch(payload.guild_id);
-    state.guild_play_options.remove(&payload.guild_id);
-    state.dsp_params.remove(&payload.guild_id);
-    state.load_epochs.remove(&payload.guild_id);
-    state.guild_volumes.remove(&payload.guild_id);
-    state.loop_modes.remove(&payload.guild_id);
-
-    if let Some((_, driver_ref)) = state.players.remove(&payload.guild_id) {
-        let mut driver = driver_ref.lock().await;
-        driver.stop();
-        driver.leave();
+    if cleanup_guild_player(&state, payload.guild_id).await {
         info!(guild = payload.guild_id, "Driver desconectado y reproductor eliminado");
         Ok(Json(ApiResponse::ok("Desconectado y reproductor limpiado")))
     } else {
@@ -1422,9 +1728,100 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
     });
 }
 
-/// Tarea global de monitoreo de prefetch anticipado.
-/// Inspecciona cada segundo los reproductores activos para detectar pistas que entran
-/// en la ventana de 10-15s previa al corte y pre-cargar el siguiente tema.
+/// Verifica si la pista en reproducción actual contiene segmentos de SponsorBlock
+/// y adelanta la posición automáticamente si el cabezal entra en una sección no musical.
+async fn check_sponsorblock_skip(state: &AppState, guild_id: u64) {
+    let driver_ref = match state.players.get(&guild_id) {
+        Some(d) => d.clone(),
+        None => return,
+    };
+
+    let (current_handle, meta) = {
+        let driver = driver_ref.lock().await;
+        if let Some(current) = driver.queue().current() {
+            let m: Arc<TrackMetadata> = current.data();
+            (Some(current), Some(m))
+        } else {
+            (None, None)
+        }
+    };
+
+    if let (Some(handle), Some(meta)) = (current_handle, meta) {
+        if meta.skip_segments.is_empty() {
+            return;
+        }
+
+        if let Ok(info) = handle.get_info().await {
+            if info.playing == songbird::tracks::PlayMode::Play {
+                let pos_secs = info.position.as_secs_f64();
+                for seg in &meta.skip_segments {
+                    if pos_secs >= seg.start && pos_secs < (seg.end - 0.25) {
+                        info!(
+                            guild = guild_id,
+                            title = %meta.title,
+                            from = pos_secs,
+                            to = seg.end,
+                            "SponsorBlock: saltando segmento no musical de videoclip"
+                        );
+                        let target = std::time::Duration::from_secs_f64(seg.end);
+                        let _ = handle.seek_async(target).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Garbage Collector de reproductores inactivos:
+/// Si un servidor no tiene canciones en reproducción ni pendientes en cola por más de
+/// AXAUDIO_IDLE_TIMEOUT_SECS (por defecto 300s / 5min), desconecta el driver y libera sockets/memoria.
+async fn check_idle_cleanup(state: &AppState, guild_id: u64) {
+    let timeout_secs: u64 = std::env::var("AXAUDIO_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+
+    if timeout_secs == 0 {
+        return;
+    }
+
+    let driver_ref = match state.players.get(&guild_id) {
+        Some(d) => d.clone(),
+        None => return,
+    };
+
+    let is_empty = {
+        let driver = driver_ref.lock().await;
+        driver.queue().is_empty()
+    };
+
+    let has_pending = state
+        .pending_playlists
+        .get(&guild_id)
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
+
+    if !is_empty || has_pending {
+        state.touch_activity(guild_id);
+    } else {
+        let last = state.get_last_activity(guild_id);
+        if last.elapsed() >= std::time::Duration::from_secs(timeout_secs) {
+            info!(
+                guild = guild_id,
+                idle_secs = last.elapsed().as_secs(),
+                timeout = timeout_secs,
+                "Garbage Collector: reproductor inactivo por más del límite configurado; liberando driver y recursos UDP"
+            );
+            cleanup_guild_player(state, guild_id).await;
+        }
+    }
+}
+
+/// Tarea global de monitoreo en segundo plano:
+/// 1. Prefetch anticipado (10-15s antes del final de pista para audio gapless)
+/// 2. SponsorBlock skipping en tiempo real
+/// 3. Garbage Collection de reproductores inactivos
 pub async fn run_prefetch_monitor(state: AppState) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1435,6 +1832,8 @@ pub async fn run_prefetch_monitor(state: AppState) {
         let guild_ids: Vec<u64> = state.players.iter().map(|entry| *entry.key()).collect();
         for guild_id in guild_ids {
             maybe_prefetch_next_track(&state, guild_id).await;
+            check_sponsorblock_skip(&state, guild_id).await;
+            check_idle_cleanup(&state, guild_id).await;
         }
     }
 }

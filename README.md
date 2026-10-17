@@ -75,10 +75,12 @@ Running Lavalink means running a JVM. On a small VPS that is most of your RAM go
 ## ✨ Features
 
 - 🦀 **Pure Rust core**: Songbird 0.4 + Symphonia 0.5, no GC pauses.
-- 🎵 **Wide format support**: MP3, FLAC, AAC, OGG Vorbis, WAV, plus direct HTTP / ICY streams.
+- 🎵 **Wide format & source support**: MP3, FLAC, AAC, OGG Vorbis, WAV, direct HTTP / ICY streams, and **native Spotify resolution** (Tracks, Playlists, Albums via 0-key public embeds).
 - 📡 **Real-time transport**: direct 50 Hz UDP RTP Opus streaming with hardware-accelerated ChaCha20-Poly1305 and AES-GCM encryption.
 - ⚙️ **Simple REST control plane**: Axum 0.8 on a multi-threaded Tokio runtime.
-- 🛡️ **YouTube bypass built in**: Deno JS runtime, PoToken sidecar and a multi-account cookie pool with automatic retry.
+- 🛡️ **YouTube bypass & auto-healing**: QuickJS/Deno runtimes, PoToken sidecar, multi-cookie pool, and **automatic 403 Forbidden cache purge & retry**.
+- ⏭️ **SponsorBlock built-in**: Real-time server-side skipping of non-musical intro/outro segments (`music_offtopic`).
+- 🧹 **Idle Player Garbage Collector**: Configurable automatic driver teardown and socket reclamation on inactive guilds.
 - 🎧 **Studio-grade fidelity**: native 48 kHz Opus (format 251), `tanh` soft-clipping and headroom normalization.
 - 🪶 **Tuned for tiny servers**: defaults to `TOKIO_WORKER_THREADS=2`, ideal for Oracle Cloud Free Tier, AWS t4g/t3a and Hetzner VPS.
 - 🐳 **One-command deploy** with Docker Compose.
@@ -270,9 +272,15 @@ Everything is configurable through environment variables or a `.env` file.
 | `YTDLP_COOKIES`           | _none_                                 | Raw Netscape cookie content or path override.                         |
 | `YTDLP_FORMAT`            | `ba[format_id=251]/ba[acodec=opus]...` | Prefers YouTube's native 48 kHz Opus stream (format 251).             |
 | `YTDLP_DEFAULT_SEARCH`    | `ytsearch:`                            | Search provider prefix for text queries.                              |
-| `YTDLP_REMOTE_COMPONENTS` | `ejs:github`                           | EJS remote solver source. Set to `none` to disable.                   |
-| `YTDLP_EXTRACTOR_ARGS`    | _auto (bgutil)_                        | Custom `--extractor-args` flags for `yt-dlp`.                         |
-| `YTDLP_EXTRA_ARGS`        | _none_                                 | Extra flags forwarded directly to `yt-dlp`.                           |
+| `YTDLP_REMOTE_COMPONENTS`         | `ejs:github`                           | EJS remote solver source. Set to `none` to disable.                   |
+| `YTDLP_JS_RUNTIMES`               | `quickjs,deno`                         | Preferred JavaScript challenge runtimes (QuickJS primary, Deno fallback). |
+| `YTDLP_PLAYER_CLIENTS`            | `android,web`                          | Priority order for YouTube player clients (Android avoids JS cipher).  |
+| `YTDLP_CACHE_DIR`                 | `/tmp/yt-dlp-cache`                    | Persistent directory for caching decipher algorithms and player scripts. |
+| `AXAUDIO_MAX_CONCURRENT_RESOLVES` | `2`                                    | Process semaphore limit for concurrent yt-dlp extractions.           |
+| `AXAUDIO_IDLE_TIMEOUT_SECS`       | `300`                                  | Idle seconds with empty queue before GC disconnects voice (0 to disable). |
+| `AXAUDIO_SPONSORBLOCK`            | `true`                                 | Enable real-time auto-skipping of non-musical intro/outro segments.   |
+| `YTDLP_EXTRACTOR_ARGS`            | _auto (bgutil + clients)_              | Custom `--extractor-args` flags for `yt-dlp`.                         |
+| `YTDLP_EXTRA_ARGS`                | _none_                                 | Extra flags forwarded directly to `yt-dlp`.                           |
 
 ## 📡 REST API Reference
 
