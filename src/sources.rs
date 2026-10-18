@@ -357,7 +357,7 @@ impl SourceResolver {
             let pot_provider_url = std::env::var("BGUTIL_POT_URL")
                 .unwrap_or_else(|_| "http://bgutil-pot:4416".to_string());
             let default_clients = std::env::var("YTDLP_PLAYER_CLIENTS")
-                .unwrap_or_else(|_| if cookie_path.is_some() { "default,mweb".to_string() } else { "android,web".to_string() });
+                .unwrap_or_else(|_| if cookie_path.is_some() { "mweb,default".to_string() } else { "mweb,tv_embedded".to_string() });
             cmd.arg("--extractor-args")
                 .arg(format!("youtubepot-bgutilhttp:base_url={}", pot_provider_url))
                 .arg("--extractor-args")
@@ -514,7 +514,7 @@ impl SourceResolver {
             let pot_provider_url = std::env::var("BGUTIL_POT_URL")
                 .unwrap_or_else(|_| "http://bgutil-pot:4416".to_string());
             let default_clients = std::env::var("YTDLP_PLAYER_CLIENTS")
-                .unwrap_or_else(|_| if cookie_path.is_some() { "default,mweb".to_string() } else { "android,web".to_string() });
+                .unwrap_or_else(|_| if cookie_path.is_some() { "mweb,default".to_string() } else { "mweb,tv_embedded".to_string() });
             cmd.arg("--extractor-args")
                 .arg(format!("youtubepot-bgutilhttp:base_url={}", pot_provider_url))
                 .arg("--extractor-args")
