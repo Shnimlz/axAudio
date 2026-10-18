@@ -147,16 +147,18 @@ impl Decoder for DspDecoder {
 
         self.last_was_dsp = true;
 
-        // 4. Asegurar que f32_buf tenga la capacidad y especificación exacta
-        // Con timescale activo, la trama de salida puede requerir mayor capacidad (e.g. desaceleración 0.25x -> 4x frames)
-        let min_cap = (decoded.capacity() * 4).max(8192);
+        // 4. Asegurar que f32_buf tenga la capacidad y especificación EXACTA del paquete decodificado.
+        // NOTA CRÍTICA: En Symphonia 0.5.5, `AudioBuffer::convert` indexa internamente con `self.n_capacity`
+        // en lugar de `dest.n_capacity`. Por tanto, si f32_buf.capacity() != decoded.capacity(),
+        // el canal 1 (derecho) se escribe en el offset equivocado y se lee silencio absoluto (0.0).
+        let cap = decoded.capacity();
         let need_realloc = match self.f32_buf {
-            Some(ref buf) => buf.capacity() < min_cap || buf.spec() != decoded.spec(),
+            Some(ref buf) => buf.capacity() != cap || buf.spec() != decoded.spec(),
             None => true,
         };
 
         if need_realloc {
-            self.f32_buf = Some(AudioBuffer::new(min_cap as u64, *decoded.spec()));
+            self.f32_buf = Some(AudioBuffer::new(cap as u64, *decoded.spec()));
         }
 
         let f32_buf = self.f32_buf.as_mut().unwrap();
@@ -205,5 +207,30 @@ impl Decoder for DspDecoder {
             }
         }
         self.inner.last_decoded()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use symphonia::core::audio::{Channels, Signal, SignalSpec};
+
+    #[test]
+    fn test_symphonia_convert_stereo_retention() {
+        let spec = SignalSpec::new(48000, Channels::FRONT_LEFT | Channels::FRONT_RIGHT);
+        let mut src = AudioBuffer::<f32>::new(960, spec);
+        src.render_reserved(Some(960));
+        let (left_src, right_src) = src.chan_pair_mut(0, 1);
+        left_src.fill(1.0);
+        right_src.fill(2.0);
+
+        // When dest has exact matching capacity
+        let mut dst = AudioBuffer::<f32>::new(src.capacity() as u64, spec);
+        dst.clear();
+        src.convert(&mut dst);
+
+        let (left_dst, right_dst) = dst.chan_pair_mut(0, 1);
+        assert_eq!(left_dst[0], 1.0, "Canal izquierdo debe conservar 1.0");
+        assert_eq!(right_dst[0], 2.0, "Canal derecho debe conservar 2.0 y no ser silencio");
     }
 }

@@ -240,5 +240,23 @@ impl DspChain {
 
         // 5. Normalizador perceptual de volumen EBU R128 (K-weighting + Smooth AGC + True Peak Limiter)
         self.loudness.process_planar(left, right);
+
+        // 6. Limitador suave de pico analógico universal (Soft-Knee Peak Limiter a 0 dBFS)
+        // Si EBU R128 está apagado, protege la salida contra saturación digital / inter-sample clipping en Discord Opus
+        if !self.loudness.is_active() {
+            let len = left.len().min(right.len());
+            for i in 0..len {
+                if left[i].abs() > 0.95 {
+                    let sign = left[i].signum();
+                    let excess = left[i].abs() - 0.95;
+                    left[i] = sign * (0.95 + 0.048 * (excess / 0.048).tanh());
+                }
+                if right[i].abs() > 0.95 {
+                    let sign = right[i].signum();
+                    let excess = right[i].abs() - 0.95;
+                    right[i] = sign * (0.95 + 0.048 * (excess / 0.048).tanh());
+                }
+            }
+        }
     }
 }
