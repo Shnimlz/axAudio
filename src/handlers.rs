@@ -125,11 +125,17 @@ impl EventHandler for TrackEndNotifier {
                             let dsp_params = st_clone.get_dsp_params(guild_id);
                             let target_volume = st_clone.get_volume(guild_id);
                             let effective_volume = (target_volume * 0.95).clamp(0.0, 2.0);
+                            let play_opts = st_clone
+                                .guild_play_options
+                                .get(&guild_id)
+                                .map(|o| o.clone())
+                                .unwrap_or_default();
                             let trk = create_track_with_dsp(
                                 st_clone.http_client.clone(),
                                 meta.stream_url.clone(),
                                 meta.clone(),
                                 dsp_params,
+                                play_opts.user_agent.as_deref(),
                             )
                             .await;
 
@@ -231,6 +237,7 @@ impl EventHandler for TrackErrorNotifier {
                                     fresh_track.stream_url.clone(),
                                     track_meta.clone(),
                                     dsp_params,
+                                    play_opts.user_agent.as_deref(),
                                 )
                                 .await;
 
@@ -603,8 +610,18 @@ async fn create_track_with_dsp(
     stream_url: String,
     meta: Arc<TrackMetadata>,
     dsp_params: Arc<std::sync::RwLock<DspParams>>,
+    custom_user_agent: Option<&str>,
 ) -> Track {
-    let source = HttpRequest::new(http_client.clone(), stream_url.clone());
+    let client = if let Some(ua) = custom_user_agent {
+        reqwest::Client::builder()
+            .user_agent(ua)
+            .build()
+            .unwrap_or_else(|_| http_client.clone())
+    } else {
+        http_client.clone()
+    };
+
+    let source = HttpRequest::new(client.clone(), stream_url.clone());
     let input: songbird::input::Input = source.into();
 
     match input
@@ -622,7 +639,7 @@ async fn create_track_with_dsp(
         }
         Err(e) => {
             warn!(error = ?e, "Pre-parsing falló para DSP, usando entrada nativa de Songbird");
-            let fallback = HttpRequest::new(http_client, stream_url);
+            let fallback = HttpRequest::new(client, stream_url);
             Track::new_with_data(fallback.into(), meta)
         }
     }
@@ -693,6 +710,7 @@ pub async fn player_play(
         batch.first_track.stream_url.clone(),
         first_meta.clone(),
         dsp_params.clone(),
+        payload.user_agent.as_deref(),
     )
     .await;
 
@@ -729,6 +747,7 @@ pub async fn player_play(
                 extra_args: payload.extra_args.clone(),
                 cookies: payload.cookies.clone(),
                 format: payload.format.clone(),
+                user_agent: payload.user_agent.clone(),
             },
         );
 
@@ -1686,6 +1705,7 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
                     track.stream_url.clone(),
                     track_meta.clone(),
                     dsp_params,
+                    play_opts.user_agent.as_deref(),
                 )
                 .await;
 

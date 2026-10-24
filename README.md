@@ -281,6 +281,7 @@ Everything is configurable through environment variables or a `.env` file.
 | `AXAUDIO_MAX_CONCURRENT_RESOLVES` | `2`                                    | Process semaphore limit for concurrent yt-dlp extractions.           |
 | `AXAUDIO_IDLE_TIMEOUT_SECS`       | `300`                                  | Idle seconds with empty queue before GC disconnects voice (0 to disable). |
 | `AXAUDIO_SPONSORBLOCK`            | `true`                                 | Enable real-time auto-skipping of non-musical intro/outro segments.   |
+| `HTTP_USER_AGENT`                 | _modern Chrome browser UA_             | Custom User-Agent header for HTTP audio stream fetching.              |
 | `YTDLP_EXTRACTOR_ARGS`            | _auto (bgutil + clients)_              | Custom `--extractor-args` flags for `yt-dlp`.                         |
 | `YTDLP_EXTRA_ARGS`                | _none_                                 | Extra flags forwarded directly to `yt-dlp`.                           |
 
@@ -380,6 +381,7 @@ Content-Type: application/json
 | `extra_args`     |          | Per-request extra CLI flags for `yt-dlp`.                                                         |
 | `cookies`        |          | Per-request Netscape cookies text or file path.                                                   |
 | `limit`          |          | Optional integer limit for playlist/mix extraction (overrides server defaults).                   |
+| `user_agent`     |          | Optional custom User-Agent for fetching the resolved HTTP stream.                                |
 
 </details>
 

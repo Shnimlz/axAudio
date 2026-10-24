@@ -16,6 +16,7 @@ pub struct GuildPlayOptions {
     pub extra_args: Option<String>,
     pub cookies: Option<String>,
     pub format: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 #[derive(Clone)]
@@ -54,11 +55,15 @@ impl AppState {
             Err(_) => Some(Arc::new("youshallnotpass".to_string())),
         };
 
+        let default_ua = std::env::var("HTTP_USER_AGENT").unwrap_or_else(|_| {
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36".to_string()
+        });
+
         Self {
             players: Arc::new(DashMap::new()),
             dsp_params: Arc::new(DashMap::new()),
             http_client: Client::builder()
-                .user_agent("Mozilla/5.0 (compatible; axAudio/0.1.0)")
+                .user_agent(default_ua)
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             resolver: Arc::new(SourceResolver::new()),

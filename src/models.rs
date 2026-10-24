@@ -63,6 +63,7 @@ pub struct PlayPayload {
     pub cookies: Option<String>,
     pub format: Option<String>,
     pub limit: Option<usize>,
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -125,6 +126,7 @@ pub struct ResolvePayload {
     pub cookies: Option<String>,
     pub format: Option<String>,
     pub limit: Option<usize>,
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
