@@ -257,57 +257,116 @@ cargo build --release
 
 ## ⚙️ Configuration
 
-Everything is configurable through environment variables or a `.env` file.
+Every tunable of `axAudio` is read from the process environment at startup. All variables are **optional**; the values in the `Default` column are baked in. Values come from your shell, a `.env` file, or Docker `environment:` blocks.
 
-| Variable                  | Default                                | Description                                                           |
-| :------------------------ | :------------------------------------- | :-------------------------------------------------------------------- |
-| `PORT`                    | `2333`                                 | HTTP server listening port.                                           |
-| `AUDIO_BITRATE`           | `128000`                               | Opus bitrate in bps (e.g. `128000`, `192000`, `256000`, `384000`).    |
-| `RUST_LOG`                | `axAudio=info,tower_http=info`         | Tracing log level filter.                                             |
-| `TOKIO_WORKER_THREADS`    | `2`                                    | Tokio worker threads (recommended: your vCPU count).                  |
-| `BGUTIL_POT_URL`          | `http://bgutil-pot:4416`               | URL of the Proof-of-Origin token sidecar.                             |
-| `YTDLP_COOKIES_DIR`       | `/app/cookies`, `./cookies`            | Directory with multiple `.txt` cookie files for round-robin rotation. |
-| `YTDLP_COOKIES_POOL`      | _none_                                 | Comma-separated list of cookie file paths.                            |
-| `YTDLP_COOKIES_PATH`      | `/app/cookies.txt`, `./cookies.txt`    | Single Netscape `cookies.txt` fallback.                               |
-| `YTDLP_COOKIES`           | _none_                                 | Raw Netscape cookie content or path override.                         |
-| `YTDLP_FORMAT`            | `ba[format_id=251]/ba[acodec=opus]...` | Prefers YouTube's native 48 kHz Opus stream (format 251).             |
-| `YTDLP_DEFAULT_SEARCH`    | `ytsearch:`                            | Search provider prefix for text queries.                              |
-| `YTDLP_PLAYLIST_MAX`      | `25`                                   | Maximum tracks resolved from a standard YouTube playlist.            |
-| `YTDLP_PLAYLIST_MIX_MAX`  | _auto (YTDLP_PLAYLIST_MAX)_            | Maximum tracks resolved from dynamic YouTube Mixes / Radios (`RD...`). |
-| `YTDLP_REMOTE_COMPONENTS`         | `ejs:github`                           | EJS remote solver source. Set to `none` to disable.                   |
-| `YTDLP_JS_RUNTIMES`               | `quickjs,deno`                         | Preferred JavaScript challenge runtimes (QuickJS primary, Deno fallback). |
-| `YTDLP_PLAYER_CLIENTS`            | `android,web`                          | Priority order for YouTube player clients (Android avoids JS cipher).  |
-| `YTDLP_CACHE_DIR`                 | `/tmp/yt-dlp-cache`                    | Persistent directory for caching decipher algorithms and player scripts. |
-| `AXAUDIO_MAX_CONCURRENT_RESOLVES` | `2`                                    | Process semaphore limit for concurrent yt-dlp extractions.           |
-| `AXAUDIO_IDLE_TIMEOUT_SECS`       | `300`                                  | Idle seconds with empty queue before GC disconnects voice (0 to disable). |
-| `AXAUDIO_SPONSORBLOCK`            | `true`                                 | Enable real-time auto-skipping of non-musical intro/outro segments.   |
-| `HTTP_USER_AGENT`                 | _modern Chrome browser UA_             | Custom User-Agent header for HTTP audio stream fetching.              |
-| `YTDLP_EXTRACTOR_ARGS`            | _auto (bgutil + clients)_              | Custom `--extractor-args` flags for `yt-dlp`.                         |
-| `YTDLP_EXTRA_ARGS`                | _none_                                 | Extra flags forwarded directly to `yt-dlp`.                           |
+### 🔐 Server & Auth
+
+| Variable | Default | What it does |
+| :--- | :--- | :--- |
+| `PORT` | `2333` | TCP port the HTTP server binds (`0.0.0.0:PORT`). Change if another service owns 2333. |
+| `AXAUDIO_PASSWORD` | `youshallnotpass` | Shared secret every authenticated request must present. Send as `Authorization: Bearer <pw>`, `x-axaudio-password: <pw>`, or `?auth=<pw>`. Set to empty string or `none` to disable auth entirely (not recommended). |
+| `RUST_LOG` | `axAudio=info,tower_http=info` | Tracing filter. Set `axAudio=debug` to see yt-dlp stderr, cookie rotation, and prefetch timings. |
+| `TOKIO_WORKER_THREADS` | `2` | Tokio worker threads. On 1 vCPU VPS keep at `2`; on 4 vCPU try `4`. More threads than cores just adds contention. |
+
+### 🔊 Audio Pipeline
+
+| Variable | Default | What it does |
+| :--- | :--- | :--- |
+| `AUDIO_BITRATE` | `128000` | Opus output bitrate in **bps** (not kbps). Use `128000` for Discord (their ceiling), `256000`/`384000` for local-only playback. Higher is not always better — Discord caps at 256 kbps. |
+| `HTTP_USER_AGENT` | Modern Chrome UA | User-Agent header sent when fetching audio from non-YouTube sources (Icecast, ICY, raw mp3). For `googlevideo.com` the UA **returned by yt-dlp** is used instead because the URL is signed against it. |
+
+### 🛡️ YouTube Anti-Bot (yt-dlp + PoToken + Cookies)
+
+| Variable | Default | What it does |
+| :--- | :--- | :--- |
+| `BGUTIL_POT_URL` | `http://bgutil-pot:4416` | Base URL of the `brainicism/bgutil-ytdlp-pot-provider` sidecar that mints BotGuard PoTokens. Point at `http://127.0.0.1:4416` in bare-metal, or the service name in Docker. |
+| `YTDLP_COOKIES_DIR` | `/app/cookies` and `./cookies` | Directory scanned at startup for `*.txt` Netscape cookie files. All discovered files form the **rotation pool** (round-robin per request). |
+| `YTDLP_COOKIES_POOL` | _unset_ | Comma-separated list of explicit cookie file paths, appended to the pool. Useful for mixing local + mounted volumes. |
+| `YTDLP_COOKIES_PATH` | `/app/cookies.txt` and `./cookies.txt` | Single-cookie fallback. Used if no pool directory exists. |
+| `YTDLP_PLAYER_CLIENTS` | `mweb,tv_embedded` (or `mweb,default` with cookies) | Comma-separated priority list of InnerTube player clients. YouTube's `web` client requires JavaScript decryption; `mweb` + `tv_embedded` usually doesn't. Override to e.g. `tv` or `android` if Google rotates cipher. |
+| `YTDLP_FORMAT` | `ba[format_id=251]/ba[acodec=opus]/ba[ext=webm]/bestaudio[ext=m4a]/bestaudio/best` | yt-dlp format selector. `251` is YouTube's ~160 kbps native 48 kHz stereo Opus stream — the sweet spot. Change to `ba[ext=m4a]/bestaudio` if you prefer AAC. |
+| `YTDLP_DEFAULT_SEARCH` | `ytsearch:` | Prefix used when the URL in `/v1/player/play` is not a valid URL (free-text search). |
+| `YTDLP_PLAYLIST_MAX` | `25` | Hard cap on tracks resolved per standard YouTube playlist / Spotify playlist / album. Protects VPS CPU from 500-track mixtapes. |
+| `YTDLP_PLAYLIST_MIX_MAX` | Falls back to `YTDLP_PLAYLIST_MAX` | Same cap for dynamic YouTube Mixes (`list=RD...`). Usually you want this *lower* than regular playlists since mixes are infinite. |
+| `YTDLP_CACHE_DIR` | `/tmp/yt-dlp-cache` | Persistent cache of YouTube's `base.js` / decipher algorithms. Set to `none` to disable. Must be writable by the axaudio user (Dockerfile pre-creates `/tmp/yt-dlp-cache`). |
+| `YTDLP_REMOTE_COMPONENTS` | `ejs:github` | Source of remote EJS solver scripts (used by some YouTube extractors). Set `none` to run fully offline. |
+| `YTDLP_JS_RUNTIMES` | `quickjs,deno` | Preferred JS runtimes (in priority order) for YouTube signature decryption. QuickJS is ~3 MB and ~3 ms; Deno is the fallback. Set `quickjs` only if you have network trouble with Deno. |
+| `YTDLP_EXTRACTOR_ARGS` | _auto (bgutil + clients)_ | Overrides the **entire** `--extractor-args` line. Advanced: only set this if you know exactly what you're doing — the auto default already wires PoToken + players. |
+| `YTDLP_EXTRA_ARGS` | _unset_ | Extra raw CLI flags appended to every `yt-dlp` invocation. Blocked tokens: `--exec`, `--config-location`, `--plugin`, `--alias`, `;`, `&`, `|`, backticks, `$`, newlines. |
+
+### ⚙️ Axum / Rate Limiting / Lifecycle
+
+| Variable | Default | What it does |
+| :--- | :--- | :--- |
+| `AXAUDIO_MAX_CONCURRENT_RESOLVES` | `2` | Process semaphore for concurrent yt-dlp subprocesses. Keep ≤ number of vCPUs. Higher values just cause CPU oversubscription on 1-core boxes. |
+| `RATE_LIMIT_RESOLVE` | `30` | Max **per minute per guild** for `/v1/tracks/resolve` and `/v1/tracks/search`. Returns `429 Too Many Requests` when exceeded. |
+| `RATE_LIMIT_JOINS` | `10` | Max **per minute per guild** for `/v1/voice/join`. Guards against a runaway bot that spam-joins channels. |
+| `RATE_LIMIT_YTDLP` | `5` | Cap on concurrent yt-dlp subprocesses (belt-and-suspenders on top of `AXAUDIO_MAX_CONCURRENT_RESOLVES`). |
+| `RATE_LIMIT_LIGHT` | `60` | Reserved for future lightweight endpoints (`/v1/stats`, `/v1/player/queue`, …) — currently not enforced on any route. |
+| `AXAUDIO_IDLE_TIMEOUT_SECS` | `300` | Seconds of inactivity (no playback, no pending tracks) before the background GC tears down the driver and frees the UDP sockets. Set `0` to disable. |
+| `AXAUDIO_SPONSORBLOCK` | Enabled | Set to `0`, `false`, or `disabled` to stop the server from calling the SponsorBlock API to skip `music_offtopic` segments. |
 
 ## 📡 REST API Reference
 
-All endpoints accept and return JSON. Snowflake IDs (`guild_id`, `channel_id`, `user_id`) can be numbers or numeric strings.
+All endpoints accept and return JSON. Snowflake IDs (`guild_id`, `channel_id`, `user_id`) can be numbers or numeric strings. Every response is wrapped in the envelope:
 
-| Method | Endpoint                | Description                                                   |
-| :----: | :---------------------- | :------------------------------------------------------------ |
-| `GET`  | `/health` · `/v1/stats` | Health check and runtime stats                                |
-| `POST` | `/v1/voice/join`        | Connect to a voice channel                                    |
-| `POST` | `/v1/voice/leave`       | Disconnect from a voice channel                               |
-| `POST` | `/v1/player/play`       | Enqueue a URL or search query                                 |
-| `POST` | `/v1/player/control`    | Pause, resume, skip, stop, volume                             |
-| `POST` | `/v1/player/queue`      | Inspect current track and upcoming queue                      |
-| `POST` | `/v1/tracks/resolve`    | Resolve metadata and direct CDN stream URL without playing    |
-| `POST` | `/v1/tracks/search`     | Fast multi-source search (~1s) with auto YouTube/SoundCloud   |
-|  `WS`  | `/v1/events`            | Real-time WebSocket player events (track start / end / error) |
+```json
+{ "success": true,  "data": <payload>, "message": null }
+{ "success": false, "data": null,      "message": "Human-readable reason" }
+```
 
-<details>
-<summary><b>Health check & stats</b></summary>
+> **Authentication** — every `/v1/*` route (except `/health`) is guarded by an axum middleware. Send the shared secret (`AXAUDIO_PASSWORD`) via **any one** of:
+>
+> ```http
+> Authorization: Bearer <password>
+> x-axaudio-password: <password>
+> GET /v1/...?auth=<password>
+> ```
+>
+> If `AXAUDIO_PASSWORD` is set to an empty string or `none`, the middleware is bypassed (not recommended for public deployments).
 
-<br>
+### Endpoint map
+
+| Method | Endpoint                | Purpose                                                       | Rate-limit |
+| :----: | :---------------------- | :------------------------------------------------------------ | :--------- |
+| `GET`  | `/health`               | Liveness probe (no auth required)                             | —         |
+| `GET`  | `/v1/stats`             | Version, uptime, active players                               | —         |
+| `POST` | `/v1/voice/join`        | Connect a voice driver to a Discord voice channel             | `RATE_LIMIT_JOINS` |
+| `POST` | `/v1/voice/leave`       | Disconnect & free UDP sockets for a guild                     | —         |
+| `POST` | `/v1/player/play`       | Resolve and enqueue a track, playlist or search query         | `AXAUDIO_MAX_CONCURRENT_RESOLVES` (semaphore) |
+| `POST` | `/v1/player/control`    | Pause / resume / skip / stop / volume / seek / shuffle / loop / remove / move | — |
+| `POST` | `/v1/player/seek`       | Shortcut for `control` with `action: "seek"`                  | —         |
+| `POST` | `/v1/player/shuffle`    | Shortcut for `control` with `action: "shuffle"`               | —         |
+| `POST` | `/v1/player/loop`       | Shortcut for `control` with `action: "loop"`                  | —         |
+| `POST` | `/v1/player/autoplay`   | Enable / disable auto-play when the queue empties             | —         |
+| `POST` | `/v1/player/queue`      | Inspect current track + full upcoming queue                   | —         |
+| `POST` | `/v1/player/eq`         | Set 15-band equaliser or apply a named DSP preset             | —         |
+| `POST` | `/v1/player/dsp`        | Apply the full DSP stack (preset + spatial + modulation + loudness + timescale) | — |
+| `POST` | `/v1/tracks/resolve`    | Resolve metadata + CDN stream URL **without** playing         | `RATE_LIMIT_RESOLVE` |
+| `POST` | `/v1/tracks/search`     | Multi-provider search (auto → YouTube → SoundCloud)           | `RATE_LIMIT_RESOLVE` |
+| `WS`   | `/v1/events`            | Real-time `track_start` / `track_end` / `track_error` events  | —                |
+
+---
+
+### GET `/health`
+
+Liveness probe for Docker `HEALTHCHECK` and load balancers. **No auth required** — safe to expose behind a public LB.
 
 ```http
 GET /health
+```
+
+```json
+{ "success": true, "data": "Motor axAudio operativo", "message": null }
+```
+
+---
+
+### GET `/v1/stats`
+
+Runtime telemetry. `active_players` is the number of currently connected guilds (not total historical joins).
+
+```http
 GET /v1/stats
 ```
 
@@ -317,120 +376,395 @@ GET /v1/stats
   "data": {
     "status": "healthy",
     "version": "0.1.0",
-    "uptime_seconds": 120,
+    "uptime_seconds": 3600,
     "active_players": 1
   },
   "message": null
 }
 ```
 
-</details>
+---
 
-<details>
-<summary><b>Join a voice channel</b></summary>
+### POST `/v1/voice/join`
 
-<br>
+Opens a UDP voice socket for the guild. Must be called **before** any `/v1/player/*` call. Requires the two Discord Gateway payloads:
 
-When Discord dispatches `VOICE_STATE_UPDATE` and `VOICE_SERVER_UPDATE`, forward the session parameters to `axAudio`:
+- `VOICE_STATE_UPDATE` → provides `session_id` and `channel_id`
+- `VOICE_SERVER_UPDATE` → provides `token` and `endpoint`
+
+The `bitrate` of the Opus codec is set from `AUDIO_BITRATE` (default `128000`).
 
 ```http
 POST /v1/voice/join
+Authorization: Bearer <AXAUDIO_PASSWORD>
 Content-Type: application/json
 
 {
-  "guild_id": "123456789012345678",
+  "guild_id":  "123456789012345678",
   "channel_id": "987654321098765432",
-  "session_id": "session_id_from_discord",
-  "token": "voice_token_from_discord",
-  "endpoint": "us-east1234.discord.media",
-  "user_id": "112233445566778899"
+  "session_id": "aX9sF3k2q1m7...",
+  "token":      "MmQ4ZjRmN2...",
+  "endpoint":   "voice-eu-west1.discord.media",
+  "user_id":    "112233445566778899"
 }
 ```
 
-</details>
+**Response**
 
-<details>
-<summary><b>Play a track</b></summary>
+```json
+{ "success": true, "data": "Conectado al canal de voz de Discord", "message": null }
+```
 
-<br>
+**Errors**
 
-Enqueues a direct audio URL, a YouTube URL, or a text search query.
+| HTTP | Cause |
+| :---: | :--- |
+| 400  | `guild_id` / `channel_id` / `user_id` is `0` |
+| 429  | `RATE_LIMIT_JOINS` exceeded for this guild |
+
+---
+
+### POST `/v1/voice/leave`
+
+Stops playback, cancels all pending playlist prefetches, clears the in-memory queue and removes the driver from the in-memory guild table. After this call you **must** call `/v1/voice/join` again to resume.
+
+```http
+POST /v1/voice/leave
+Content-Type: application/json
+
+{ "guild_id": "123456789012345678" }
+```
+
+```json
+{ "success": true, "data": "Desconectado y reproductor limpiado", "message": null }
+```
+
+---
+
+### POST `/v1/player/play`
+
+The main entry point. Three input shapes:
+
+1. **Direct audio URL** (`.mp3`, `.ogg`, Icecast, …) → streamed verbatim, no yt-dlp.
+2. **Spotify URL** (`spotify:track:...`, `open.spotify.com/track/...`) → resolved through Spotify's public embed SSR, no API key needed.
+3. **YouTube URL / text query / `ytsearch:...` / `scsearch:...`** → yt-dlp + cookie pool + PoToken sidecar.
+
+For **playlists and mixes** (URLs with `?list=`, `RD...` prefixes, or a Spotify playlist/album), only the first track is resolved immediately — the rest is enqueued in a background prefetch queue so the first note starts within ~1 s.
 
 ```http
 POST /v1/player/play
+Authorization: Bearer <AXAUDIO_PASSWORD>
 Content-Type: application/json
 
 {
   "guild_id": "123456789012345678",
   "url": "https://www.youtube.com/watch?v=GitbDhOPBGs",
   "volume": 1.0,
-  "format": "ba[format_id=251]/bestaudio",
-  "extractor_args": null,
-  "extra_args": null,
-  "cookies": null
+  "replace": false
 }
 ```
 
-| Field            | Required | Description                                                                                       |
+| Field            | Required | Description                                                                                     |
 | :--------------- | :------: | :------------------------------------------------------------------------------------------------ |
-| `guild_id`       |    ✅    | Target guild.                                                                                     |
-| `url`            |    ✅    | Direct stream (`.mp3`, `.ogg`, ...), YouTube URL, or search query (e.g. `ytsearch:lofi hip hop`). |
-| `volume`         |          | Float from `0.0` to `2.0` (default `1.0`).                                                        |
-| `format`         |          | Audio codec/format override (e.g. `ba[format_id=251]/bestaudio`, `flac/bestaudio/opus`).          |
-| `extractor_args` |          | Per-request override for `yt-dlp --extractor-args`.                                               |
-| `extra_args`     |          | Per-request extra CLI flags for `yt-dlp`.                                                         |
-| `cookies`        |          | Per-request Netscape cookies text or file path.                                                   |
-| `limit`          |          | Optional integer limit for playlist/mix extraction (overrides server defaults).                   |
-| `user_agent`     |          | Optional custom User-Agent for fetching the resolved HTTP stream.                                |
+| `guild_id`       |    ✅    | Target guild. Must already be joined via `/v1/voice/join`.                                        |
+| `url`            |    ✅    | Direct audio URL, YouTube/Spotify URL, or free-text search.                                       |
+| `volume`         |          | `0.0` to `2.0` (multiplied by 0.95 headroom factor internally).                                   |
+| `replace`        |          | `true` clears the queue and stops the current track **before** enqueuing. Default `false`.        |
+| `format`         |          | yt-dlp format selector (e.g. `ba[format_id=251]/bestaudio`). Overrides `YTDLP_FORMAT`.             |
+| `extractor_args` |          | Full override of yt-dlp `--extractor-args`. Advanced.                                              |
+| `extra_args`     |          | Extra raw CLI flags appended to yt-dlp. Blocked: `--exec`, `;`, `&`, `|`, backticks, `$`, newlines.|
+| `cookies`        |          | Netscape cookie file path. Bypasses the pool for this request.                                     |
+| `limit`          |          | Cap on playlist/mix items (overrides `YTDLP_PLAYLIST_MAX`).                                         |
+| `user_agent`     |          | Custom UA for the HTTP stream. **For `googlevideo.com` the yt-dlp UA is used instead** (URL is signed against it). |
 
-</details>
-
-<details>
-<summary><b>Player control (pause, resume, skip, stop, volume)</b></summary>
-
-<br>
-
-```http
-POST /v1/player/control
-Content-Type: application/json
-
-{
-  "guild_id": "123456789012345678",
-  "action": "skip"
-}
-```
-
-| `action` | Effect                                            |
-| :------- | :------------------------------------------------ |
-| `pause`  | Pauses current playback.                          |
-| `resume` | Resumes paused playback.                          |
-| `skip`   | Skips to the next item in the queue.              |
-| `stop`   | Stops playback and clears the queue.              |
-| `volume` | Sets output volume with `value` (`0.0` to `2.0`). |
+**Response (single track)**
 
 ```json
 {
-  "guild_id": "123456789012345678",
-  "action": "volume",
-  "value": 0.5
+  "success": true,
+  "data": {
+    "title": "Daft Punk - One More Time (Official Audio)",
+    "source_url": "https://www.youtube.com/watch?v=FGBhQbmPwH8",
+    "stream_url": "https://rr3---sn-...googlevideo.com/videoplayback?...",
+    "duration_secs": 320,
+    "author": "Daft Punk",
+    "thumbnail": "https://i.ytimg.com/vi/FGBhQbmPwH8/hqdefault.jpg",
+    "is_playlist": false,
+    "playlist_title": null,
+    "playlist_tracks_count": 0,
+    "queue_length": 0,
+    "was_empty": true
+  },
+  "message": null
 }
 ```
 
-</details>
+**Response (playlist — only track 1 resolved, rest prefetched in background)**
 
-<details>
-<summary><b>Resolve track metadata without playing</b></summary>
+```json
+{
+  "success": true,
+  "data": {
+    "title": "Top Hits",
+    "source_url": "https://www.youtube.com/playlist?list=PL...",
+    "stream_url": "https://rr3---sn-...googlevideo.com/videoplayback?...",
+    "duration_secs": 214,
+    "author": "Artist",
+    "thumbnail": "https://i.ytimg.com/vi/.../hqdefault.jpg",
+    "is_playlist": true,
+    "playlist_title": "Top Hits",
+    "playlist_tracks_count": 25,
+    "queue_length": 25,
+    "was_empty": true
+  },
+  "message": null
+}
+```
 
-<br>
+---
+
+### POST `/v1/player/control`
+
+Unified action dispatcher. Each action uses a different field:
+
+| `action` | Field used  | Range / value                                          |
+| :------- | :---------- | :----------------------------------------------------- |
+| `pause`  | —           | —                                                      |
+| `resume` | —           | —                                                      |
+| `stop`   | —           | Clears queue, stops driver                             |
+| `skip`   | —           | Advances to the next queued item                       |
+| `clear`  | —           | Clears the queue (keeps current track)                 |
+| `volume` | `value`     | `0.0` to `2.0`                                         |
+| `seek`   | `position_secs` (or `value`) | Seconds from the start of the track   |
+| `loop`   | `mode`      | `off` / `track` / `queue`                              |
+| `shuffle`| —           | Re-shuffles the upcoming queue (not the current track) |
+| `remove` | `index`     | `0`-based position in the **upcoming** queue           |
+| `move`   | `from_index`, `to_index` | `0`-based positions in the upcoming queue |
+
+`/v1/player/seek`, `/v1/player/shuffle` and `/v1/player/loop` are sugar endpoints that pre-fill `action` for you.
+
+**Examples**
 
 ```http
-POST /v1/tracks/resolve
+# Pause
+POST /v1/player/control
+{ "guild_id": "1234", "action": "pause" }
+
+# Set volume to 70%
+POST /v1/player/control
+{ "guild_id": "1234", "action": "volume", "value": 0.7 }
+
+# Seek to 45 s
+POST /v1/player/control
+{ "guild_id": "1234", "action": "seek", "position_secs": 45 }
+
+# Loop current track
+POST /v1/player/control
+{ "guild_id": "1234", "action": "loop", "mode": "track" }
+
+# Remove track #2 from the upcoming queue (0-based)
+POST /v1/player/control
+{ "guild_id": "1234", "action": "remove", "index": 2 }
+
+# Move track #1 to position #3
+POST /v1/player/control
+{ "guild_id": "1234", "action": "move", "from_index": 1, "to_index": 3 }
+```
+
+**Response**
+
+```json
+{ "success": true, "data": "Reproductor pausado", "message": null }
+```
+
+---
+
+### POST `/v1/player/autoplay`
+
+Enables / disables **auto-play**: when the queue empties, axAudio pulls the next track from the most recent playlist (or continues the current Mix / Radio) without the client asking.
+
+```http
+POST /v1/player/autoplay
+Content-Type: application/json
+
+# Explicit enable
+{ "guild_id": "1234", "enabled": true }
+
+# Toggle (no `enabled` field)
+{ "guild_id": "1234" }
+```
+
+**Response**
+
+```json
+{ "success": true, "data": true, "message": null }
+```
+
+---
+
+### POST `/v1/player/queue`
+
+Returns the **current** track (at the head), the full **upcoming** queue — including tracks still pending resolution — and the current playback position.
+
+```http
+POST /v1/player/queue
+Content-Type: application/json
+
+{ "guild_id": "123456789012345678" }
+```
+
+**Response**
+
+```json
+{
+  "success": true,
+  "data": {
+    "guild_id": 123456789012345678,
+    "is_playing": true,
+    "current": {
+      "title": "Top Hits — #1",
+      "source_url": "https://www.youtube.com/watch?v=abc",
+      "stream_url": "https://rr3---sn-...googlevideo.com/videoplayback?...",
+      "duration_secs": 214,
+      "author": "Artist A",
+      "thumbnail": "https://i.ytimg.com/vi/abc/hqdefault.jpg"
+    },
+    "current_position_secs": 47.3,
+    "loop_mode": "off",
+    "autoplay": false,
+    "queue": [
+      { "title": "[Pendiente] Top Hits — #2", "source_url": "https://www.youtube.com/watch?v=def", "stream_url": "", "duration_secs": 190, "author": "Artist B", "thumbnail": "https://i.ytimg.com/vi/def/hqdefault.jpg" },
+      { "title": "Top Hits — #3", "source_url": "https://www.youtube.com/watch?v=ghi", "stream_url": "https://rr3---sn-...googlevideo.com/videoplayback?...", "duration_secs": 240, "author": "Artist C", "thumbnail": "https://i.ytimg.com/vi/ghi/hqdefault.jpg" }
+    ],
+    "total_tracks": 3
+  },
+  "message": null
+}
+```
+
+> Items in the queue with `[Pendiente]` prefix are not yet resolved to a CDN URL — they will be auto-resolved as the prefetch engine approaches them.
+
+---
+
+### POST `/v1/player/eq`
+
+Applies the 15-band equaliser or a named DSP preset. Use **either** `preset` **or** `bands`, not both (`bands` wins when both are sent).
+
+```http
+POST /v1/player/eq
+Content-Type: application/json
+
+# Option A: apply a named preset
+{ "guild_id": "1234", "preset": "bass-boost-3d" }
+
+# Option B: custom per-band gains (decibel values -15 to +15)
+{
+  "guild_id": "1234",
+  "bands": [
+    { "band": 0,  "gain_db":  6.0 },
+    { "band": 1,  "gain_db":  4.0 },
+    { "band": 2,  "gain_db":  2.0 },
+    { "band": 13, "gain_db":  3.0 },
+    { "band": 14, "gain_db":  5.0 }
+  ]
+}
+```
+
+**Band frequencies** (15 bands, IEC R125 centred): `25 Hz, 40, 63, 100, 160, 250, 400, 630, 1k, 1.6k, 2.5k, 4k, 6.3k, 10k, 16k`.
+
+**Response**
+
+```json
+{
+  "success": true,
+  "data": {
+    "guild_id": 1234,
+    "status": {
+      "active_preset": "bass-boost-3d",
+      "eq_bands": [6.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "stereo_width": 1.35,
+      "rotation": false,
+      "tremolo": false,
+      "vibrato": false,
+      "loudness": false,
+      "target_lufs": -14.0,
+      "speed": 1.0,
+      "pitch": 1.0,
+      "rate": 1.0
+    },
+    "message": "Preset 'bass-boost-3d' aplicado: Sub-graves acentuados, campo estéreo 1.35x"
+  },
+  "message": null
+}
+```
+
+---
+
+### POST `/v1/player/dsp`
+
+Full-featured DSP control. Accepts a `preset` and/or any combination of `spatial`, `modulation`, `loudness`, `timescale`, and `bands` — all sub-objects are optional and merged into the guild's parameter block.
+
+```http
+POST /v1/player/dsp
 Content-Type: application/json
 
 {
-  "query": "https://www.youtube.com/watch?v=GitbDhOPBGs"
+  "guild_id": "1234",
+  "preset": "8d",
+
+  "spatial": {
+    "stereo_width": 1.35,
+    "binaural_crossfeed": true,
+    "crossfeed_level": 0.20,
+    "bass_exciter": true,
+    "bass_exciter_drive": 0.35
+  },
+
+  "modulation": {
+    "rotation": true,
+    "rotation_speed_hz": 0.15,
+    "tremolo": false,
+    "vibrato": false
+  },
+
+  "loudness": {
+    "enabled": true,
+    "target_lufs": -14.0,
+    "max_gain_db": 9.0,
+    "min_gain_db": -12.0
+  },
+
+  "timescale": {
+    "speed": 1.0,
+    "pitch": 1.0,
+    "rate": 1.0
+  }
 }
 ```
+
+**Valid preset names** (all lowercase, hyphens): `music`, `bass-boost-3d`, `bass-boost`, `bass`, `cinema-3d`, `dolby-atmos`, `vocal-clarity`, `vocal`, `gaming-3d`, `concert-hall`, `nightcore`, `vaporwave`, `8d`, `tremolo`, `vibrato`, `broadcast`, `flat`.
+
+**Response shape** — identical to `/v1/player/eq`.
+
+---
+
+### POST `/v1/tracks/resolve`
+
+Resolve a query to metadata + a **direct CDN stream URL** **without** enqueuing. Useful for:
+
+- Building custom players outside Discord
+- Pre-emptively warming the cache before `/v1/player/play`
+- Inspecting what format/codec axAudio will pick
+
+```http
+POST /v1/tracks/resolve
+Authorization: Bearer <AXAUDIO_PASSWORD>
+Content-Type: application/json
+
+{ "query": "https://www.youtube.com/watch?v=GitbDhOPBGs" }
+```
+
+**Response**
 
 ```json
 {
@@ -448,16 +782,21 @@ Content-Type: application/json
 ```
 
 > [!TIP]
-> **Standalone Apps (Non-Discord)**: You can pass `"format": "flac/bestaudio/best"` or `"format": "ba[ext=mp3]"` in the JSON body to request high-res or custom audio codecs directly.
+> **Standalone apps**: pass `"format": "flac/bestaudio/best"` or `"format": "ba[ext=mp3]"` to force a specific codec. The returned `stream_url` can be fed directly to `ffmpeg` / `mpv` / a Web Audio player.
 
-</details>
+---
 
-<details>
-<summary><b>Fast multi-source track search (YouTube + SoundCloud fallback)</b></summary>
+### POST `/v1/tracks/search`
 
-<br>
+Multi-provider search with flat metadata (~1 s typical). `source` selects the provider strategy:
 
-Searches across providers with flat metadata extraction in ~1s. If YouTube fails or returns 0 results, it automatically cascades to SoundCloud without downtime:
+| `source` | Behaviour |
+| :------- | :------- |
+| `auto`   (default) | 1) YouTube InnerTube (native, ~30 ms) → 2) yt-dlp `ytsearch` → 3) `scsearch` SoundCloud |
+| `youtube`         | 1) InnerTube → 2) yt-dlp `ytsearch` (no SoundCloud fallback) |
+| `soundcloud`      | SoundCloud only (`scsearch:`) |
+
+`limit` is clamped to `1..25` (matches `YTDLP_PLAYLIST_MAX`).
 
 ```http
 POST /v1/tracks/search
@@ -469,6 +808,8 @@ Content-Type: application/json
   "source": "auto"
 }
 ```
+
+**Response**
 
 ```json
 {
@@ -490,23 +831,58 @@ Content-Type: application/json
 }
 ```
 
-</details>
+To play a search result, take `tracks[0].url` and send it to `/v1/player/play`.
 
-<details>
-<summary><b>Leave a voice channel</b></summary>
+---
 
-<br>
+### WS `/v1/events`
 
-```http
-POST /v1/voice/leave
-Content-Type: application/json
+Real-time player telemetry. Open a WebSocket, and axAudio pushes a JSON message every time a track starts, ends, or errors. Useful for building "Now Playing" panels, auto-responding to errors, or driving an external queue UI.
 
+**Connection**
+
+```
+GET /v1/events HTTP/1.1
+Upgrade: websocket
+Connection: Upgrade
+```
+
+**Message schema** (tagged union on `type`)
+
+```json
 {
-  "guild_id": "123456789012345678"
+  "type": "track_start",
+  "guild_id": 123456789012345678,
+  "track": {
+    "title": "One More Time",
+    "source_url": "https://www.youtube.com/watch?v=FGBhQbmPwH8",
+    "stream_url": "https://rr3---sn-...googlevideo.com/videoplayback?...",
+    "duration_secs": 320,
+    "author": "Daft Punk",
+    "thumbnail": "https://i.ytimg.com/vi/FGBhQbmPwH8/hqdefault.jpg"
+  }
 }
 ```
 
-</details>
+```json
+{
+  "type": "track_end",
+  "guild_id": 123456789012345678,
+  "track": { "title": "One More Time", "...": "..." },
+  "reason": "Track completed naturally"
+}
+```
+
+```json
+{
+  "type": "track_error",
+  "guild_id": 123456789012345678,
+  "track": { "title": "One More Time", "...": "..." },
+  "error": "Errored(Create(Fail(\"failed with http status code: 403 Forbidden\")))"
+}
+```
+
+**Keep-alive**: axAudio sends a WS `Ping` frame every 30 s. Your client must reply with `Pong` or the connection is dropped. If you fall behind, axAudio emits a synthetic `{"type":"resync","missed_events":N}` message — treat it as a cue to refetch `/v1/player/queue` to resync state.
 
 ## 🛡️ YouTube Anti-Bot & BotGuard
 

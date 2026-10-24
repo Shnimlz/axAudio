@@ -636,7 +636,29 @@ async fn create_track_with_dsp(
     dsp_params: Arc<std::sync::RwLock<DspParams>>,
     custom_user_agent: Option<&str>,
 ) -> Track {
-    let client = if let Some(ua) = custom_user_agent {
+    let is_google_cdn = stream_url.contains("googlevideo.com")
+        || stream_url.contains("googleapis.com/videoplayback");
+
+    // Prioridad de User-Agent: la devuelta por yt-dlp (meta.stream_headers) > custom
+    // del payload > default del AppState. La primera es la con la que se firmó la
+    // URL y es la única que googlevideo.com acepta.
+    let meta_ua: Option<String> = meta
+        .stream_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("User-Agent"))
+        .map(|(_, v)| v.clone());
+
+    let client = if is_google_cdn {
+        let ua = meta_ua
+            .or_else(|| custom_user_agent.map(|s| s.to_string()))
+            .unwrap_or_else(|| {
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36".to_string()
+            });
+        reqwest::Client::builder()
+            .user_agent(ua)
+            .build()
+            .unwrap_or_else(|_| http_client.clone())
+    } else if let Some(ua) = custom_user_agent {
         reqwest::Client::builder()
             .user_agent(ua)
             .build()
@@ -645,7 +667,30 @@ async fn create_track_with_dsp(
         http_client.clone()
     };
 
-    let source = HttpRequest::new(client.clone(), stream_url.clone());
+    // Inyectar los headers que yt-dlp devolvió (`http_headers`). Es crítico para
+    // streams firmados de YouTube (googlevideo.com / videoplayback): la URL está
+    // firmada contra el `User-Agent` (y a veces `Client-Context`) que el extractor
+    // usó para obtenerla. Enviar una UA genérica (la de state.http_client) provoca
+    // 403 Forbidden al reproducir, reintentar o hacer Range requests sobre el stream.
+    let mut headers: reqwest::header::HeaderMap = reqwest::header::HeaderMap::new();
+    for (k, v) in &meta.stream_headers {
+        if k.eq_ignore_ascii_case("Content-Length") {
+            // content_length se maneja vía HttpRequest::content_length para que
+            // songbird construya `Range: bytes=0-{max}` correctamente.
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            k.parse::<reqwest::header::HeaderName>(),
+            v.parse::<reqwest::header::HeaderValue>(),
+        ) {
+            headers.insert(name, val);
+        }
+    }
+
+    let mut source = HttpRequest::new_with_headers(client.clone(), stream_url.clone(), headers);
+    if let Some(len) = meta.stream_content_length {
+        source.content_length = Some(len);
+    }
     let input: songbird::input::Input = source.into();
 
     match input

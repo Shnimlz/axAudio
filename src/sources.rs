@@ -31,6 +31,15 @@ pub struct TrackMetadata {
     pub thumbnail: Option<String>,
     #[serde(default)]
     pub skip_segments: Vec<SkipSegment>,
+    /// HTTP headers returned por yt-dlp (`http_headers`) que el CDN (googlevideo.com)
+    /// exige para validar la firma de la URL. Sin estos (especialmente `User-Agent`),
+    /// Google responde 403 Forbidden al consumir el stream.
+    #[serde(default)]
+    pub stream_headers: Vec<(String, String)>,
+    /// `content_length` del format de yt-dlp. Songbird lo usa para construir
+    /// `Range: bytes=0-{max}` que GoogleVideo espera.
+    #[serde(default)]
+    pub stream_content_length: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -635,6 +644,25 @@ impl SourceResolver {
             Vec::new()
         };
 
+        // Recuperar `http_headers` (User-Agent, Client-Context, etc.) y `content_length`
+        // del formato de yt-dlp. GoogleVideo firma la URL contra estos headers; sin ellos
+        // el CDN rechaza la descarga con 403.
+        let stream_headers: Vec<(String, String)> = val
+            .get("http_headers")
+            .or_else(|| entries_first.and_then(|e| e.get("http_headers")))
+            .and_then(|h| h.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let stream_content_length = val
+            .get("content_length")
+            .or_else(|| entries_first.and_then(|e| e.get("content_length")))
+            .and_then(|c| c.as_u64());
+
         Ok(TrackMetadata {
             title,
             source_url,
@@ -643,6 +671,8 @@ impl SourceResolver {
             author,
             thumbnail,
             skip_segments,
+            stream_headers,
+            stream_content_length,
         })
     }
 
@@ -684,6 +714,8 @@ impl SourceResolver {
                 author: None,
                 thumbnail: None,
                 skip_segments: Vec::new(),
+                stream_headers: Vec::new(),
+                stream_content_length: None,
             });
         }
 
@@ -1708,6 +1740,8 @@ impl SourceResolver {
                 author: None,
                 thumbnail: None,
                 skip_segments: Vec::new(),
+                stream_headers: Vec::new(),
+                stream_content_length: None,
             };
             return Ok(ResolvedPlaylistBatch {
                 first_track: meta,

@@ -175,6 +175,20 @@ axAudio employs an asynchronous **two-stage pipeline**:
 
 ---
 
+## 6. Signed-Stream 403 Prevention (YouTube CDN)
+
+YouTube CDN streams (`googlevideo.com`, `*.googleapis.com/videoplayback`) are URL-signed and **bound to the `User-Agent` (and in some formats `Client-Context`) that yt-dlp used to obtain them**. If the audio engine streams with a generic UA, Google re-validates the signature on the first request (or on any subsequent `Range` request after a pause/resume) and rejects it with **403 Forbidden** — the classic "TrackError detectado (posible 403 o corte de CDN)" event.
+
+axAudio prevents this at three layers:
+
+1. **Header preservation** — `SourceResolver::run_single_track_cmd` captures `http_headers` and `content_length` from yt-dlp's `--dump-single-json` output into `TrackMetadata.stream_headers` / `TrackMetadata.stream_content_length`.
+2. **UA-pinned client** — `create_track_with_dsp` builds the streaming client with the yt-dlp UA taking priority over any client-supplied `user_agent` payload value (yt-dlp's is the one the URL was signed with).
+3. **Correct Range framing** — `songbird::input::HttpRequest::new_with_headers` receives the full header map (minus `Content-Length`) and the `content_length` field, so range requests are sent as `bytes=0-{max}`, which `googlevideo.com` expects.
+
+The auto-heal path (`TrackErrorNotifier`) is kept as a last-resort: on a `TrackError` it purges the resolver cache and re-resolves the track with a fresh CDN URL.
+
+---
+
 ## 6. In-Memory Stream URL Caching
 
 YouTube video stream URLs (`googlevideo.com`) remain valid for up to 6 hours. axAudio caches resolved streams in a high-speed concurrent `DashMap` with a **4-hour Time-To-Live (TTL)**:
