@@ -1,6 +1,7 @@
 mod dsp;
 mod handlers;
 mod models;
+mod rate_limiter;
 mod sources;
 mod state;
 

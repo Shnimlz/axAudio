@@ -120,6 +120,8 @@ pub struct QueuePayload {
 
 #[derive(Debug, Deserialize)]
 pub struct ResolvePayload {
+    #[serde(deserialize_with = "deserialize_u64_flexible")]
+    pub guild_id: u64,
     pub query: String,
     pub extractor_args: Option<String>,
     pub extra_args: Option<String>,
@@ -131,6 +133,8 @@ pub struct ResolvePayload {
 
 #[derive(Debug, Deserialize)]
 pub struct SearchPayload {
+    #[serde(deserialize_with = "deserialize_u64_flexible")]
+    pub guild_id: u64,
     pub query: String,
     pub limit: Option<usize>,
     pub source: Option<String>, // "auto" (default), "youtube", "soundcloud"

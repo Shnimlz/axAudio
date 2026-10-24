@@ -8,6 +8,7 @@ use tokio::sync::broadcast;
 
 use crate::dsp::DspParams;
 use crate::models::{LoopMode, PlayerEvent};
+use crate::rate_limiter::RateLimiter;
 use crate::sources::{FlatPlaylistItem, SourceResolver, TrackMetadata};
 
 #[derive(Clone, Debug, Default)]
@@ -38,6 +39,7 @@ pub struct AppState {
     pub guild_play_options: Arc<DashMap<u64, GuildPlayOptions>>,
     pub event_tx: broadcast::Sender<PlayerEvent>,
     pub auth_token: Option<Arc<String>>,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -45,6 +47,12 @@ impl AppState {
         // Buffer aumentado de 256 a 8192 para reducir eventos droppeados
         // cuando hay múltiples clientes WebSocket lentos.
         let (event_tx, _) = broadcast::channel(8192);
+        
+        // Rate limiter configurado por environment variables (defaults seguros para producción)
+        let rate_limiter = Arc::new(RateLimiter::new(
+            crate::rate_limiter::RateLimitConfig::from_env()
+        ));
+        
         let auth_token = match std::env::var("AXAUDIO_PASSWORD") {
             Ok(val) => {
                 let trimmed = val.trim().to_string();
@@ -82,6 +90,7 @@ impl AppState {
             guild_play_options: Arc::new(DashMap::new()),
             event_tx,
             auth_token,
+            rate_limiter,
         }
     }
 

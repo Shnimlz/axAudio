@@ -462,6 +462,14 @@ pub async fn resolve_track(
     State(state): State<AppState>,
     Json(payload): Json<ResolvePayload>,
 ) -> Result<Json<ApiResponse<TrackResponse>>, (StatusCode, Json<ApiResponse<TrackResponse>>)> {
+    // Rate limit: verificar antes de ejecutar yt-dlp
+    if let Err(e) = state.rate_limiter.check_resolve(payload.guild_id) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiResponse::err(format!("Rate limit excedido: {}", e))),
+        ));
+    }
+
     match state
         .resolver
         .resolve(
@@ -498,6 +506,14 @@ pub async fn search_tracks(
     State(state): State<AppState>,
     Json(payload): Json<SearchPayload>,
 ) -> Result<Json<ApiResponse<SearchResponse>>, (StatusCode, Json<ApiResponse<SearchResponse>>)> {
+    // Rate limit: verificar antes de ejecutar yt-dlp
+    if let Err(e) = state.rate_limiter.check_resolve(payload.guild_id) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiResponse::err(format!("Rate limit excedido: {}", e))),
+        ));
+    }
+
     let limit = payload.limit.unwrap_or(5);
     let source = payload.source.as_deref().unwrap_or("auto");
 
@@ -539,6 +555,14 @@ pub async fn voice_join(
         Some(id) => id,
         None => return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::err("guild_id inválido: 0")))),
     };
+
+    // Rate limit: verificar antes de abrir sockets UDP
+    if let Err(e) = state.rate_limiter.check_join(payload.guild_id) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiResponse::err(format!("Rate limit excedido: {}", e))),
+        ));
+    }
 
     let channel_id = match NonZeroU64::new(payload.channel_id) {
         Some(id) => id,
