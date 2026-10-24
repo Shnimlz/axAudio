@@ -1,1 +1,5 @@
 /target
+.continuerules
+.cursorrules
+.github/copilot-instructions.md
+.mcp.json

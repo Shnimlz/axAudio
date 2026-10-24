@@ -42,7 +42,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let (event_tx, _) = broadcast::channel(256);
+        // Buffer aumentado de 256 a 8192 para reducir eventos droppeados
+        // cuando hay múltiples clientes WebSocket lentos.
+        let (event_tx, _) = broadcast::channel(8192);
         let auth_token = match std::env::var("AXAUDIO_PASSWORD") {
             Ok(val) => {
                 let trimmed = val.trim().to_string();
@@ -188,11 +190,14 @@ impl AppState {
         self.last_activity.insert(guild_id, Instant::now());
     }
 
+    /// Retorna la última actividad del guild.
+    /// Si no hay entrada, retorna `Instant::now() - Duration::MAX` (prácticamente el inicio del runtime),
+    /// lo que hace que el GC detecte inmediatamente el guild como inactivo.
     pub fn get_last_activity(&self, guild_id: u64) -> Instant {
         self.last_activity
             .get(&guild_id)
             .map(|t| *t.value())
-            .unwrap_or_else(Instant::now)
+            .unwrap_or_else(|| Instant::now() - std::time::Duration::MAX)
     }
 }
 

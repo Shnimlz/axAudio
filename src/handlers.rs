@@ -1674,9 +1674,28 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
     let state_clone = state.clone();
     let driver_clone = driver_ref.clone();
 
+    // CleanupGuard: asegura que end_prefetch se llame siempre al salir del scope,
+    // incluso si el tokio::spawn panica. Esto previene la fuga del flag prefetching_guilds.
+    let guard_guild_id = guild_id;
+    let state_clone_for_guard = state_clone.clone();
+
     tokio::spawn(async move {
+        struct CleanupGuard {
+            guild_id: u64,
+            state: AppState,
+        }
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                self.state.end_prefetch(self.guild_id);
+            }
+        }
+        let _guard = CleanupGuard {
+            guild_id: guard_guild_id,
+            state: state_clone_for_guard,
+        };
+
         info!(
-            guild = guild_id,
+            guild = guard_guild_id,
             next_title = %next_item.title,
             trigger = %reason,
             "Prefetch anticipado activado: resolviendo y precalentando flujo de audio (gapless)..."
@@ -1695,8 +1714,8 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
 
         match resolve_res {
             Ok(track) => {
-                let dsp_params = state_clone.get_dsp_params(guild_id);
-                let target_vol = state_clone.get_volume(guild_id);
+                let dsp_params = state_clone.get_dsp_params(guard_guild_id);
+                let target_vol = state_clone.get_volume(guard_guild_id);
                 let effective_vol = (target_vol * 0.95).clamp(0.0, 2.0);
                 let track_meta = Arc::new(track.clone());
 
@@ -1717,26 +1736,26 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
                 };
 
                 attach_track_events(
-                    guild_id,
+                    guard_guild_id,
                     track_meta,
                     &handle,
                     &state_clone.event_tx,
                     Some(state_clone.clone()),
                 );
 
-                if state_clone.get_loop_mode(guild_id) == LoopMode::Track {
+                if state_clone.get_loop_mode(guard_guild_id) == LoopMode::Track {
                     let _ = handle.enable_loop();
                 }
 
                 info!(
-                    guild = guild_id,
+                    guild = guard_guild_id,
                     title = %track.title,
                     "Prefetch exitoso: decodificador y stream listos en cola Songbird (transición gapless)"
                 );
             }
             Err(err) => {
                 warn!(
-                    guild = guild_id,
+                    guild = guard_guild_id,
                     url = %next_item.url,
                     title = %next_item.title,
                     error = %err,
@@ -1744,8 +1763,7 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
                 );
             }
         }
-
-        state_clone.end_prefetch(guild_id);
+        // _guard se destruye aquí, llamando end_prefetch automáticamente
     });
 }
 
