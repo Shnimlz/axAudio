@@ -214,6 +214,12 @@ impl SourceResolver {
             || matches!(Self::parse_spotify_url(q), Some(SpotifyEntity::Playlist(_)) | Some(SpotifyEntity::Album(_)))
     }
 
+    /// Detecta si una URL o consulta es un Mix o Radio dinámica de YouTube (list=RD...)
+    pub fn is_youtube_mix_url(query: &str) -> bool {
+        let q = query.trim();
+        q.contains("list=RD") || q.contains("list=UL")
+    }
+
     /// Extrae la URL del primer video si está presente en el parámetro `v=` o formato youtu.be
     pub fn extract_video_url(url: &str) -> Option<String> {
         if let Some(pos) = url.find("v=") {
@@ -331,6 +337,10 @@ impl SourceResolver {
 
         let playlist_max = if let Some(m) = max_items {
             m.to_string()
+        } else if Self::is_youtube_mix_url(query_trimmed) {
+            std::env::var("YTDLP_PLAYLIST_MIX_MAX")
+                .or_else(|_| std::env::var("YTDLP_PLAYLIST_MAX"))
+                .unwrap_or_else(|_| "25".to_string())
         } else {
             std::env::var("YTDLP_PLAYLIST_MAX").unwrap_or_else(|_| "25".to_string())
         };
@@ -1684,6 +1694,7 @@ impl SourceResolver {
         custom_extra_args: Option<&str>,
         custom_cookies: Option<&str>,
         custom_format: Option<&str>,
+        limit: Option<usize>,
     ) -> Result<ResolvedPlaylistBatch, String> {
         let query_trimmed = query.trim();
 
@@ -1776,7 +1787,7 @@ impl SourceResolver {
         if let Some(first_video_url) = Self::extract_video_url(query_trimmed) {
             info!(v_url = %first_video_url, "Extrayendo primera pista y lista plana de forma secuencial y controlada...");
             let first_track = self.resolve_single(&first_video_url, custom_extractor_args, custom_extra_args, custom_cookies, custom_format).await?;
-            let flat_playlist = self.resolve_flat_playlist(query_trimmed, custom_extractor_args, custom_extra_args, custom_cookies).await?;
+            let flat_playlist = self.resolve_flat_playlist_with_limit(query_trimmed, custom_extractor_args, custom_extra_args, custom_cookies, limit).await?;
 
             let mut remaining = flat_playlist.entries;
             // Remover la primera canción de los pendientes para no duplicar
@@ -1802,7 +1813,7 @@ impl SourceResolver {
         // 3. Playlist pura sin video específico (ej. playlist?list=PL...)
         info!(query = %query_trimmed, "Extrayendo flat-playlist de lista pura...");
         let mut flat_playlist = self
-            .resolve_flat_playlist(query_trimmed, custom_extractor_args, custom_extra_args, custom_cookies)
+            .resolve_flat_playlist_with_limit(query_trimmed, custom_extractor_args, custom_extra_args, custom_cookies, limit)
             .await?;
 
         if flat_playlist.entries.is_empty() {

@@ -655,6 +655,7 @@ pub async fn player_play(
             payload.extra_args.as_deref(),
             payload.cookies.as_deref(),
             payload.format.as_deref(),
+            payload.limit,
         )
         .await
     {

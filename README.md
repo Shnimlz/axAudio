@@ -272,6 +272,8 @@ Everything is configurable through environment variables or a `.env` file.
 | `YTDLP_COOKIES`           | _none_                                 | Raw Netscape cookie content or path override.                         |
 | `YTDLP_FORMAT`            | `ba[format_id=251]/ba[acodec=opus]...` | Prefers YouTube's native 48 kHz Opus stream (format 251).             |
 | `YTDLP_DEFAULT_SEARCH`    | `ytsearch:`                            | Search provider prefix for text queries.                              |
+| `YTDLP_PLAYLIST_MAX`      | `25`                                   | Maximum tracks resolved from a standard YouTube playlist.            |
+| `YTDLP_PLAYLIST_MIX_MAX`  | _auto (YTDLP_PLAYLIST_MAX)_            | Maximum tracks resolved from dynamic YouTube Mixes / Radios (`RD...`). |
 | `YTDLP_REMOTE_COMPONENTS`         | `ejs:github`                           | EJS remote solver source. Set to `none` to disable.                   |
 | `YTDLP_JS_RUNTIMES`               | `quickjs,deno`                         | Preferred JavaScript challenge runtimes (QuickJS primary, Deno fallback). |
 | `YTDLP_PLAYER_CLIENTS`            | `android,web`                          | Priority order for YouTube player clients (Android avoids JS cipher).  |
@@ -377,6 +379,7 @@ Content-Type: application/json
 | `extractor_args` |          | Per-request override for `yt-dlp --extractor-args`.                                               |
 | `extra_args`     |          | Per-request extra CLI flags for `yt-dlp`.                                                         |
 | `cookies`        |          | Per-request Netscape cookies text or file path.                                                   |
+| `limit`          |          | Optional integer limit for playlist/mix extraction (overrides server defaults).                   |
 
 </details>
 
