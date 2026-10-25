@@ -182,6 +182,36 @@ impl SourceResolver {
         None
     }
 
+    /// Aplica los argumentos de extractor por defecto (PO tokens + player clients + authcheck).
+    /// La sintaxis `youtube:pot_bgutil_webpo` es la que yt-dlp (≥2026) reconoce; la antigua
+    /// `youtubepot-bgutilhttp` se ignora en silencio y el token GVS nunca se solicita.
+    fn apply_extractor_defaults(
+        cmd: &mut Command,
+        custom_extractor_args: Option<&str>,
+        cookie_path: Option<&str>,
+    ) {
+        if let Some(args) = custom_extractor_args {
+            cmd.arg("--extractor-args").arg(args);
+        } else if let Ok(env_args) = std::env::var("YTDLP_EXTRACTOR_ARGS") {
+            cmd.arg("--extractor-args").arg(env_args);
+        } else {
+            let pot_provider_url = std::env::var("BGUTIL_POT_URL")
+                .unwrap_or_else(|_| "http://bgutil-pot:4416".to_string());
+            // Con cookies, `tv_embedded` es el cliente más estable desde IP datacenter;
+            // `mweb` queda a merced del experimento SABR de YouTube (yt-dlp #17666).
+            let default_clients = std::env::var("YTDLP_PLAYER_CLIENTS")
+                .unwrap_or_else(|_| if cookie_path.is_some() { "tv_embedded".to_string() } else { "tv_embedded,mweb".to_string() });
+            cmd.arg("--extractor-args")
+                .arg(format!("youtube:pot_bgutil_webpo:base_url={}", pot_provider_url))
+                .arg("--extractor-args")
+                .arg(format!("youtube:player_client={}", default_clients));
+            // Con cookies presentes, yt-dlp exige saltar el auth-check en playlists.
+            if cookie_path.is_some() {
+                cmd.arg("--extractor-args").arg("youtubetab:skip=authcheck");
+            }
+        }
+    }
+
     /// Filtra argumentos de CLI para prevenir inyección de comandos arbitrarios
     fn is_safe_extra_arg(arg: &str) -> bool {
         let lower = arg.to_lowercase();
@@ -368,20 +398,7 @@ impl SourceResolver {
             cmd.arg("--js-runtimes").arg(js_runtimes);
         }
 
-        if let Some(args) = custom_extractor_args {
-            cmd.arg("--extractor-args").arg(args);
-        } else if let Ok(env_args) = std::env::var("YTDLP_EXTRACTOR_ARGS") {
-            cmd.arg("--extractor-args").arg(env_args);
-        } else {
-            let pot_provider_url = std::env::var("BGUTIL_POT_URL")
-                .unwrap_or_else(|_| "http://bgutil-pot:4416".to_string());
-            let default_clients = std::env::var("YTDLP_PLAYER_CLIENTS")
-                .unwrap_or_else(|_| if cookie_path.is_some() { "mweb,default".to_string() } else { "mweb,tv_embedded".to_string() });
-            cmd.arg("--extractor-args")
-                .arg(format!("youtubepot-bgutilhttp:base_url={}", pot_provider_url))
-                .arg("--extractor-args")
-                .arg(format!("youtube:player_client={}", default_clients));
-        }
+        Self::apply_extractor_defaults(&mut cmd, custom_extractor_args, cookie_path);
 
         if let Some(path) = cookie_path {
             cmd.arg("--cookies").arg(path);
@@ -525,20 +542,7 @@ impl SourceResolver {
             cmd.arg("--js-runtimes").arg(js_runtimes);
         }
 
-        if let Some(args) = custom_extractor_args {
-            cmd.arg("--extractor-args").arg(args);
-        } else if let Ok(env_args) = std::env::var("YTDLP_EXTRACTOR_ARGS") {
-            cmd.arg("--extractor-args").arg(env_args);
-        } else {
-            let pot_provider_url = std::env::var("BGUTIL_POT_URL")
-                .unwrap_or_else(|_| "http://bgutil-pot:4416".to_string());
-            let default_clients = std::env::var("YTDLP_PLAYER_CLIENTS")
-                .unwrap_or_else(|_| if cookie_path.is_some() { "mweb,default".to_string() } else { "mweb,tv_embedded".to_string() });
-            cmd.arg("--extractor-args")
-                .arg(format!("youtubepot-bgutilhttp:base_url={}", pot_provider_url))
-                .arg("--extractor-args")
-                .arg(format!("youtube:player_client={}", default_clients));
-        }
+        Self::apply_extractor_defaults(&mut cmd, custom_extractor_args, cookie_path);
 
         if let Some(path) = cookie_path {
             cmd.arg("--cookies").arg(path);
