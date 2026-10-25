@@ -1,7 +1,8 @@
 //! Módulo de Procesamiento de Señales Digitales (DSP) de axAudio
 //!
-//! Integra ecualización de 15 bandas, expansión espacial Mid/Side,
-//! modelado acústico 3D y limitador analógico soft-clip.
+//! Pipeline de 7 etapas: EQ de 15 bandas → Spatial Mid/Side 3D → Reverb FDN
+//! (Chowning) → Modulación dinámica (Vibrato/Tremolo/Flanger/Chorus/Phaser/8D
+//! Rotation) → Normalización EBU R128 → Soft-Knee Peak Limiter.
 
 #![allow(unused_imports, dead_code)]
 
@@ -11,6 +12,7 @@ pub mod equalizer;
 pub mod loudness;
 pub mod modulation;
 pub mod presets;
+pub mod reverb;
 pub mod spatial;
 pub mod timescale;
 
@@ -19,9 +21,11 @@ pub use decoder::{inject_dsp, DspDecoder};
 pub use equalizer::{BandSetting, Equalizer, EQ_FREQUENCIES};
 pub use loudness::{LoudnessNormalizer, LoudnessSettings};
 pub use modulation::{
-    ModulationProcessor, ModulationSettings, RotationProcessor, TremoloProcessor, VibratoProcessor,
+    ChorusProcessor, FlangerProcessor, ModulationProcessor, ModulationSettings, PhaserProcessor,
+    RotationProcessor, TremoloProcessor, VibratoProcessor,
 };
 pub use presets::{apply_preset, apply_preset_to_params, get_preset, DspPreset};
+pub use reverb::{ReverbProcessor, ReverbSettings};
 pub use spatial::{SpatialProcessor, SpatialSettings};
 pub use timescale::{TimescaleProcessor, TimescaleSettings};
 
@@ -32,6 +36,8 @@ use serde::{Deserialize, Serialize};
 pub struct DspParams {
     pub gains_db: [f32; 15],
     pub spatial: SpatialSettings,
+    #[serde(default)]
+    pub reverb: ReverbSettings,
     pub modulation: ModulationSettings,
     pub loudness: LoudnessSettings,
     pub timescale: TimescaleSettings,
@@ -44,6 +50,7 @@ impl Default for DspParams {
         Self {
             gains_db: [0.0; 15],
             spatial: SpatialSettings::default(),
+            reverb: ReverbSettings::default(),
             modulation: ModulationSettings::default(),
             loudness: LoudnessSettings::default(),
             timescale: TimescaleSettings::default(),
@@ -79,6 +86,12 @@ impl DspParams {
         self.version += 1;
     }
 
+    pub fn set_reverb(&mut self, reverb: ReverbSettings) {
+        self.reverb = reverb;
+        self.active_preset = None;
+        self.version += 1;
+    }
+
     pub fn set_modulation(&mut self, modulation: ModulationSettings) {
         self.modulation = modulation;
         self.active_preset = None;
@@ -103,11 +116,18 @@ impl DspParams {
             stereo_width: self.spatial.stereo_width,
             binaural_crossfeed: self.spatial.binaural_crossfeed,
             bass_exciter: self.spatial.bass_exciter,
+            reverb: self.reverb.reverb,
+            reverb_room_size: self.reverb.reverb_room_size,
+            reverb_tone: self.reverb.reverb_tone,
+            reverb_wet: self.reverb.reverb_wet,
             eq_bands: self.gains_db,
             rotation: self.modulation.rotation,
             rotation_speed_hz: self.modulation.rotation_speed_hz,
             tremolo: self.modulation.tremolo,
             vibrato: self.modulation.vibrato,
+            flanger: self.modulation.flanger,
+            chorus: self.modulation.chorus,
+            phaser: self.modulation.phaser,
             loudness: self.loudness.enabled,
             target_lufs: self.loudness.target_lufs,
             speed: self.timescale.speed,
@@ -123,11 +143,18 @@ pub struct DspStatus {
     pub stereo_width: f32,
     pub binaural_crossfeed: bool,
     pub bass_exciter: bool,
+    pub reverb: bool,
+    pub reverb_room_size: f32,
+    pub reverb_tone: f32,
+    pub reverb_wet: f32,
     pub eq_bands: [f32; 15],
     pub rotation: bool,
     pub rotation_speed_hz: f32,
     pub tremolo: bool,
     pub vibrato: bool,
+    pub flanger: bool,
+    pub chorus: bool,
+    pub phaser: bool,
     pub loudness: bool,
     pub target_lufs: f32,
     pub speed: f32,
@@ -140,6 +167,7 @@ pub struct DspStatus {
 pub struct DspChain {
     pub equalizer: Equalizer,
     pub spatial: SpatialProcessor,
+    pub reverb: ReverbProcessor,
     pub modulation: ModulationProcessor,
     pub loudness: LoudnessNormalizer,
     pub timescale: TimescaleProcessor,
@@ -152,6 +180,7 @@ impl DspChain {
         Self {
             equalizer: Equalizer::new(sample_rate),
             spatial: SpatialProcessor::new(sample_rate),
+            reverb: ReverbProcessor::new(sample_rate),
             modulation: ModulationProcessor::new(sample_rate),
             loudness: LoudnessNormalizer::new(sample_rate),
             timescale: TimescaleProcessor::new(),
@@ -169,6 +198,9 @@ impl DspChain {
         }
         self.spatial.update_sample_rate(sample_rate);
         self.spatial.set_settings(params.spatial.clone());
+
+        self.reverb.update_sample_rate(sample_rate);
+        self.reverb.set_settings(params.reverb.clone());
 
         self.modulation.update_sample_rate(sample_rate);
         self.modulation.set_settings(params.modulation.clone());
@@ -197,6 +229,7 @@ impl DspChain {
     pub fn reset(&mut self) {
         self.equalizer.reset();
         self.spatial.reset();
+        self.reverb.reset();
         self.modulation.reset();
         self.loudness.reset();
         self.timescale.reset();
@@ -207,6 +240,7 @@ impl DspChain {
     pub fn is_active(&self) -> bool {
         self.equalizer.is_active
             || self.spatial.is_active()
+            || self.reverb.is_active()
             || self.modulation.is_active()
             || self.loudness.is_active()
             || self.timescale.is_active()
@@ -235,13 +269,16 @@ impl DspChain {
         // 3. Spatializer (Mid/Side + Crossfeed unitario + Excitador armónico)
         self.spatial.process_planar(left, right);
 
-        // 4. Modulación y espacialización dinámica (Vibrato -> Tremolo -> 8D Orbital Rotation)
+        // 4. Reverb FDN (Chowning 1980: 8 líneas coprimas + pre-delay 15 ms + RT60 analítico)
+        self.reverb.process_planar(left, right);
+
+        // 5. Modulación dinámica (Vibrato -> Tremolo -> Flanger -> Chorus -> Phaser -> 8D Orbital Rotation)
         self.modulation.process_planar(left, right);
 
-        // 5. Normalizador perceptual de volumen EBU R128 (K-weighting + Smooth AGC + True Peak Limiter)
+        // 6. Normalizador perceptual de volumen EBU R128 (K-weighting + Smooth AGC + True Peak Limiter)
         self.loudness.process_planar(left, right);
 
-        // 6. Limitador suave de pico analógico universal (Soft-Knee Peak Limiter a 0 dBFS)
+        // 7. Limitador suave de pico analógico universal (Soft-Knee Peak Limiter a 0 dBFS)
         // Si EBU R128 está apagado, protege la salida contra saturación digital / inter-sample clipping en Discord Opus
         if !self.loudness.is_active() {
             let len = left.len().min(right.len());
