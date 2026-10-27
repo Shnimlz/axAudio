@@ -21,49 +21,50 @@ use tracing::{error, info, warn};
 
 use crate::dsp::{apply_preset_to_params, inject_dsp, DspParams};
 use crate::models::{
-    ApiResponse, AutoplayPayload, ControlPayload, DspPayload, DspResponse, EqPayload, JoinPayload, LeavePayload,
-    LoopMode, PlayPayload, PlayResponse, PlayerEvent, QueuePayload, QueueResponse, ResolvePayload,
-    SearchPayload, SearchResponse, StatsResponse, TrackResponse,
+    ApiResponse, AutoplayPayload, ControlPayload, DspPayload, DspResetPayload, DspResponse, EqPayload, JoinPayload, LeavePayload,
+    LiveRadioPayload, LoudnessPayload, LoopMode, ModulationPayload, PlayPayload, PlayResponse, PlayerEvent, PlayerKey, PresetInfo, PresetListResponse, PresetSavePayload,
+    QueuePayload, QueueResponse, ResolvePayload, ReverbPayload, SearchPayload, SearchResponse, SpatialPayload, StatsResponse,
+    TimescalePayload, TrackResponse, TwentyFourSevenPayload,
 };
 use crate::sources::{FlatPlaylistItem, SourceResolver, TrackMetadata};
 use crate::state::AppState;
 
 struct TrackPlayNotifier {
-    guild_id: u64,
+    key: PlayerKey,
     meta: Arc<TrackMetadata>,
     event_tx: broadcast::Sender<PlayerEvent>,
     state: Option<AppState>,
     has_played: Arc<AtomicBool>,
+    retried: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl EventHandler for TrackPlayNotifier {
     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
         self.has_played.store(true, Ordering::SeqCst);
-        info!(guild = self.guild_id, title = %self.meta.title, "Evento TrackPlay emitido");
+        // Al comenzar a reproducir con éxito, reseteamos el indicador de retry
+        // Esto permite que si la URL de CDN de YouTube expira tras 6 horas de reproducción continua,
+        // la auto-curación se active de nuevo sin límite arbitrario.
+        self.retried.store(false, Ordering::SeqCst);
+        info!(guild = self.key.guild_id, bot = self.key.bot_id, title = %self.meta.title, "Evento TrackPlay emitido");
         if let Some(ref st) = self.state {
-            st.set_last_track(self.guild_id, (*self.meta).clone());
+            st.tracks_played_count.fetch_add(1, Ordering::Relaxed);
+            st.set_last_track(self.key, (*self.meta).clone());
             if let Some(vid) = SourceResolver::extract_video_id(&self.meta.source_url) {
-                st.record_seen_track(self.guild_id, &vid);
+                st.record_seen_track(self.key, &vid);
             }
         }
         let _ = self.event_tx.send(PlayerEvent::TrackStart {
-            guild_id: self.guild_id,
-            track: TrackResponse {
-                title: self.meta.title.clone(),
-                source_url: self.meta.source_url.clone(),
-                stream_url: self.meta.stream_url.clone(),
-                duration_secs: self.meta.duration_secs,
-                author: self.meta.author.clone(),
-                thumbnail: self.meta.thumbnail.clone(),
-            },
+            guild_id: self.key.guild_id,
+            bot_id: Some(self.key.bot_id),
+            track: self.meta.to_response(),
         });
         None
     }
 }
 
 struct TrackEndNotifier {
-    guild_id: u64,
+    key: PlayerKey,
     meta: Arc<TrackMetadata>,
     event_tx: broadcast::Sender<PlayerEvent>,
     state: Option<AppState>,
@@ -76,7 +77,8 @@ impl EventHandler for TrackEndNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if !self.has_played.load(Ordering::SeqCst) {
             info!(
-                guild = self.guild_id,
+                guild = self.key.guild_id,
+                bot = self.key.bot_id,
                 title = %self.meta.title,
                 "TrackEnd ignorado: la pista fue detenida/desalojada antes de sonar"
             );
@@ -99,41 +101,55 @@ impl EventHandler for TrackEndNotifier {
             return None;
         }
 
-        info!(guild = self.guild_id, title = %self.meta.title, reason = %reason, "Evento TrackEnd emitido");
+        info!(guild = self.key.guild_id, bot = self.key.bot_id, title = %self.meta.title, reason = %reason, "Evento TrackEnd emitido");
         let _ = self.event_tx.send(PlayerEvent::TrackEnd {
-            guild_id: self.guild_id,
-            track: Some(TrackResponse {
-                title: self.meta.title.clone(),
-                source_url: self.meta.source_url.clone(),
-                stream_url: self.meta.stream_url.clone(),
-                duration_secs: self.meta.duration_secs,
-                author: self.meta.author.clone(),
-                thumbnail: self.meta.thumbnail.clone(),
-            }),
+            guild_id: self.key.guild_id,
+            bot_id: Some(self.key.bot_id),
+            track: Some(self.meta.to_response()),
             reason: reason.to_string(),
         });
 
         // Bucle de cola: Si la pista terminó con éxito y el modo es Queue, re-encolar al final
         if reason == "finished" {
             if let Some(ref st) = self.state {
-                if st.get_loop_mode(self.guild_id) == LoopMode::Queue {
+                if st.get_loop_mode(self.key) == LoopMode::Queue {
                     let st_clone = st.clone();
-                    let guild_id = self.guild_id;
+                    let key = self.key;
                     let meta = self.meta.clone();
                     tokio::spawn(async move {
-                        if let Some(driver_ref) = st_clone.players.get(&guild_id) {
-                            let dsp_params = st_clone.get_dsp_params(guild_id);
-                            let target_volume = st_clone.get_volume(guild_id);
+                        if let Some(driver_ref) = st_clone.players.get(&key) {
+                            let dsp_params = st_clone.get_dsp_params(key);
+                            let target_volume = st_clone.get_volume(key);
                             let effective_volume = (target_volume * 0.95).clamp(0.0, 2.0);
                             let play_opts = st_clone
                                 .guild_play_options
-                                .get(&guild_id)
+                                .get(&key)
                                 .map(|o| o.clone())
                                 .unwrap_or_default();
+
+                            // Si la URL del stream ha expirado o está próxima a expirar,
+                            // re-resolverla con fresh URL antes de re-encolar
+                            let meta_to_use = if meta.is_url_expired_or_expiring() {
+                                st_clone.resolver.invalidate_cache(&meta.source_url);
+                                st_clone.resolver.invalidate_cache(&meta.stream_url);
+                                match st_clone.resolver.resolve_single(
+                                    &meta.source_url,
+                                    play_opts.extractor_args.as_deref(),
+                                    play_opts.extra_args.as_deref(),
+                                    play_opts.cookies.as_deref(),
+                                    play_opts.format.as_deref(),
+                                ).await {
+                                    Ok(fresh) => Arc::new(fresh),
+                                    Err(_) => meta.clone(),
+                                }
+                            } else {
+                                meta.clone()
+                            };
+
                             let trk = create_track_with_dsp(
                                 st_clone.http_client.clone(),
-                                meta.stream_url.clone(),
-                                meta.clone(),
+                                meta_to_use.stream_url.clone(),
+                                meta_to_use.clone(),
                                 dsp_params,
                                 play_opts.user_agent.as_deref(),
                             )
@@ -143,8 +159,8 @@ impl EventHandler for TrackEndNotifier {
                             let handle = driver.enqueue(trk).await;
                             let _ = handle.set_volume(effective_volume);
                             attach_track_events(
-                                guild_id,
-                                meta,
+                                key,
+                                meta_to_use,
                                 &handle,
                                 &st_clone.event_tx,
                                 Some(st_clone.clone()),
@@ -155,14 +171,13 @@ impl EventHandler for TrackEndNotifier {
             }
         }
 
-        // Activación de prefetch de seguridad: Si la cola se vació (por ejemplo, tras un skip
-        // o corte antes de la ventana de 15s), avanzar inmediatamente a la siguiente pista pendiente
+        // Activación de prefetch de seguridad
         if let Some(ref st) = self.state {
             let st_clone = st.clone();
-            let guild_id = self.guild_id;
+            let key = self.key;
             tokio::spawn(async move {
                 tokio::task::yield_now().await;
-                maybe_prefetch_next_track(&st_clone, guild_id).await;
+                maybe_prefetch_next_track(&st_clone, key).await;
             });
         }
 
@@ -171,7 +186,7 @@ impl EventHandler for TrackEndNotifier {
 }
 
 struct TrackErrorNotifier {
-    guild_id: u64,
+    key: PlayerKey,
     meta: Arc<TrackMetadata>,
     event_tx: broadcast::Sender<PlayerEvent>,
     state: Option<AppState>,
@@ -195,7 +210,8 @@ impl EventHandler for TrackErrorNotifier {
                 st.resolver.invalidate_cache(&self.meta.stream_url);
 
                 warn!(
-                    guild = self.guild_id,
+                    guild = self.key.guild_id,
+                    bot = self.key.bot_id,
                     title = %self.meta.title,
                     url = %self.meta.source_url,
                     error = %err_msg,
@@ -203,14 +219,14 @@ impl EventHandler for TrackErrorNotifier {
                 );
 
                 let st_clone = st.clone();
-                let guild_id = self.guild_id;
+                let key = self.key;
                 let source_url = self.meta.source_url.clone();
                 let event_tx_clone = self.event_tx.clone();
 
                 tokio::spawn(async move {
                     let play_opts = st_clone
                         .guild_play_options
-                        .get(&guild_id)
+                        .get(&key)
                         .map(|p| p.clone())
                         .unwrap_or_default();
 
@@ -226,9 +242,9 @@ impl EventHandler for TrackErrorNotifier {
                         .await
                     {
                         Ok(fresh_track) => {
-                            if let Some(driver_ref) = st_clone.players.get(&guild_id) {
-                                let dsp_params = st_clone.get_dsp_params(guild_id);
-                                let target_vol = st_clone.get_volume(guild_id);
+                            if let Some(driver_ref) = st_clone.players.get(&key) {
+                                let dsp_params = st_clone.get_dsp_params(key);
+                                let target_vol = st_clone.get_volume(key);
                                 let effective_vol = (target_vol * 0.95).clamp(0.0, 2.0);
                                 let track_meta = Arc::new(fresh_track.clone());
 
@@ -250,7 +266,7 @@ impl EventHandler for TrackErrorNotifier {
 
                                 let retried_flag = Arc::new(AtomicBool::new(true));
                                 attach_track_events_with_retried(
-                                    guild_id,
+                                    key,
                                     track_meta,
                                     &handle,
                                     &event_tx_clone,
@@ -258,12 +274,13 @@ impl EventHandler for TrackErrorNotifier {
                                     retried_flag,
                                 );
 
-                                if st_clone.get_loop_mode(guild_id) == LoopMode::Track {
+                                if st_clone.get_loop_mode(key) == LoopMode::Track {
                                     let _ = handle.enable_loop();
                                 }
 
                                 info!(
-                                    guild = guild_id,
+                                    guild = key.guild_id,
+                                    bot = key.bot_id,
                                     title = %fresh_track.title,
                                     "Auto-curación exitosa: pista re-resuelta con stream fresco y reanudada"
                                 );
@@ -272,7 +289,8 @@ impl EventHandler for TrackErrorNotifier {
                         }
                         Err(e) => {
                             warn!(
-                                guild = guild_id,
+                                guild = key.guild_id,
+                                bot = key.bot_id,
                                 error = %e,
                                 "Reintento de auto-curación falló al re-resolver la pista"
                             );
@@ -280,7 +298,8 @@ impl EventHandler for TrackErrorNotifier {
                     }
 
                     let _ = event_tx_clone.send(PlayerEvent::TrackError {
-                        guild_id,
+                        guild_id: key.guild_id,
+                        bot_id: Some(key.bot_id),
                         track: Some(TrackResponse {
                             title: source_url.clone(),
                             source_url,
@@ -288,10 +307,12 @@ impl EventHandler for TrackErrorNotifier {
                             duration_secs: None,
                             author: None,
                             thumbnail: None,
+                            is_live: None,
+                            suggested_preset: None,
                         }),
                         error: err_msg,
                     });
-                    maybe_prefetch_next_track(&st_clone, guild_id).await;
+                    maybe_prefetch_next_track(&st_clone, key).await;
                 });
 
                 return None;
@@ -299,21 +320,16 @@ impl EventHandler for TrackErrorNotifier {
         }
 
         warn!(
-            guild = self.guild_id,
+            guild = self.key.guild_id,
+            bot = self.key.bot_id,
             title = %self.meta.title,
             error = %err_msg,
             "Evento TrackError emitido (sin más reintentos)"
         );
         let _ = self.event_tx.send(PlayerEvent::TrackError {
-            guild_id: self.guild_id,
-            track: Some(TrackResponse {
-                title: self.meta.title.clone(),
-                source_url: self.meta.source_url.clone(),
-                stream_url: self.meta.stream_url.clone(),
-                duration_secs: self.meta.duration_secs,
-                author: self.meta.author.clone(),
-                thumbnail: self.meta.thumbnail.clone(),
-            }),
+            guild_id: self.key.guild_id,
+            bot_id: Some(self.key.bot_id),
+            track: Some(self.meta.to_response()),
             error: err_msg,
         });
         None
@@ -342,18 +358,18 @@ fn shuffle_slice<T>(slice: &mut [T]) {
 }
 
 fn attach_track_events(
-    guild_id: u64,
+    key: PlayerKey,
     meta: Arc<TrackMetadata>,
     handle: &TrackHandle,
     event_tx: &broadcast::Sender<PlayerEvent>,
     state: Option<AppState>,
 ) {
     let retried = Arc::new(AtomicBool::new(false));
-    attach_track_events_with_retried(guild_id, meta, handle, event_tx, state, retried);
+    attach_track_events_with_retried(key, meta, handle, event_tx, state, retried);
 }
 
 fn attach_track_events_with_retried(
-    guild_id: u64,
+    key: PlayerKey,
     meta: Arc<TrackMetadata>,
     handle: &TrackHandle,
     event_tx: &broadcast::Sender<PlayerEvent>,
@@ -366,17 +382,18 @@ fn attach_track_events_with_retried(
     let _ = handle.add_event(
         Event::Track(TrackEvent::Play),
         TrackPlayNotifier {
-            guild_id,
+            key,
             meta: meta.clone(),
             event_tx: event_tx.clone(),
             state: state.clone(),
             has_played: has_played.clone(),
+            retried: retried.clone(),
         },
     );
     let _ = handle.add_event(
         Event::Track(TrackEvent::End),
         TrackEndNotifier {
-            guild_id,
+            key,
             meta: meta.clone(),
             event_tx: event_tx.clone(),
             state: state.clone(),
@@ -387,7 +404,7 @@ fn attach_track_events_with_retried(
     let _ = handle.add_event(
         Event::Track(TrackEvent::Error),
         TrackErrorNotifier {
-            guild_id,
+            key,
             meta,
             event_tx: event_tx.clone(),
             state,
@@ -454,8 +471,64 @@ pub async fn get_stats(State(state): State<AppState>) -> Json<ApiResponse<StatsR
         version: AXAUDIO_VERSION,
         uptime_seconds: state.start_time.elapsed().as_secs(),
         active_players: state.players.len(),
+        active_247_players: state.twenty_four_seven_players.len(),
+        tracks_played_total: state.tracks_played_count.load(Ordering::Relaxed),
+        resolves_total: state.resolves_count.load(Ordering::Relaxed),
+        cached_tracks: state.resolver.cache_size(),
+        custom_presets_count: state.custom_presets.len(),
+        memory_rss_bytes: AppState::get_memory_rss(),
     };
     Json(ApiResponse::ok(stats))
+}
+
+pub async fn get_metrics(State(state): State<AppState>) -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
+    let uptime = state.start_time.elapsed().as_secs();
+    let active_players = state.players.len();
+    let active_247 = state.twenty_four_seven_players.len();
+    let tracks_played = state.tracks_played_count.load(Ordering::Relaxed);
+    let resolves = state.resolves_count.load(Ordering::Relaxed);
+    let cached = state.resolver.cache_size();
+    let custom_presets = state.custom_presets.len();
+    let memory_rss = AppState::get_memory_rss();
+
+    let mut body = String::with_capacity(1024);
+    body.push_str("# HELP axaudio_uptime_seconds Uptime of the axAudio engine in seconds\n");
+    body.push_str("# TYPE axaudio_uptime_seconds counter\n");
+    body.push_str(&format!("axaudio_uptime_seconds {}\n\n", uptime));
+
+    body.push_str("# HELP axaudio_active_players Number of currently active Discord voice players\n");
+    body.push_str("# TYPE axaudio_active_players gauge\n");
+    body.push_str(&format!("axaudio_active_players {}\n\n", active_players));
+
+    body.push_str("# HELP axaudio_247_players Number of players with 24/7 mode enabled\n");
+    body.push_str("# TYPE axaudio_247_players gauge\n");
+    body.push_str(&format!("axaudio_247_players {}\n\n", active_247));
+
+    body.push_str("# HELP axaudio_tracks_played_total Total number of audio tracks played since startup\n");
+    body.push_str("# TYPE axaudio_tracks_played_total counter\n");
+    body.push_str(&format!("axaudio_tracks_played_total {}\n\n", tracks_played));
+
+    body.push_str("# HELP axaudio_resolves_total Total number of track resolution queries executed\n");
+    body.push_str("# TYPE axaudio_resolves_total counter\n");
+    body.push_str(&format!("axaudio_resolves_total {}\n\n", resolves));
+
+    body.push_str("# HELP axaudio_cached_tracks Number of tracks currently in memory cache\n");
+    body.push_str("# TYPE axaudio_cached_tracks gauge\n");
+    body.push_str(&format!("axaudio_cached_tracks {}\n\n", cached));
+
+    body.push_str("# HELP axaudio_custom_presets Number of custom user-defined presets registered\n");
+    body.push_str("# TYPE axaudio_custom_presets gauge\n");
+    body.push_str(&format!("axaudio_custom_presets {}\n\n", custom_presets));
+
+    body.push_str("# HELP axaudio_memory_rss_bytes Process resident set size (RSS) memory in bytes\n");
+    body.push_str("# TYPE axaudio_memory_rss_bytes gauge\n");
+    body.push_str(&format!("axaudio_memory_rss_bytes {}\n", memory_rss));
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
 }
 
 pub async fn resolve_track(
@@ -470,6 +543,8 @@ pub async fn resolve_track(
         ));
     }
 
+    state.resolves_count.fetch_add(1, Ordering::Relaxed);
+
     match state
         .resolver
         .resolve(
@@ -482,14 +557,7 @@ pub async fn resolve_track(
         .await
     {
         Ok(meta) => {
-            let res = TrackResponse {
-                title: meta.title,
-                source_url: meta.source_url,
-                stream_url: meta.stream_url,
-                duration_secs: meta.duration_secs,
-                author: meta.author,
-                thumbnail: meta.thumbnail,
-            };
+            let res = meta.to_response();
             Ok(Json(ApiResponse::ok(res)))
         }
         Err(e) => {
@@ -574,8 +642,12 @@ pub async fn voice_join(
         None => return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::err("user_id inválido: 0")))),
     };
 
+    let bot_id = payload.bot_id.unwrap_or(payload.user_id);
+    let player_key = PlayerKey::new(payload.guild_id, bot_id);
+
     info!(
         guild = payload.guild_id,
+        bot = bot_id,
         channel = payload.channel_id,
         endpoint = %payload.endpoint,
         "Conectando driver de axAudio al canal de voz de Discord"
@@ -594,7 +666,7 @@ pub async fn voice_join(
     // eliminando la distorsión armónica cuadrada (chillidos/estridencias) y reteniendo los graves intactos
     let driver_ref = state
         .players
-        .entry(payload.guild_id)
+        .entry(player_key)
         .or_insert_with(|| {
             let mut config = songbird::Config::default();
             config.preallocated_tracks = 1;
@@ -615,12 +687,13 @@ pub async fn voice_join(
 
     match driver.connect(connection_info).await {
         Ok(_) => {
-            state.touch_activity(payload.guild_id);
-            info!(guild = payload.guild_id, "Conexión exitosa al canal de voz");
+            state.touch_activity(player_key);
+    state.resolves_count.fetch_add(1, Ordering::Relaxed);
+            info!(guild = payload.guild_id, bot = bot_id, "Conexión exitosa al canal de voz");
             Ok(Json(ApiResponse::ok("Conectado al canal de voz de Discord")))
         }
         Err(e) => {
-            error!(guild = payload.guild_id, error = ?e, "Fallo al conectar el driver al canal de voz");
+            error!(guild = payload.guild_id, bot = bot_id, error = ?e, "Fallo al conectar el driver al canal de voz");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiResponse::err(format!("Fallo en la conexión del driver: {:?}", e))),
@@ -718,19 +791,21 @@ pub async fn player_play(
     State(state): State<AppState>,
     Json(payload): Json<PlayPayload>,
 ) -> Result<Json<ApiResponse<PlayResponse>>, (StatusCode, Json<ApiResponse<PlayResponse>>)> {
-    let driver_ref = match state.players.get(&payload.guild_id) {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let driver_ref = match state.players.get(&player_key) {
         Some(d) => d.clone(),
         None => {
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(ApiResponse::err("No hay conexión de voz activa para este servidor. Ejecute /v1/voice/join primero.")),
+                Json(ApiResponse::err("No hay conexión de voz activa para este servidor/bot. Ejecute /v1/voice/join primero.")),
             ));
         }
     };
 
-    state.touch_activity(payload.guild_id);
+    state.touch_activity(player_key);
+    state.resolves_count.fetch_add(1, Ordering::Relaxed);
 
-    info!(guild = payload.guild_id, query = %payload.url, "Resolviendo fuente de audio (Pista/Playlist/Mix/Radio)...");
+    info!(guild = payload.guild_id, bot = player_key.bot_id, query = %payload.url, "Resolviendo fuente de audio (Pista/Playlist/Mix/Radio)...");
 
     // Extracción optimizada (Fast Start): Pista 1 en paralelo con Flat-Playlist
     let batch = match state
@@ -747,7 +822,7 @@ pub async fn player_play(
     {
         Ok(b) => b,
         Err(e) => {
-            error!(guild = payload.guild_id, error = %e, "Fallo al resolver lote de audio con yt-dlp");
+            error!(guild = payload.guild_id, bot = player_key.bot_id, error = %e, "Fallo al resolver lote de audio con yt-dlp");
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ApiResponse::err(format!("Fallo resolviendo pista(s): {}", e))),
@@ -757,18 +832,18 @@ pub async fn player_play(
 
     // Si se solicita reemplazar explícitamente, se detiene la cola y el stream actual
     if payload.replace == Some(true) {
-        state.next_epoch(payload.guild_id);
-        state.pending_playlists.remove(&payload.guild_id);
+        state.next_epoch(player_key);
+        state.pending_playlists.remove(&player_key);
         let mut d = driver_ref.lock().await;
         d.stop();
         d.queue().stop();
     }
 
-    let target_volume = payload.volume.unwrap_or_else(|| state.get_volume(payload.guild_id));
-    state.set_volume(payload.guild_id, target_volume);
+    let target_volume = payload.volume.unwrap_or_else(|| state.get_volume(player_key));
+    state.set_volume(player_key, target_volume);
     let effective_volume = (target_volume * 0.95).clamp(0.0, 2.0);
 
-    let dsp_params = state.get_dsp_params(payload.guild_id);
+    let dsp_params = state.get_dsp_params(player_key);
 
     // Encolar inmediatamente la pista 1 con el pipeline DSP inyectado
     // IMPORTANTE: create_track_with_dsp conecta vía HTTP para resolver headers del stream.
@@ -792,13 +867,13 @@ pub async fn player_play(
         (h, init_len, tot_len)
     };
     attach_track_events(
-        payload.guild_id,
+        player_key,
         first_meta,
         &handle,
         &state.event_tx,
         Some(state.clone()),
     );
-    if state.get_loop_mode(payload.guild_id) == LoopMode::Track {
+    if state.get_loop_mode(player_key) == LoopMode::Track {
         let _ = handle.enable_loop();
     }
 
@@ -806,11 +881,10 @@ pub async fn player_play(
     // El motor global de prefetch anticipado preparará cada pista 10-15s antes del final de la pista activa,
     // garantizando streams HTTP frescos, cero saturación de sockets y transiciones 100% gapless.
     if !batch.remaining_entries.is_empty() {
-        let guild_id = payload.guild_id;
-        state.next_epoch(guild_id);
-        state.pending_playlists.insert(guild_id, batch.remaining_entries.clone());
+        state.next_epoch(player_key);
+        state.pending_playlists.insert(player_key, batch.remaining_entries.clone());
         state.guild_play_options.insert(
-            guild_id,
+            player_key,
             crate::state::GuildPlayOptions {
                 extractor_args: payload.extractor_args.clone(),
                 extra_args: payload.extra_args.clone(),
@@ -821,7 +895,8 @@ pub async fn player_play(
         );
 
         info!(
-            guild = guild_id,
+            guild = player_key.guild_id,
+            bot = player_key.bot_id,
             pending_count = batch.remaining_entries.len(),
             "Playlist registrada en cola pendiente: el motor de prefetch anticipado resolverá cada pista 10-15s antes de su corte"
         );
@@ -829,7 +904,7 @@ pub async fn player_play(
         // Si la pista inicial es corta (<= 20s), evaluar prefetch inmediatamente
         let state_trigger = state.clone();
         tokio::spawn(async move {
-            maybe_prefetch_next_track(&state_trigger, guild_id).await;
+            maybe_prefetch_next_track(&state_trigger, player_key).await;
         });
     }
 
@@ -849,9 +924,102 @@ pub async fn player_play(
 
     info!(
         guild = payload.guild_id,
+        bot = player_key.bot_id,
         is_playlist = batch.is_playlist,
         playlist_tracks_count = batch.total_tracks_count,
         "Pista inicial lista y encolada exitosamente"
+    );
+
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+/// Endpoint dedicado para streaming de radio en vivo (Icecast / SHOUTcast / HLS / HTTP stream)
+/// con demuxer de metadatos ICY y emisión de eventos WebSocket en tiempo real.
+pub async fn player_live(
+    State(state): State<AppState>,
+    Json(payload): Json<LiveRadioPayload>,
+) -> Result<Json<ApiResponse<PlayResponse>>, (StatusCode, Json<ApiResponse<PlayResponse>>)> {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let driver_ref = match state.players.get(&player_key) {
+        Some(d) => d.clone(),
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::err("No hay conexión de voz activa para este servidor/bot. Ejecute /v1/voice/join primero.")),
+            ));
+        }
+    };
+
+    let target_volume = payload.volume.unwrap_or_else(|| state.get_volume(player_key));
+    state.set_volume(player_key, target_volume);
+    let effective_volume = (target_volume * 0.95).clamp(0.0, 2.0);
+
+    let dsp_params = state.get_dsp_params(player_key);
+
+    let (songbird_track, track_meta) = match crate::icy::create_live_radio_track(
+        state.http_client.clone(),
+        payload.url.clone(),
+        payload.title.clone(),
+        player_key.guild_id,
+        Some(player_key.bot_id),
+        dsp_params,
+        state.event_tx.clone(),
+        payload.user_agent.as_deref(),
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(url = %payload.url, error = %e, "Error al conectar a radio streaming en vivo");
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(ApiResponse::err(format!("No se pudo conectar a la radio en vivo: {}", e))),
+            ));
+        }
+    };
+
+    // Limpiar cola pendiente de playlists anteriores si existían
+    state.pending_playlists.remove(&player_key);
+
+    let handle = {
+        let mut driver = driver_ref.lock().await;
+        // Para radio en vivo, reemplazamos cualquier pista actual
+        driver.queue().stop();
+        let h = driver.play(songbird_track);
+        let _ = h.set_volume(effective_volume);
+        h
+    };
+
+    attach_track_events(
+        player_key,
+        track_meta.clone(),
+        &handle,
+        &state.event_tx,
+        Some(state.clone()),
+    );
+
+    state.touch_activity(player_key);
+
+    let response = PlayResponse {
+        title: track_meta.title.clone(),
+        source_url: track_meta.source_url.clone(),
+        stream_url: track_meta.stream_url.clone(),
+        duration_secs: None,
+        author: track_meta.author.clone(),
+        thumbnail: None,
+        is_playlist: false,
+        playlist_title: None,
+        playlist_tracks_count: 0,
+        queue_length: 1,
+        was_empty: true,
+    };
+
+    info!(
+        guild = payload.guild_id,
+        bot = player_key.bot_id,
+        title = %track_meta.title,
+        url = %payload.url,
+        "Radio streaming en vivo iniciada con éxito"
     );
 
     Ok(Json(ApiResponse::ok(response)))
@@ -861,12 +1029,13 @@ pub async fn player_queue(
     State(state): State<AppState>,
     Json(payload): Json<QueuePayload>,
 ) -> Result<Json<ApiResponse<QueueResponse>>, (StatusCode, Json<ApiResponse<QueueResponse>>)> {
-    let driver_ref = match state.players.get(&payload.guild_id) {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let driver_ref = match state.players.get(&player_key) {
         Some(d) => d.clone(),
         None => {
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(ApiResponse::err("No hay reproductor de voz activo para este servidor")),
+                Json(ApiResponse::err("No hay reproductor de voz activo para este servidor/bot")),
             ));
         }
     };
@@ -878,18 +1047,11 @@ pub async fn player_queue(
     let mut all_tracks = Vec::new();
     for handle in handles {
         let meta: Arc<TrackMetadata> = handle.data();
-        all_tracks.push(TrackResponse {
-            title: meta.title.clone(),
-            source_url: meta.source_url.clone(),
-            stream_url: meta.stream_url.clone(),
-            duration_secs: meta.duration_secs,
-            author: meta.author.clone(),
-            thumbnail: meta.thumbnail.clone(),
-        });
+        all_tracks.push(meta.to_response());
     }
 
     // Agregar pistas de playlist que aún se están cargando en segundo plano
-    if let Some(pending) = state.pending_playlists.get(&payload.guild_id) {
+    if let Some(pending) = state.pending_playlists.get(&player_key) {
         for item in pending.iter() {
             all_tracks.push(TrackResponse {
                 title: format!("[Pendiente] {}", item.title),
@@ -898,6 +1060,8 @@ pub async fn player_queue(
                 duration_secs: item.duration_secs,
                 author: item.author.clone(),
                 thumbnail: item.thumbnail.clone(),
+                is_live: None,
+                suggested_preset: None,
             });
         }
     }
@@ -919,16 +1083,19 @@ pub async fn player_queue(
     };
 
     let total = (if current.is_some() { 1 } else { 0 }) + all_tracks.len();
-    let loop_mode = state.get_loop_mode(payload.guild_id).as_str().to_string();
-    let autoplay = state.is_autoplay(payload.guild_id);
+    let loop_mode = state.get_loop_mode(player_key).as_str().to_string();
+    let autoplay = state.is_autoplay(player_key);
+    let twenty_four_seven = state.is_247(player_key);
 
     let res = QueueResponse {
         guild_id: payload.guild_id,
+        bot_id: Some(player_key.bot_id),
         is_playing: current.is_some(),
         current,
         current_position_secs,
         loop_mode,
         autoplay,
+        twenty_four_seven,
         queue: all_tracks,
         total_tracks: total,
     };
@@ -940,17 +1107,19 @@ pub async fn player_control(
     State(state): State<AppState>,
     Json(payload): Json<ControlPayload>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
-    let driver_ref = match state.players.get(&payload.guild_id) {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let driver_ref = match state.players.get(&player_key) {
         Some(d) => d.clone(),
         None => {
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(ApiResponse::err("No hay reproductor de voz activo para este servidor")),
+                Json(ApiResponse::err("No hay reproductor de voz activo para este servidor/bot")),
             ));
         }
     };
 
-    state.touch_activity(payload.guild_id);
+    state.touch_activity(player_key);
+    state.resolves_count.fetch_add(1, Ordering::Relaxed);
 
     let mut driver = driver_ref.lock().await;
 
@@ -964,9 +1133,9 @@ pub async fn player_control(
             Ok(Json(ApiResponse::ok("Reproductor reanudado".to_string())))
         }
         "stop" => {
-            state.next_epoch(payload.guild_id);
-            state.pending_playlists.remove(&payload.guild_id);
-            state.end_prefetch(payload.guild_id);
+            state.next_epoch(player_key);
+            state.pending_playlists.remove(&player_key);
+            state.end_prefetch(player_key);
             driver.queue().stop();
             driver.stop();
             Ok(Json(ApiResponse::ok("Reproductor detenido".to_string())))
@@ -976,9 +1145,9 @@ pub async fn player_control(
             Ok(Json(ApiResponse::ok("Pista saltada".to_string())))
         }
         "clear" => {
-            state.next_epoch(payload.guild_id);
-            state.pending_playlists.remove(&payload.guild_id);
-            state.end_prefetch(payload.guild_id);
+            state.next_epoch(player_key);
+            state.pending_playlists.remove(&player_key);
+            state.end_prefetch(player_key);
             driver.queue().modify_queue(|q| {
                 if q.len() > 1 {
                     let first = q.pop_front().unwrap();
@@ -993,7 +1162,7 @@ pub async fn player_control(
         "volume" => {
             if let Some(val) = payload.value {
                 let clamped = val.clamp(0.0, 2.0);
-                state.set_volume(payload.guild_id, clamped);
+                state.set_volume(player_key, clamped);
                 if let Some(track) = driver.queue().current() {
                     let _ = track.set_volume(clamped * 0.95);
                 }
@@ -1048,7 +1217,7 @@ pub async fn player_control(
                 }
             };
 
-            state.set_loop_mode(payload.guild_id, mode);
+            state.set_loop_mode(player_key, mode);
 
             if let Some(track) = driver.queue().current() {
                 if mode == LoopMode::Track {
@@ -1080,7 +1249,7 @@ pub async fn player_control(
                 }
             });
 
-            if let Some(mut pend) = state.pending_playlists.get_mut(&payload.guild_id) {
+            if let Some(mut pend) = state.pending_playlists.get_mut(&player_key) {
                 shuffle_slice(&mut pend);
                 upcoming_count += pend.len();
             }
@@ -1117,7 +1286,7 @@ pub async fn player_control(
                 let q_upcoming_len = driver.queue().len().saturating_sub(1);
                 if target_idx >= q_upcoming_len {
                     let pending_idx = target_idx - q_upcoming_len;
-                    if let Some(mut pend) = state.pending_playlists.get_mut(&payload.guild_id) {
+                    if let Some(mut pend) = state.pending_playlists.get_mut(&player_key) {
                         if pending_idx < pend.len() {
                             let item = pend.remove(pending_idx);
                             removed_title = Some(item.title);
@@ -1160,7 +1329,7 @@ pub async fn player_control(
             let q_upcoming_len = driver.queue().len().saturating_sub(1);
             let pending_len = state
                 .pending_playlists
-                .get(&payload.guild_id)
+                .get(&player_key)
                 .map(|p| p.len())
                 .unwrap_or(0);
             let total_upcoming = q_upcoming_len + pending_len;
@@ -1189,7 +1358,7 @@ pub async fn player_control(
                 } else {
                     state
                         .pending_playlists
-                        .get(&payload.guild_id)
+                        .get(&player_key)
                         .and_then(|p| p.get(from - q_upcoming_len).map(|it| it.title.clone()))
                         .unwrap_or_else(|| "Pista".to_string())
                 };
@@ -1218,7 +1387,7 @@ pub async fn player_control(
                 // Caso 2: Ambas posiciones están en state.pending_playlists
                 let from_p = from - q_upcoming_len;
                 let to_p = to - q_upcoming_len;
-                if let Some(mut pend) = state.pending_playlists.get_mut(&payload.guild_id) {
+                if let Some(mut pend) = state.pending_playlists.get_mut(&player_key) {
                     if from_p < pend.len() && to_p < pend.len() {
                         let item = pend.remove(from_p);
                         moved_title = Some(item.title.clone());
@@ -1246,7 +1415,7 @@ pub async fn player_control(
 
                 if let Some(item) = moved_item {
                     let new_q_upcoming_len = driver.queue().len().saturating_sub(1);
-                    let mut pend = state.pending_playlists.entry(payload.guild_id).or_default();
+                    let mut pend = state.pending_playlists.entry(player_key).or_default();
                     let to_p = (to - new_q_upcoming_len).min(pend.len());
                     pend.insert(to_p, item);
                     trigger_prefetch = true;
@@ -1256,7 +1425,7 @@ pub async fn player_control(
                 let from_p = from - q_upcoming_len;
                 let item_opt = state
                     .pending_playlists
-                    .get_mut(&payload.guild_id)
+                    .get_mut(&player_key)
                     .and_then(|mut pend| {
                         if from_p < pend.len() {
                             Some(pend.remove(from_p))
@@ -1285,21 +1454,20 @@ pub async fn player_control(
                     });
                     displaced.reverse();
 
-                    let mut pend = state.pending_playlists.entry(payload.guild_id).or_default();
+                    let mut pend = state.pending_playlists.entry(player_key).or_default();
                     pend.insert(0, item);
                     for (i, d) in displaced.into_iter().enumerate() {
                         pend.insert(1 + i, d);
                     }
-                    state.end_prefetch(payload.guild_id);
+                    state.end_prefetch(player_key);
                     trigger_prefetch = true;
                 }
             }
 
             if trigger_prefetch {
                 let st_clone = state.clone();
-                let guild_id = payload.guild_id;
                 tokio::spawn(async move {
-                    maybe_prefetch_next_track(&st_clone, guild_id).await;
+                    maybe_prefetch_next_track(&st_clone, player_key).await;
                 });
             }
 
@@ -1316,24 +1484,38 @@ pub async fn player_control(
         }
         "autoplay" => {
             let new_val = if let Some(e) = payload.enabled {
-                state.set_autoplay(payload.guild_id, e);
+                state.set_autoplay(player_key, e);
                 e
             } else {
-                let toggled = !state.is_autoplay(payload.guild_id);
-                state.set_autoplay(payload.guild_id, toggled);
+                let toggled = !state.is_autoplay(player_key);
+                state.set_autoplay(player_key, toggled);
                 toggled
             };
 
             if new_val {
                 let st_clone = state.clone();
-                let guild_id = payload.guild_id;
                 tokio::spawn(async move {
-                    maybe_prefetch_next_track(&st_clone, guild_id).await;
+                    maybe_prefetch_next_track(&st_clone, player_key).await;
                 });
             }
 
             Ok(Json(ApiResponse::ok(format!(
                 "Autoplay {}",
+                if new_val { "activado" } else { "desactivado" }
+            ))))
+        }
+        "247" | "24_7" | "twenty_four_seven" => {
+            let new_val = if let Some(e) = payload.enabled {
+                state.set_247(player_key, e);
+                e
+            } else {
+                let toggled = !state.is_247(player_key);
+                state.set_247(player_key, toggled);
+                toggled
+            };
+
+            Ok(Json(ApiResponse::ok(format!(
+                "Modo 24/7 {}",
                 if new_val { "activado" } else { "desactivado" }
             ))))
         }
@@ -1372,42 +1554,63 @@ pub async fn player_autoplay(
     State(state): State<AppState>,
     Json(payload): Json<AutoplayPayload>,
 ) -> Result<Json<ApiResponse<bool>>, (StatusCode, Json<ApiResponse<bool>>)> {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
     let new_val = if let Some(e) = payload.enabled {
-        state.set_autoplay(payload.guild_id, e);
+        state.set_autoplay(player_key, e);
         e
     } else {
-        let toggled = !state.is_autoplay(payload.guild_id);
-        state.set_autoplay(payload.guild_id, toggled);
+        let toggled = !state.is_autoplay(player_key);
+        state.set_autoplay(player_key, toggled);
         toggled
     };
 
     if new_val {
         let st_clone = state.clone();
-        let guild_id = payload.guild_id;
         tokio::spawn(async move {
-            maybe_prefetch_next_track(&st_clone, guild_id).await;
+            maybe_prefetch_next_track(&st_clone, player_key).await;
         });
     }
 
     Ok(Json(ApiResponse::ok(new_val)))
 }
 
-/// Desconecta el driver de Songbird y purga todos los registros del servidor en AppState
-pub async fn cleanup_guild_player(state: &AppState, guild_id: u64) -> bool {
-    state.next_epoch(guild_id);
-    state.pending_playlists.remove(&guild_id);
-    state.end_prefetch(guild_id);
-    state.guild_play_options.remove(&guild_id);
-    state.dsp_params.remove(&guild_id);
-    state.load_epochs.remove(&guild_id);
-    state.guild_volumes.remove(&guild_id);
-    state.loop_modes.remove(&guild_id);
-    state.autoplay_guilds.remove(&guild_id);
-    state.seen_tracks.remove(&guild_id);
-    state.last_tracks.remove(&guild_id);
-    state.last_activity.remove(&guild_id);
+pub async fn player_247(
+    State(state): State<AppState>,
+    Json(payload): Json<TwentyFourSevenPayload>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let new_val = if let Some(e) = payload.enabled {
+        state.set_247(player_key, e);
+        e
+    } else {
+        let toggled = !state.is_247(player_key);
+        state.set_247(player_key, toggled);
+        toggled
+    };
 
-    if let Some((_, driver_ref)) = state.players.remove(&guild_id) {
+    Ok(Json(ApiResponse::ok(format!(
+        "Modo 24/7 {}",
+        if new_val { "activado" } else { "desactivado" }
+    ))))
+}
+
+/// Desconecta el driver de Songbird y purga todos los registros del servidor en AppState
+pub async fn cleanup_guild_player(state: &AppState, key: PlayerKey) -> bool {
+    state.next_epoch(key);
+    state.pending_playlists.remove(&key);
+    state.end_prefetch(key);
+    state.guild_play_options.remove(&key);
+    state.dsp_params.remove(&key);
+    state.load_epochs.remove(&key);
+    state.guild_volumes.remove(&key);
+    state.loop_modes.remove(&key);
+    state.autoplay_guilds.remove(&key);
+    state.twenty_four_seven_players.remove(&key);
+    state.seen_tracks.remove(&key);
+    state.last_tracks.remove(&key);
+    state.last_activity.remove(&key);
+
+    if let Some((_, driver_ref)) = state.players.remove(&key) {
         let mut driver = driver_ref.lock().await;
         driver.stop();
         driver.leave();
@@ -1421,11 +1624,12 @@ pub async fn voice_leave(
     State(state): State<AppState>,
     Json(payload): Json<LeavePayload>,
 ) -> Result<Json<ApiResponse<&'static str>>, (StatusCode, Json<ApiResponse<&'static str>>)> {
-    if cleanup_guild_player(&state, payload.guild_id).await {
-        info!(guild = payload.guild_id, "Driver desconectado y reproductor eliminado");
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    if cleanup_guild_player(&state, player_key).await {
+        info!(guild = payload.guild_id, bot = player_key.bot_id, "Driver desconectado y reproductor eliminado");
         Ok(Json(ApiResponse::ok("Desconectado y reproductor limpiado")))
     } else {
-        warn!(guild = payload.guild_id, "Intento de abandonar una sesión de voz inexistente");
+        warn!(guild = payload.guild_id, bot = player_key.bot_id, "Intento de abandonar una sesión de voz inexistente");
         Ok(Json(ApiResponse::ok("La sesión no estaba activa")))
     }
 }
@@ -1494,7 +1698,8 @@ pub async fn player_eq(
     State(state): State<AppState>,
     Json(payload): Json<EqPayload>,
 ) -> Result<Json<ApiResponse<DspResponse>>, (StatusCode, Json<ApiResponse<DspResponse>>)> {
-    let dsp_params = state.get_dsp_params(payload.guild_id);
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let dsp_params = state.get_dsp_params(player_key);
     let mut params = match dsp_params.write() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -1517,8 +1722,12 @@ pub async fn player_eq(
     }
 
     let status = params.get_status();
+    drop(params);
+    state.persist_guild_settings();
+
     let res = DspResponse {
         guild_id: payload.guild_id,
+        bot_id: Some(player_key.bot_id),
         status,
         message,
     };
@@ -1530,7 +1739,8 @@ pub async fn player_dsp(
     State(state): State<AppState>,
     Json(payload): Json<DspPayload>,
 ) -> Result<Json<ApiResponse<DspResponse>>, (StatusCode, Json<ApiResponse<DspResponse>>)> {
-    let dsp_params = state.get_dsp_params(payload.guild_id);
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let dsp_params = state.get_dsp_params(player_key);
     let mut params = match dsp_params.write() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -1573,13 +1783,24 @@ pub async fn player_dsp(
         }
     }
 
+    if let Some(reverb) = payload.reverb {
+        params.set_reverb(reverb);
+        if message.is_empty() {
+            message = "Configuración de reverb acústico FDN actualizada".to_string();
+        }
+    }
+
     if let Some(ref bands) = payload.bands {
         params.set_bands(bands);
     }
 
     let status = params.get_status();
+    drop(params);
+    state.persist_guild_settings();
+
     let res = DspResponse {
         guild_id: payload.guild_id,
+        bot_id: Some(player_key.bot_id),
         status,
         message,
     };
@@ -1587,32 +1808,170 @@ pub async fn player_dsp(
     Ok(Json(ApiResponse::ok(res)))
 }
 
-/// Evalúa el estado del reproductor del guild y, si restan 10-15s para el final de la pista actual
+pub async fn player_dsp_reverb(
+    State(state): State<AppState>,
+    Json(payload): Json<ReverbPayload>,
+) -> Result<Json<ApiResponse<DspResponse>>, (StatusCode, Json<ApiResponse<DspResponse>>)> {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let dsp_params = state.get_dsp_params(player_key);
+    let mut params = match dsp_params.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    params.set_reverb(payload.settings);
+    let status = params.get_status();
+    drop(params);
+    state.persist_guild_settings();
+
+    Ok(Json(ApiResponse::ok(DspResponse {
+        guild_id: payload.guild_id,
+        bot_id: Some(player_key.bot_id),
+        status,
+        message: "Configuración de Reverb FDN actualizada".to_string(),
+    })))
+}
+
+pub async fn player_dsp_spatial(
+    State(state): State<AppState>,
+    Json(payload): Json<SpatialPayload>,
+) -> Result<Json<ApiResponse<DspResponse>>, (StatusCode, Json<ApiResponse<DspResponse>>)> {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let dsp_params = state.get_dsp_params(player_key);
+    let mut params = match dsp_params.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    params.set_spatial(payload.settings);
+    let status = params.get_status();
+    drop(params);
+    state.persist_guild_settings();
+
+    Ok(Json(ApiResponse::ok(DspResponse {
+        guild_id: payload.guild_id,
+        bot_id: Some(player_key.bot_id),
+        status,
+        message: "Configuración Espacial 3D actualizada".to_string(),
+    })))
+}
+
+pub async fn player_dsp_timescale(
+    State(state): State<AppState>,
+    Json(payload): Json<TimescalePayload>,
+) -> Result<Json<ApiResponse<DspResponse>>, (StatusCode, Json<ApiResponse<DspResponse>>)> {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let dsp_params = state.get_dsp_params(player_key);
+    let mut params = match dsp_params.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    params.set_timescale(payload.settings);
+    let status = params.get_status();
+    drop(params);
+    state.persist_guild_settings();
+
+    Ok(Json(ApiResponse::ok(DspResponse {
+        guild_id: payload.guild_id,
+        bot_id: Some(player_key.bot_id),
+        status,
+        message: "Ajuste de Timescale (velocidad/pitch) actualizado".to_string(),
+    })))
+}
+
+pub async fn player_dsp_loudness(
+    State(state): State<AppState>,
+    Json(payload): Json<LoudnessPayload>,
+) -> Result<Json<ApiResponse<DspResponse>>, (StatusCode, Json<ApiResponse<DspResponse>>)> {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let dsp_params = state.get_dsp_params(player_key);
+    let mut params = match dsp_params.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    params.set_loudness(payload.settings);
+    let status = params.get_status();
+    drop(params);
+    state.persist_guild_settings();
+
+    Ok(Json(ApiResponse::ok(DspResponse {
+        guild_id: payload.guild_id,
+        bot_id: Some(player_key.bot_id),
+        status,
+        message: "Normalización de volumen EBU R128 actualizada".to_string(),
+    })))
+}
+
+pub async fn player_dsp_modulation(
+    State(state): State<AppState>,
+    Json(payload): Json<ModulationPayload>,
+) -> Result<Json<ApiResponse<DspResponse>>, (StatusCode, Json<ApiResponse<DspResponse>>)> {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let dsp_params = state.get_dsp_params(player_key);
+    let mut params = match dsp_params.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    params.set_modulation(payload.settings);
+    let status = params.get_status();
+    drop(params);
+    state.persist_guild_settings();
+
+    Ok(Json(ApiResponse::ok(DspResponse {
+        guild_id: payload.guild_id,
+        bot_id: Some(player_key.bot_id),
+        status,
+        message: "Efectos de modulación (8D/Chorus/Flanger/Phaser) actualizados".to_string(),
+    })))
+}
+
+pub async fn player_dsp_reset(
+    State(state): State<AppState>,
+    Json(payload): Json<DspResetPayload>,
+) -> Result<Json<ApiResponse<DspResponse>>, (StatusCode, Json<ApiResponse<DspResponse>>)> {
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let dsp_params = state.get_dsp_params(player_key);
+    let mut params = match dsp_params.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *params = DspParams::default();
+    let status = params.get_status();
+    drop(params);
+    state.persist_guild_settings();
+
+    Ok(Json(ApiResponse::ok(DspResponse {
+        guild_id: payload.guild_id,
+        bot_id: Some(player_key.bot_id),
+        status,
+        message: "Pipeline DSP restablecido a plano (bypass)".to_string(),
+    })))
+}
+
+/// Evalúa el estado del reproductor y, si restan 10-15s para el final de la pista actual
 /// (o si la cola está vacía tras un salto), pre-resuelve y encola la siguiente pista de la cola.
-pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
+pub async fn maybe_prefetch_next_track(state: &AppState, key: PlayerKey) {
     // 1. Si el modo de repetición es 'track', la pista actual se repite indefinidamente
-    if state.get_loop_mode(guild_id) == LoopMode::Track {
+    if state.get_loop_mode(key) == LoopMode::Track {
         return;
     }
 
-    // 2. Si ya hay una operación de prefetch en curso para este guild, evitar llamadas concurrentes
-    if state.is_prefetching(guild_id) {
+    // 2. Si ya hay una operación de prefetch en curso para este reproductor, evitar llamadas concurrentes
+    if state.is_prefetching(key) {
         return;
     }
 
     // 3. Verificar si hay pistas pendientes en la lista de reproducción o si autoplay está activo
     let has_pending = state
         .pending_playlists
-        .get(&guild_id)
+        .get(&key)
         .map(|p| !p.is_empty())
         .unwrap_or(false);
 
-    if !has_pending && !state.is_autoplay(guild_id) {
+    if !has_pending && !state.is_autoplay(key) {
         return;
     }
 
-    // 4. Obtener el reproductor activo del guild
-    let driver_ref = match state.players.get(&guild_id) {
+    // 4. Obtener el reproductor activo
+    let driver_ref = match state.players.get(&key) {
         Some(d) => d.clone(),
         None => return,
     };
@@ -1675,23 +2034,23 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
     }
 
     // 6. Si no hay pistas pendientes pero autoplay está activo, generar recomendaciones vía InnerTube
-    if !has_pending && state.is_autoplay(guild_id) {
+    if !has_pending && state.is_autoplay(key) {
         let seed_opt = if let Some(ref curr) = current_track {
             let meta: Arc<TrackMetadata> = curr.data();
             Some(meta.source_url.clone())
         } else {
-            state.get_last_track(guild_id).map(|t| t.source_url)
+            state.get_last_track(key).map(|t| t.source_url)
         };
 
         if let Some(seed_url) = seed_opt {
             let clean_id = SourceResolver::extract_video_id(&seed_url).unwrap_or_else(|| seed_url.clone());
-            info!(guild = guild_id, seed = %clean_id, "Autoplay activo: consultando recomendaciones en InnerTube (radio WEB_REMIX)...");
+            info!(guild = key.guild_id, bot = key.bot_id, seed = %clean_id, "Autoplay activo: consultando recomendaciones en InnerTube (radio WEB_REMIX)...");
             if let Ok(items) = state.resolver.related_innertube(&clean_id, 25).await {
                 let mut fresh: Vec<_> = items
                     .into_iter()
                     .filter(|item| {
                         if let Some(vid) = SourceResolver::extract_video_id(&item.url) {
-                            !state.is_track_seen(guild_id, &vid) && vid != clean_id
+                            !state.is_track_seen(key, &vid) && vid != clean_id
                         } else {
                             true
                         }
@@ -1699,7 +2058,7 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
                     .collect();
 
                 if fresh.is_empty() {
-                    state.clear_seen_tracks(guild_id);
+                    state.clear_seen_tracks(key);
                     fresh = state
                         .resolver
                         .related_innertube(&clean_id, 25)
@@ -1709,12 +2068,13 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
 
                 if !fresh.is_empty() {
                     info!(
-                        guild = guild_id,
+                        guild = key.guild_id,
+                        bot = key.bot_id,
                         count = fresh.len(),
                         next = %fresh[0].title,
                         "Autoplay: recomendaciones obtenidas y añadidas a la cola pendiente"
                     );
-                    let mut list = state.pending_playlists.entry(guild_id).or_insert_with(Vec::new);
+                    let mut list = state.pending_playlists.entry(key).or_insert_with(Vec::new);
                     list.extend(fresh);
                 }
             }
@@ -1722,21 +2082,21 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
     }
 
     // 7. Activar flag de prefetch y extraer la siguiente pista de pending_playlists
-    if !state.start_prefetch(guild_id) {
+    if !state.start_prefetch(key) {
         return;
     }
 
-    let next_item = match state.pending_playlists.get_mut(&guild_id) {
+    let next_item = match state.pending_playlists.get_mut(&key) {
         Some(mut list) if !list.is_empty() => list.remove(0),
         _ => {
-            state.end_prefetch(guild_id);
+            state.end_prefetch(key);
             return;
         }
     };
 
     let play_opts = state
         .guild_play_options
-        .get(&guild_id)
+        .get(&key)
         .map(|o| o.clone())
         .unwrap_or_default();
 
@@ -1745,26 +2105,27 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
 
     // CleanupGuard: asegura que end_prefetch se llame siempre al salir del scope,
     // incluso si el tokio::spawn panica. Esto previene la fuga del flag prefetching_guilds.
-    let guard_guild_id = guild_id;
+    let guard_key = key;
     let state_clone_for_guard = state_clone.clone();
 
     tokio::spawn(async move {
         struct CleanupGuard {
-            guild_id: u64,
+            key: PlayerKey,
             state: AppState,
         }
         impl Drop for CleanupGuard {
             fn drop(&mut self) {
-                self.state.end_prefetch(self.guild_id);
+                self.state.end_prefetch(self.key);
             }
         }
         let _guard = CleanupGuard {
-            guild_id: guard_guild_id,
+            key: guard_key,
             state: state_clone_for_guard,
         };
 
         info!(
-            guild = guard_guild_id,
+            guild = guard_key.guild_id,
+            bot = guard_key.bot_id,
             next_title = %next_item.title,
             trigger = %reason,
             "Prefetch anticipado activado: resolviendo y precalentando flujo de audio (gapless)..."
@@ -1783,8 +2144,8 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
 
         match resolve_res {
             Ok(track) => {
-                let dsp_params = state_clone.get_dsp_params(guard_guild_id);
-                let target_vol = state_clone.get_volume(guard_guild_id);
+                let dsp_params = state_clone.get_dsp_params(guard_key);
+                let target_vol = state_clone.get_volume(guard_key);
                 let effective_vol = (target_vol * 0.95).clamp(0.0, 2.0);
                 let track_meta = Arc::new(track.clone());
 
@@ -1805,26 +2166,28 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
                 };
 
                 attach_track_events(
-                    guard_guild_id,
+                    guard_key,
                     track_meta,
                     &handle,
                     &state_clone.event_tx,
                     Some(state_clone.clone()),
                 );
 
-                if state_clone.get_loop_mode(guard_guild_id) == LoopMode::Track {
+                if state_clone.get_loop_mode(guard_key) == LoopMode::Track {
                     let _ = handle.enable_loop();
                 }
 
                 info!(
-                    guild = guard_guild_id,
+                    guild = guard_key.guild_id,
+                    bot = guard_key.bot_id,
                     title = %track.title,
                     "Prefetch exitoso: decodificador y stream listos en cola Songbird (transición gapless)"
                 );
             }
             Err(err) => {
                 warn!(
-                    guild = guard_guild_id,
+                    guild = guard_key.guild_id,
+                    bot = guard_key.bot_id,
                     url = %next_item.url,
                     title = %next_item.title,
                     error = %err,
@@ -1838,8 +2201,8 @@ pub async fn maybe_prefetch_next_track(state: &AppState, guild_id: u64) {
 
 /// Verifica si la pista en reproducción actual contiene segmentos de SponsorBlock
 /// y adelanta la posición automáticamente si el cabezal entra en una sección no musical.
-async fn check_sponsorblock_skip(state: &AppState, guild_id: u64) {
-    let driver_ref = match state.players.get(&guild_id) {
+async fn check_sponsorblock_skip(state: &AppState, key: PlayerKey) {
+    let driver_ref = match state.players.get(&key) {
         Some(d) => d.clone(),
         None => return,
     };
@@ -1865,7 +2228,8 @@ async fn check_sponsorblock_skip(state: &AppState, guild_id: u64) {
                 for seg in &meta.skip_segments {
                     if pos_secs >= seg.start && pos_secs < (seg.end - 0.25) {
                         info!(
-                            guild = guild_id,
+                            guild = key.guild_id,
+                            bot = key.bot_id,
                             title = %meta.title,
                             from = pos_secs,
                             to = seg.end,
@@ -1884,7 +2248,15 @@ async fn check_sponsorblock_skip(state: &AppState, guild_id: u64) {
 /// Garbage Collector de reproductores inactivos:
 /// Si un servidor no tiene canciones en reproducción ni pendientes en cola por más de
 /// AXAUDIO_IDLE_TIMEOUT_SECS (por defecto 300s / 5min), desconecta el driver y libera sockets/memoria.
-async fn check_idle_cleanup(state: &AppState, guild_id: u64) {
+/// Si el modo 24/7 o un modo de bucle (Track/Queue) está activo, NO se desconecta.
+async fn check_idle_cleanup(state: &AppState, key: PlayerKey) {
+    // Protección 24/7 y Loop: si el modo 24/7 está activado o la repetición está activa,
+    // nunca desconectar el bot por inactividad.
+    if state.is_247(key) || state.get_loop_mode(key) != LoopMode::Off {
+        state.touch_activity(key);
+        return;
+    }
+
     let timeout_secs: u64 = std::env::var("AXAUDIO_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1894,7 +2266,7 @@ async fn check_idle_cleanup(state: &AppState, guild_id: u64) {
         return;
     }
 
-    let driver_ref = match state.players.get(&guild_id) {
+    let driver_ref = match state.players.get(&key) {
         Some(d) => d.clone(),
         None => return,
     };
@@ -1906,22 +2278,23 @@ async fn check_idle_cleanup(state: &AppState, guild_id: u64) {
 
     let has_pending = state
         .pending_playlists
-        .get(&guild_id)
+        .get(&key)
         .map(|p| !p.is_empty())
         .unwrap_or(false);
 
     if !is_empty || has_pending {
-        state.touch_activity(guild_id);
+        state.touch_activity(key);
     } else {
-        let last = state.get_last_activity(guild_id);
+        let last = state.get_last_activity(key);
         if last.elapsed() >= std::time::Duration::from_secs(timeout_secs) {
             info!(
-                guild = guild_id,
+                guild = key.guild_id,
+                bot = key.bot_id,
                 idle_secs = last.elapsed().as_secs(),
                 timeout = timeout_secs,
                 "Garbage Collector: reproductor inactivo por más del límite configurado; liberando driver y recursos UDP"
             );
-            cleanup_guild_player(state, guild_id).await;
+            cleanup_guild_player(state, key).await;
         }
     }
 }
@@ -1937,12 +2310,140 @@ pub async fn run_prefetch_monitor(state: AppState) {
     loop {
         interval.tick().await;
 
-        let guild_ids: Vec<u64> = state.players.iter().map(|entry| *entry.key()).collect();
-        for guild_id in guild_ids {
-            maybe_prefetch_next_track(&state, guild_id).await;
-            check_sponsorblock_skip(&state, guild_id).await;
-            check_idle_cleanup(&state, guild_id).await;
+        let player_keys: Vec<PlayerKey> = state.players.iter().map(|entry| *entry.key()).collect();
+        for key in player_keys {
+            maybe_prefetch_next_track(&state, key).await;
+            check_sponsorblock_skip(&state, key).await;
+            check_idle_cleanup(&state, key).await;
         }
+    }
+}
+
+/// Crea o actualiza un preset personalizado copiando los DSP params actuales de un guild
+pub async fn preset_save(
+    State(state): State<AppState>,
+    Json(payload): Json<PresetSavePayload>,
+) -> Result<Json<ApiResponse<PresetInfo>>, (StatusCode, Json<ApiResponse<PresetInfo>>)> {
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::err("El nombre del preset no puede estar vacío")),
+        ));
+    }
+
+    // Copia los DSP params actuales del guild/bot, o usa defaults
+    let params = if let Some(guild_id) = payload.guild_id {
+        let player_key = state.resolve_player_key(guild_id, payload.bot_id);
+        let dsp_params = state.get_dsp_params(player_key);
+        match dsp_params.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    } else {
+        crate::dsp::DspParams::default()
+    };
+
+    state.save_custom_preset(name.clone(), params.clone());
+
+    let info = PresetInfo {
+        name: name.clone(),
+        description: payload.description,
+        status: params.get_status(),
+    };
+
+    Ok(Json(ApiResponse::ok(info)))
+}
+
+/// Aplica un preset personalizado a un guild
+pub async fn preset_apply(
+    State(state): State<AppState>,
+    Json(payload): Json<DspPayload>,
+) -> Result<Json<ApiResponse<DspResponse>>, (StatusCode, Json<ApiResponse<DspResponse>>)> {
+    let preset_name = payload.preset.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::err("Se requiere el campo 'preset'")),
+        )
+    })?;
+
+    let player_key = state.resolve_player_key(payload.guild_id, payload.bot_id);
+    let dsp_params = state.get_dsp_params(player_key);
+
+    // Primero intenta preset personalizado, luego built-in
+    let custom = state.get_custom_preset(preset_name);
+    let (desc, new_params) = if let Some(cp) = &custom {
+        (
+            format!("Preset personalizado '{}' aplicado", preset_name),
+            cp.clone(),
+        )
+    } else {
+        match apply_preset_to_params(preset_name, &mut crate::dsp::DspParams::default()) {
+            Ok(d) => {
+                let mut p = crate::dsp::DspParams::default();
+                apply_preset_to_params(preset_name, &mut p).ok();
+                (d, p)
+            }
+            Err(e) => {
+                return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))));
+            }
+        }
+    };
+
+    let mut params = match dsp_params.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *params = new_params;
+
+    let status = params.get_status();
+    drop(params);
+    state.persist_guild_settings();
+
+    let res = DspResponse {
+        guild_id: payload.guild_id,
+        bot_id: Some(player_key.bot_id),
+        status,
+        message: desc,
+    };
+
+    Ok(Json(ApiResponse::ok(res)))
+}
+
+/// Lista todos los presets personalizados
+pub async fn preset_list(State(state): State<AppState>) -> Json<ApiResponse<PresetListResponse>> {
+    let presets: Vec<PresetInfo> = state
+        .list_custom_presets()
+        .into_iter()
+        .filter_map(|name| {
+            state.get_custom_preset(&name).map(|params| PresetInfo {
+                name: name.clone(),
+                description: None,
+                status: params.get_status(),
+            })
+        })
+        .collect();
+
+    let response = PresetListResponse {
+        count: presets.len(),
+        presets,
+    };
+    Json(ApiResponse::ok(response))
+}
+
+/// Elimina un preset personalizado
+pub async fn preset_delete(
+    State(state): State<AppState>,
+    Json(payload): Json<PresetSavePayload>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let name = payload.name.trim().to_string();
+    if state.delete_custom_preset(&name) {
+        Ok(Json(ApiResponse::ok(())))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::err(format!("Preset '{}' no encontrado", name))),
+        ))
     }
 }
 

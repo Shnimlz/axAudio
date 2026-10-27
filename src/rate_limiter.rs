@@ -11,6 +11,7 @@ use tracing::warn;
 
 /// Configuración de rate limiting (se puede cambiar via env vars)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RateLimitConfig {
     /// Requests máximas por guild para operaciones costosas (resolve, search)
     pub max_requests_per_minute: u32,
@@ -104,6 +105,7 @@ impl GuildCounter {
     }
 
     /// Limpia entries viejos (para el cleanup periódico)
+    #[allow(dead_code)]
     pub fn cleanup(&mut self) {
         let now = Instant::now();
         let cutoff = now
@@ -119,9 +121,11 @@ impl GuildCounter {
 pub struct RateLimiter {
     config: RateLimitConfig,
     counters: Arc<RwLock<HashMap<u64, GuildCounter>>>,
+    #[allow(dead_code)]
     concurrent_ytdlp: Arc<std::sync::Mutex<u32>>,
 }
 
+#[allow(dead_code)]
 impl RateLimiter {
     pub fn new(config: RateLimitConfig) -> Self {
         Self {

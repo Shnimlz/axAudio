@@ -76,11 +76,17 @@ Running Lavalink means running a JVM. On a small VPS that is most of your RAM go
 
 - 🦀 **Pure Rust core**: Songbird 0.4 + Symphonia 0.5, no GC pauses.
 - 🎵 **Wide format & source support**: MP3, FLAC, AAC, OGG Vorbis, WAV, direct HTTP / ICY streams, and **native Spotify resolution** (Tracks, Playlists, Albums via 0-key public embeds).
+- 📻 **Live Radio Streaming & ICY Demuxer**: Dedicated `/v1/player/live` endpoint for Icecast/SHOUTcast continuous radio streams with real-time `metadata_update` WebSocket events and zero decoder desync.
+- 💾 **Persistent Guild & DSP Configuration**: Volume, loop mode, 24/7, autoplay, and complete DSP pipelines persist to disk (`settings/guild_settings.json`) across server restarts.
+- 🎛️ **Granular DSP & Extended Filters**: Modular endpoints for Reverb FDN, Spatial 3D, Timescale, Loudness, Modulation, and 15-band EQ supporting Peaking, LowShelf, HighShelf, LowPass, and HighPass curves.
+- 🎯 **Automatic Suggested Presets**: Track metadata automatically suggests ideal DSP presets (Bass Boost, Nightcore, Lo-Fi, Spatial 8D, Vocal Clarity, Cinema 3D) for zero-config clients.
 - 📡 **Real-time transport**: direct 50 Hz UDP RTP Opus streaming with hardware-accelerated ChaCha20-Poly1305 and AES-GCM encryption.
 - ⚙️ **Simple REST control plane**: Axum 0.8 on a multi-threaded Tokio runtime.
 - 🛡️ **YouTube bypass & auto-healing**: QuickJS/Deno runtimes, PoToken sidecar, multi-cookie pool, and **automatic 403 Forbidden cache purge & retry**.
 - ⏭️ **SponsorBlock built-in**: Real-time server-side skipping of non-musical intro/outro segments (`music_offtopic`).
-- 🧹 **Idle Player Garbage Collector**: Configurable automatic driver teardown and socket reclamation on inactive guilds.
+- 🤖 **Multi-Bot Session Isolation**: Keyed by `(guild_id, bot_id)` so multiple bots can share the exact same axAudio instance without stealing or overwriting voice sessions, even in the same Discord server.
+- 🔁 **24/7 & Continuous Loop Auto-Healing**: YouTube CDN links expire strictly after 6 hours; axAudio proactively detects expiring stream URLs and continuously auto-heals tracks across indefinite 24/7 or loop sessions.
+- 🧹 **Idle Player Garbage Collector**: Configurable automatic driver teardown and socket reclamation on inactive guilds (with 24/7 and loop immunity).
 - 🎧 **Studio-grade fidelity**: native 48 kHz Opus (format 251), `tanh` soft-clipping and headroom normalization.
 - 🪶 **Tuned for tiny servers**: defaults to `TOKIO_WORKER_THREADS=2`, ideal for Oracle Cloud Free Tier, AWS t4g/t3a and Hetzner VPS.
 - 🐳 **One-command deploy** with Docker Compose.
@@ -330,7 +336,8 @@ All endpoints accept and return JSON. Snowflake IDs (`guild_id`, `channel_id`, `
 | Method | Endpoint                | Purpose                                                       | Rate-limit |
 | :----: | :---------------------- | :------------------------------------------------------------ | :--------- |
 | `GET`  | `/health`               | Liveness probe (no auth required)                             | —         |
-| `GET`  | `/v1/stats`             | Version, uptime, active players                               | —         |
+| `GET`  | `/metrics`              | Prometheus text metrics exporter (no auth required)           | —         |
+| `GET`  | `/v1/stats`             | Detailed telemetry, memory RSS, cache, player counters       | —         |
 | `POST` | `/v1/voice/join`        | Connect a voice driver to a Discord voice channel             | `RATE_LIMIT_JOINS` |
 | `POST` | `/v1/voice/leave`       | Disconnect & free UDP sockets for a guild                     | —         |
 | `POST` | `/v1/player/play`       | Resolve and enqueue a track, playlist or search query         | `AXAUDIO_MAX_CONCURRENT_RESOLVES` (semaphore) |
@@ -339,9 +346,14 @@ All endpoints accept and return JSON. Snowflake IDs (`guild_id`, `channel_id`, `
 | `POST` | `/v1/player/shuffle`    | Shortcut for `control` with `action: "shuffle"`               | —         |
 | `POST` | `/v1/player/loop`       | Shortcut for `control` with `action: "loop"`                  | —         |
 | `POST` | `/v1/player/autoplay`   | Enable / disable auto-play when the queue empties             | —         |
+| `POST` | `/v1/player/247`        | Enable / disable 24/7 mode (prevents idle disconnects)        | —         |
 | `POST` | `/v1/player/queue`      | Inspect current track + full upcoming queue                   | —         |
 | `POST` | `/v1/player/eq`         | Set 15-band equaliser or apply a named DSP preset             | —         |
 | `POST` | `/v1/player/dsp`        | Apply the full DSP stack (preset + spatial + modulation + loudness + timescale) | — |
+| `POST` | `/v1/presets`           | Save custom user preset with persistent disk storage          | —         |
+| `GET`  | `/v1/presets/list`      | List saved custom presets                                     | —         |
+| `POST` | `/v1/presets/apply`     | Apply a custom preset to a guild player                       | —         |
+| `POST` | `/v1/presets/delete`    | Delete a custom preset                                        | —         |
 | `POST` | `/v1/tracks/resolve`    | Resolve metadata + CDN stream URL **without** playing         | `RATE_LIMIT_RESOLVE` |
 | `POST` | `/v1/tracks/search`     | Multi-provider search (auto → YouTube → SoundCloud)           | `RATE_LIMIT_RESOLVE` |
 | `WS`   | `/v1/events`            | Real-time `track_start` / `track_end` / `track_error` events  | —                |
@@ -598,6 +610,29 @@ Content-Type: application/json
 
 ```json
 { "success": true, "data": true, "message": null }
+```
+
+---
+
+### POST `/v1/player/247`
+
+Enables / disables **24/7 mode**: keeps the voice driver connected even when the queue is completely empty, preventing the idle Garbage Collector from automatically disconnecting the bot after `AXAUDIO_IDLE_TIMEOUT_SECS`.
+
+```http
+POST /v1/player/247
+Content-Type: application/json
+
+# Explicit enable with bot_id
+{ "guild_id": "123456789012345678", "bot_id": "987654321098765432", "enabled": true }
+
+# Toggle (no `enabled` field)
+{ "guild_id": "123456789012345678" }
+```
+
+**Response**
+
+```json
+{ "success": true, "data": "Modo 24/7 activado", "message": null }
 ```
 
 ---

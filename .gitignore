@@ -3,3 +3,7 @@
 .cursorrules
 .github/copilot-instructions.md
 .mcp.json
+presets/*.json
+!presets/.gitkeep
+settings/*.json
+!settings/.gitkeep

@@ -100,6 +100,7 @@ dependencies = [
  "async-trait",
  "axum",
  "dashmap",
+ "futures-util",
  "mimalloc",
  "reqwest",
  "serde",
@@ -107,6 +108,7 @@ dependencies = [
  "songbird",
  "symphonia",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

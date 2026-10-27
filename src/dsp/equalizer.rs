@@ -37,22 +37,38 @@ pub struct BandSetting {
     pub gain: Option<f32>,     // Lineal Lavalink (-0.25 a +1.0)
     #[serde(default)]
     pub gain_db: Option<f32>,  // Decibelios directos (-15.0 a +15.0)
+    #[serde(default)]
+    pub filter_type: Option<String>, // "peaking" (default), "low_shelf", "high_shelf", "low_pass", "high_pass"
 }
 
 #[derive(Debug, Clone)]
 pub struct Equalizer {
     pub filters: Vec<StereoBiquad>,
+    pub filter_types: [FilterType; 15],
     pub gains_db: [f32; 15],
     pub sample_rate: f32,
     pub is_active: bool,
 }
 
 impl Equalizer {
+    pub fn parse_filter_type(band: usize, s: &str) -> FilterType {
+        match s.to_lowercase().replace('_', "").as_str() {
+            "lowshelf" | "shelfdown" | "bassshelf" => FilterType::LowShelf,
+            "highshelf" | "shelfup" | "trebleshelf" => FilterType::HighShelf,
+            "lowpass" | "lp" | "hicut" => FilterType::LowPass,
+            "highpass" | "hp" | "lowcut" => FilterType::HighPass,
+            _ => FilterType::Peaking { q: get_band_q(band) },
+        }
+    }
+
     pub fn new(sample_rate: f32) -> Self {
         let mut filters = Vec::with_capacity(15);
+        let mut filter_types = [FilterType::Peaking { q: 1.0 }; 15];
         for (band, &freq) in EQ_FREQUENCIES.iter().enumerate() {
+            let ft = FilterType::Peaking { q: get_band_q(band) };
+            filter_types[band] = ft;
             filters.push(StereoBiquad::new(
-                FilterType::Peaking { q: get_band_q(band) },
+                ft,
                 freq,
                 0.0,
                 sample_rate,
@@ -61,6 +77,7 @@ impl Equalizer {
 
         Self {
             filters,
+            filter_types,
             gains_db: [0.0; 15],
             sample_rate,
             is_active: false,
@@ -74,7 +91,7 @@ impl Equalizer {
             for (i, filter) in self.filters.iter_mut().enumerate() {
                 let freq = EQ_FREQUENCIES[i];
                 filter.update(
-                    FilterType::Peaking { q: get_band_q(i) },
+                    self.filter_types[i],
                     freq,
                     self.gains_db[i],
                     sample_rate,
@@ -83,14 +100,32 @@ impl Equalizer {
         }
     }
 
-    /// Configura una banda específica (0 a 14) con ganancia en dB
+    /// Configura una banda específica (0 a 14) con ganancia en dB (tipo Peaking por defecto)
     pub fn set_band_db(&mut self, band: usize, gain_db: f32) {
         if band < 15 {
             let clamped = gain_db.clamp(-15.0, 15.0);
             self.gains_db[band] = clamped;
             let freq = EQ_FREQUENCIES[band];
             self.filters[band].update(
-                FilterType::Peaking { q: get_band_q(band) },
+                self.filter_types[band],
+                freq,
+                clamped,
+                self.sample_rate,
+            );
+            self.check_active();
+        }
+    }
+
+    /// Configura una banda con ganancia en dB y tipo de filtro explícito
+    pub fn set_band_with_type(&mut self, band: usize, gain_db: f32, filter_type_str: &str) {
+        if band < 15 {
+            let clamped = gain_db.clamp(-15.0, 15.0);
+            self.gains_db[band] = clamped;
+            let ft = Self::parse_filter_type(band, filter_type_str);
+            self.filter_types[band] = ft;
+            let freq = EQ_FREQUENCIES[band];
+            self.filters[band].update(
+                ft,
                 freq,
                 clamped,
                 self.sample_rate,
@@ -115,10 +150,18 @@ impl Equalizer {
     /// Aplica una lista de bandas de forma atómica sin ambigüedades de escala
     pub fn set_bands(&mut self, bands: &[BandSetting]) {
         for b in bands {
-            if let Some(db) = b.gain_db {
-                self.set_band_db(b.band, db);
+            let db = if let Some(d) = b.gain_db {
+                d
             } else if let Some(linear) = b.gain {
-                self.set_band_lavalink(b.band, linear);
+                if linear >= 0.0 { linear * 12.0 } else { linear * 48.0 }
+            } else {
+                0.0
+            };
+
+            if let Some(ref ft_str) = b.filter_type {
+                self.set_band_with_type(b.band, db, ft_str);
+            } else {
+                self.set_band_db(b.band, db);
             }
         }
         self.check_active();
@@ -152,13 +195,15 @@ impl Equalizer {
         max_gain_db as f32
     }
 
-    /// Restablece todas las bandas a plano (0 dB)
+    /// Restablece todas las bandas a plano (0 dB) y tipo Peaking
     #[allow(dead_code)]
     pub fn reset_flat(&mut self) {
         self.gains_db = [0.0; 15];
         for (i, filter) in self.filters.iter_mut().enumerate() {
+            let ft = FilterType::Peaking { q: get_band_q(i) };
+            self.filter_types[i] = ft;
             filter.update(
-                FilterType::Peaking { q: get_band_q(i) },
+                ft,
                 EQ_FREQUENCIES[i],
                 0.0,
                 self.sample_rate,
@@ -175,7 +220,12 @@ impl Equalizer {
     }
 
     pub fn check_active(&mut self) {
-        self.is_active = self.gains_db.iter().any(|g| g.abs() > 0.05);
+        self.is_active = self.gains_db.iter().enumerate().any(|(i, g)| {
+            match self.filter_types[i] {
+                FilterType::LowPass | FilterType::HighPass => true,
+                _ => g.abs() > 0.05,
+            }
+        });
     }
 
     /// Procesa un bloque de muestras estéreo en formato planar

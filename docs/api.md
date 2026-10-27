@@ -21,15 +21,18 @@ interface ApiResponse<T> {
 
 ---
 
-## 2. Snowflake ID Flexibility
+## 2. Snowflake ID Flexibility & Multi-Bot Isolation
 
-Discord IDs (`guild_id`, `channel_id`, `user_id`) exceed JavaScript's `Number.MAX_SAFE_INTEGER` ($2^{53} - 1$). axAudio handles IDs seamlessly as either **numeric strings** or **raw 64-bit unsigned integers**:
+Discord IDs (`guild_id`, `channel_id`, `user_id`, `bot_id`) exceed JavaScript's `Number.MAX_SAFE_INTEGER` ($2^{53} - 1$). axAudio handles IDs seamlessly as either **numeric strings** or **raw 64-bit unsigned integers**:
 
 ```json
-{ "guild_id": "1198516089758785536" }
+{ "guild_id": "1198516089758785536", "bot_id": "100234857289384729" }
 // or
-{ "guild_id": 1198516089758785536 }
+{ "guild_id": 1198516089758785536, "bot_id": 100234857289384729 }
 ```
+
+### Multi-Bot Isolation
+To run multiple Discord bots on a single axAudio server instance without session collisions or hijacking, pass `bot_id` (also accepts aliases `user_id` or `bot`) in any player/voice request. axAudio isolates voice drivers and player state by `(guild_id, bot_id)`. If omitted, axAudio automatically binds to the active player in that guild or defaults to single-bot compatibility.
 
 ---
 
@@ -50,7 +53,7 @@ Liveness check for container orchestrators and reverse proxies.
 ---
 
 ### `GET /v1/stats`
-Retrieves engine telemetry, versioning, uptime, and active player counts.
+Retrieves engine telemetry, versioning, uptime, player counts, memory consumption, and resolution statistics.
 
 **Response `200 OK`**:
 ```json
@@ -60,10 +63,56 @@ Retrieves engine telemetry, versioning, uptime, and active player counts.
     "status": "healthy",
     "version": "0.1.0",
     "uptime_seconds": 18420,
-    "active_players": 3
+    "active_players": 3,
+    "active_247_players": 1,
+    "tracks_played_total": 42,
+    "resolves_total": 128,
+    "cached_tracks": 15,
+    "custom_presets_count": 2,
+    "memory_rss_bytes": 14680064
   },
   "message": null
 }
+```
+
+---
+
+### `GET /metrics`
+Standard Prometheus exposition format (`text/plain; version=0.0.4`) for direct scraping by Prometheus, Grafana Agent, Datadog, or VictoriaMetrics without authentication requirements.
+
+**Response `200 OK`**:
+```prometheus
+# HELP axaudio_uptime_seconds Uptime of the axAudio engine in seconds
+# TYPE axaudio_uptime_seconds counter
+axaudio_uptime_seconds 18420
+
+# HELP axaudio_active_players Number of currently active Discord voice players
+# TYPE axaudio_active_players gauge
+axaudio_active_players 3
+
+# HELP axaudio_247_players Number of players with 24/7 mode enabled
+# TYPE axaudio_247_players gauge
+axaudio_247_players 1
+
+# HELP axaudio_tracks_played_total Total number of audio tracks played since startup
+# TYPE axaudio_tracks_played_total counter
+axaudio_tracks_played_total 42
+
+# HELP axaudio_resolves_total Total number of track resolution queries executed
+# TYPE axaudio_resolves_total counter
+axaudio_resolves_total 128
+
+# HELP axaudio_cached_tracks Number of tracks currently in memory cache
+# TYPE axaudio_cached_tracks gauge
+axaudio_cached_tracks 15
+
+# HELP axaudio_custom_presets Number of custom user-defined presets registered
+# TYPE axaudio_custom_presets gauge
+axaudio_custom_presets 2
+
+# HELP axaudio_memory_rss_bytes Process resident set size (RSS) memory in bytes
+# TYPE axaudio_memory_rss_bytes gauge
+axaudio_memory_rss_bytes 14680064
 ```
 
 ---
@@ -170,6 +219,43 @@ When a playlist or YouTube Mix is submitted, axAudio immediately resolves and st
 
 ---
 
+### `POST /v1/player/live`
+Dedicated endpoint for continuous internet radio streaming (Icecast, SHOUTcast, continuous HTTP streams). Features an adaptive buffer and an automatic ICY metadata demuxer that strips interleaved metadata before decoding (preventing Symphonia frame desync errors) and broadcasts real-time `metadata_update` WebSocket events when track titles change on the station. Full DSP processing (EQ, Spatial 3D, Reverb, Loudness) applies identically to live radio streams.
+
+**Request Body**:
+```json
+{
+  "guild_id": "1198516089758785536",
+  "bot_id": "100234857289384729",
+  "url": "https://stream.radioparadise.com/flac",
+  "title": "Radio Paradise (Main Mix)",
+  "volume": 0.85
+}
+```
+
+**Response `200 OK`**:
+```json
+{
+  "success": true,
+  "data": {
+    "title": "Radio Paradise (Main Mix)",
+    "source_url": "https://stream.radioparadise.com/flac",
+    "stream_url": "https://stream.radioparadise.com/flac",
+    "duration_secs": null,
+    "author": "Live Radio",
+    "thumbnail": null,
+    "is_playlist": false,
+    "playlist_title": null,
+    "playlist_tracks_count": 0,
+    "queue_length": 1,
+    "was_empty": true
+  },
+  "message": null
+}
+```
+
+---
+
 ### `POST /v1/player/control`
 Executes an immediate playback action on the guild's voice driver.
 
@@ -196,6 +282,29 @@ Executes an immediate playback action on the guild's voice driver.
 {
   "success": true,
   "data": "Player paused",
+  "message": null
+}
+```
+
+---
+
+### `POST /v1/player/247`
+Toggles or explicitly sets 24/7 mode for a player. In 24/7 mode, the voice driver is never disconnected by the idle Garbage Collector even when the queue remains empty indefinitely.
+
+**Request Body**:
+```json
+{
+  "guild_id": "1198516089758785536",
+  "bot_id": "100234857289384729",
+  "enabled": true
+}
+```
+
+**Response `200 OK`**:
+```json
+{
+  "success": true,
+  "data": "Modo 24/7 activado",
   "message": null
 }
 ```
@@ -272,7 +381,14 @@ Configures the 15-band graphic equalizer or applies an acoustic preset.
 ```
 
 - `preset`: Name of a factory preset (`music`, `cinema-3d`, `bass-boost-3d`, `vocal-clarity`, `gaming-3d`, `concert-hall`, `flat`).
-- `bands`: Array of `{ band: 0..14, gain: float }`. Values between `-0.5` and `1.0` are converted automatically using the Lavalink scale; values outside this range are interpreted directly as decibels (`-15.0 dB` to `+15.0 dB`).
+- `bands`: Array of `{ band: 0..14, gain: float, filter_type?: string }`.
+  - Values between `-0.5` and `1.0` are converted automatically using the Lavalink scale; values outside this range are interpreted directly as decibels (`-15.0 dB` to `+15.0 dB`).
+  - `filter_type` (optional): Filter response curve. Supported values:
+    - `"peaking"` (default): Bell curve centered at the band frequency with psicoacoustic Q.
+    - `"lowshelf"`: Boosts or cuts all frequencies below the band frequency.
+    - `"highshelf"`: Boosts or cuts all frequencies above the band frequency.
+    - `"lowpass"`: Butterworth 2nd-order low-pass filter (attenuates high frequencies).
+    - `"highpass"`: Butterworth 2nd-order high-pass filter (attenuates low frequencies).
 
 **Response `200 OK`**:
 ```json
@@ -320,6 +436,154 @@ Full control over the DSP mastering chain, including Mid/Side stereo widening, a
 | `crossfeed_level` | `0.0` to `0.40` | `0.18` | Blending coefficient of cross-ear leakage. |
 | `bass_exciter` | `boolean` | `false` | Enables sub-85 Hz harmonic exciter. |
 | `bass_exciter_drive` | `0.0` to `1.0` | `0.35` | Saturation intensity of generated harmonics. |
+
+---
+
+### Granular DSP Endpoints
+
+Clients can configure specific DSP stages independently without sending full pipeline payloads:
+
+#### `POST /v1/player/dsp/reverb`
+Configures the 8-node Feedback Delay Network (FDN) acoustic reverberation room simulation.
+```json
+{
+  "guild_id": "1198516089758785536",
+  "bot_id": "100234857289384729",
+  "active": true,
+  "rt60": 2.5,
+  "wet": 0.35,
+  "dry": 1.0,
+  "tone": 0.6,
+  "pre_delay_ms": 25.0
+}
+```
+
+#### `POST /v1/player/dsp/spatial`
+Configures Mid/Side widening, binaural crossfeed, and harmonic sub-bass exciter.
+```json
+{
+  "guild_id": "1198516089758785536",
+  "stereo_width": 1.4,
+  "binaural_crossfeed": true,
+  "crossfeed_level": 0.2,
+  "bass_exciter": true,
+  "bass_exciter_drive": 0.3
+}
+```
+
+#### `POST /v1/player/dsp/timescale`
+Independent control over playback speed, musical pitch, and rate with zero chipmunk effect (WSOLA + Hermite spline).
+```json
+{
+  "guild_id": "1198516089758785536",
+  "speed": 1.25,
+  "pitch": 1.0,
+  "rate": 1.0
+}
+```
+
+#### `POST /v1/player/dsp/loudness`
+ITU-R BS.1770-4 / EBU R128 real-time loudness normalizer with True-Peak brickwall limiter.
+```json
+{
+  "guild_id": "1198516089758785536",
+  "target_lufs": -14.0,
+  "gate_threshold": -70.0,
+  "attack_time": 0.05,
+  "release_time": 0.5,
+  "limiter_active": true
+}
+```
+
+#### `POST /v1/player/dsp/modulation`
+LFO modulation effects: 8D circular rotation, Tremolo, Vibrato, Chorus, Flanger, and Phaser.
+```json
+{
+  "guild_id": "1198516089758785536",
+  "rotation_8d": true,
+  "rotation_speed": 0.2,
+  "chorus": true,
+  "chorus_depth": 0.35,
+  "chorus_rate": 1.2
+}
+```
+
+#### `POST /v1/player/dsp/reset`
+Instantly resets the entire DSP mastering pipeline for the player back to flat bypass.
+```json
+{
+  "guild_id": "1198516089758785536",
+  "bot_id": "100234857289384729"
+}
+```
+
+---
+
+### `POST /v1/presets`
+Saves current guild DSP settings (or default settings) as a named custom preset with automatic persistent disk storage (`presets/custom_presets.json`).
+
+**Request Body**:
+```json
+{
+  "name": "my_bass_boost",
+  "guild_id": "1198516089758785536",
+  "bot_id": "100234857289384729",
+  "description": "Deep club sub-bass with stereo widening"
+}
+```
+
+---
+
+### `GET /v1/presets/list`
+Lists all user-defined custom presets saved in the system.
+
+**Response `200 OK`**:
+```json
+{
+  "success": true,
+  "data": {
+    "presets": [
+      {
+        "name": "my_bass_boost",
+        "description": "Deep club sub-bass with stereo widening",
+        "status": {
+          "stereo_width": 1.4,
+          "binaural_crossfeed": true,
+          "eq_bands": [6.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0]
+        }
+      }
+    ],
+    "count": 1
+  },
+  "message": null
+}
+```
+
+---
+
+### `POST /v1/presets/apply`
+Applies a custom or built-in preset to a specific guild player.
+
+**Request Body**:
+```json
+{
+  "guild_id": "1198516089758785536",
+  "bot_id": "100234857289384729",
+  "preset": "my_bass_boost"
+}
+```
+
+---
+
+### `POST /v1/presets/delete`
+Deletes a custom preset from memory and disk.
+
+**Request Body**:
+```json
+{
+  "name": "my_bass_boost"
+}
+```
 
 ---
 

@@ -1,5 +1,6 @@
 mod dsp;
 mod handlers;
+mod icy;
 mod models;
 mod rate_limiter;
 mod sources;
@@ -94,14 +95,27 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/voice/join", post(handlers::voice_join))
         .route("/v1/voice/leave", post(handlers::voice_leave))
         .route("/v1/player/play", post(handlers::player_play))
+        .route("/v1/player/live", post(handlers::player_live))
         .route("/v1/player/control", post(handlers::player_control))
         .route("/v1/player/seek", post(handlers::player_seek))
         .route("/v1/player/shuffle", post(handlers::player_shuffle))
         .route("/v1/player/loop", post(handlers::player_loop))
         .route("/v1/player/autoplay", post(handlers::player_autoplay))
+        .route("/v1/player/247", post(handlers::player_247))
         .route("/v1/player/queue", post(handlers::player_queue))
         .route("/v1/player/eq", post(handlers::player_eq))
         .route("/v1/player/dsp", post(handlers::player_dsp))
+        .route("/v1/player/dsp/reverb", post(handlers::player_dsp_reverb))
+        .route("/v1/player/dsp/spatial", post(handlers::player_dsp_spatial))
+        .route("/v1/player/dsp/timescale", post(handlers::player_dsp_timescale))
+        .route("/v1/player/dsp/loudness", post(handlers::player_dsp_loudness))
+        .route("/v1/player/dsp/modulation", post(handlers::player_dsp_modulation))
+        .route("/v1/player/dsp/reset", post(handlers::player_dsp_reset))
+        .route("/v1/presets", post(handlers::preset_save))
+        .route("/v1/presets/list", get(handlers::preset_list))
+        .route("/v1/presets/delete", post(handlers::preset_delete))
+        .route("/v1/presets/apply", post(handlers::preset_apply))
+        .route("/v1/metrics", get(handlers::get_metrics))
         .route("/v1/events", get(handlers::ws_events))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -110,6 +124,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/health", get(handlers::health))
+        .route("/metrics", get(handlers::get_metrics))
         .merge(protected_routes)
         .with_state(state);
 

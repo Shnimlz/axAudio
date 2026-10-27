@@ -40,6 +40,55 @@ pub struct TrackMetadata {
     /// `Range: bytes=0-{max}` que GoogleVideo espera.
     #[serde(default)]
     pub stream_content_length: Option<u64>,
+    /// Momento local en que se resolvió la pista (omitido en serialización)
+    #[serde(skip, default = "Instant::now")]
+    pub resolved_at: Instant,
+    /// Indica si la fuente es un stream en vivo continuo
+    #[serde(default)]
+    pub is_live: bool,
+    /// Preset DSP sugerido heurísticamente por género o metadatos
+    #[serde(default)]
+    pub suggested_preset: Option<String>,
+}
+
+impl TrackMetadata {
+    /// Determina si la URL del stream ha expirado o está a punto de expirar (< 10 minutos).
+    /// Las URLs de googlevideo.com / YouTube contienen un parámetro `expire=<unix_timestamp>`.
+    /// Si no contienen `expire=`, se evalúa si fue resuelta hace más de 4 horas.
+    pub fn is_url_expired_or_expiring(&self) -> bool {
+        if let Some(pos) = self.stream_url.find("expire=") {
+            let after = &self.stream_url[pos + 7..];
+            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(expire_ts) = num_str.parse::<u64>() {
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // Si restan menos de 10 minutos (600s) o ya venció, considerarla expirada
+                if now_ts + 600 >= expire_ts {
+                    return true;
+                }
+            }
+        } else if self.resolved_at.elapsed() >= Duration::from_secs(3600 * 4) {
+            return true;
+        }
+
+        false
+    }
+
+    /// Convierte la metadata interna a la estructura de respuesta de la API REST
+    pub fn to_response(&self) -> crate::models::TrackResponse {
+        crate::models::TrackResponse {
+            title: self.title.clone(),
+            source_url: self.source_url.clone(),
+            stream_url: self.stream_url.clone(),
+            duration_secs: self.duration_secs,
+            author: self.author.clone(),
+            thumbnail: self.thumbnail.clone(),
+            is_live: if self.is_live { Some(true) } else { None },
+            suggested_preset: self.suggested_preset.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,6 +153,56 @@ pub fn parse_duration_string(s: &str) -> Option<u64> {
     }
 }
 
+/// Infiere heurísticamente un preset DSP sugerido basándose en título, artista o género
+pub fn detect_suggested_preset(title: &str, author: Option<&str>) -> Option<String> {
+    let lower = format!("{} {}", title, author.unwrap_or("")).to_ascii_lowercase();
+    if lower.contains("bass boost")
+        || lower.contains("hardstyle")
+        || lower.contains("trap")
+        || lower.contains("phonk")
+        || lower.contains("dubstep")
+    {
+        Some("bass_boost".to_string())
+    } else if lower.contains("nightcore")
+        || lower.contains("speed up")
+        || lower.contains("sped up")
+    {
+        Some("nightcore".to_string())
+    } else if lower.contains("lofi")
+        || lower.contains("lo-fi")
+        || lower.contains("chillhop")
+        || lower.contains("sleep")
+        || lower.contains("study")
+    {
+        Some("lofi".to_string())
+    } else if lower.contains("8d audio")
+        || lower.contains("8d music")
+        || lower.contains("spatial")
+    {
+        Some("spatial_8d".to_string())
+    } else if lower.contains("vaporwave")
+        || lower.contains("slowed")
+        || lower.contains("reverb")
+    {
+        Some("vaporwave".to_string())
+    } else if lower.contains("podcast")
+        || lower.contains("interview")
+        || lower.contains("audiobook")
+        || lower.contains("talk")
+        || lower.contains("acoustic")
+    {
+        Some("vocal_clarity".to_string())
+    } else if lower.contains("cinema")
+        || lower.contains("orchestra")
+        || lower.contains("soundtrack")
+        || lower.contains("epic")
+    {
+        Some("cinema_3d".to_string())
+    } else {
+        None
+    }
+}
+
 impl SourceResolver {
     pub fn new() -> Self {
         let http_client = reqwest::Client::builder()
@@ -141,6 +240,11 @@ impl SourceResolver {
             return;
         }
         self.cache.retain(|k, _| k != q && !k.starts_with(q) && !k.contains(q));
+    }
+
+    /// Retorna el número de pistas actualmente almacenadas en caché
+    pub fn cache_size(&self) -> usize {
+        self.cache.len()
     }
 
     /// Detecta y parsea identificadores y tipos de entidades de Spotify (web o URI spotify:...)
@@ -667,6 +771,14 @@ impl SourceResolver {
             .or_else(|| entries_first.and_then(|e| e.get("content_length")))
             .and_then(|c| c.as_u64());
 
+        let is_live = val
+            .get("is_live")
+            .or_else(|| entries_first.and_then(|e| e.get("is_live")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let suggested_preset = detect_suggested_preset(&title, author.as_deref());
+
         Ok(TrackMetadata {
             title,
             source_url,
@@ -677,6 +789,9 @@ impl SourceResolver {
             skip_segments,
             stream_headers,
             stream_content_length,
+            resolved_at: Instant::now(),
+            is_live,
+            suggested_preset,
         })
     }
 
@@ -701,7 +816,7 @@ impl SourceResolver {
         if custom_extractor_args.is_none() && custom_extra_args.is_none() && custom_cookies.is_none() {
             if let Some(entry) = self.cache.get(&cache_key) {
                 let (meta, cached_at) = entry.value();
-                if cached_at.elapsed() < self.ttl {
+                if cached_at.elapsed() < self.ttl && !meta.is_url_expired_or_expiring() {
                     info!(query = %query_trimmed, title = %meta.title, "Acierto en caché del resolvedor de fuentes");
                     return Ok(meta.clone());
                 }
@@ -720,6 +835,9 @@ impl SourceResolver {
                 skip_segments: Vec::new(),
                 stream_headers: Vec::new(),
                 stream_content_length: None,
+                resolved_at: Instant::now(),
+                is_live: false,
+                suggested_preset: None,
             });
         }
 
@@ -797,7 +915,7 @@ impl SourceResolver {
             };
             if let Some(entry) = self.cache.get(&target_cache_key) {
                 let (meta, cached_at) = entry.value();
-                if cached_at.elapsed() < self.ttl {
+                if cached_at.elapsed() < self.ttl && !meta.is_url_expired_or_expiring() {
                     info!(query = %query_trimmed, resolved = %resolved_target, title = %meta.title, "Acierto en caché del resolvedor tras resolución InnerTube");
                     self.cache.insert(cache_key, (meta.clone(), Instant::now()));
                     return Ok(meta.clone());
@@ -949,6 +1067,7 @@ impl SourceResolver {
     }
 
     /// Resuelve la lista plana de una playlist / mix con rotación de cookies
+    #[allow(dead_code)]
     pub async fn resolve_flat_playlist(
         &self,
         query: &str,
@@ -1746,6 +1865,9 @@ impl SourceResolver {
                 skip_segments: Vec::new(),
                 stream_headers: Vec::new(),
                 stream_content_length: None,
+                resolved_at: Instant::now(),
+                is_live: false,
+                suggested_preset: None,
             };
             return Ok(ResolvedPlaylistBatch {
                 first_track: meta,
@@ -1890,5 +2012,97 @@ impl SourceResolver {
 impl Default for SourceResolver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_expiration_detection() {
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // 1. URL que expira en 6 horas (21600s) -> no expirada
+        let fresh_meta = TrackMetadata {
+            title: "Test".to_string(),
+            source_url: "https://youtube.com/watch?v=123".to_string(),
+            stream_url: format!("https://rr1.googlevideo.com/videoplayback?expire={}&id=123", now_ts + 21600),
+            duration_secs: Some(180),
+            author: None,
+            thumbnail: None,
+            skip_segments: vec![],
+            stream_headers: vec![],
+            stream_content_length: None,
+            resolved_at: Instant::now(),
+            is_live: false,
+            suggested_preset: None,
+        };
+        assert!(!fresh_meta.is_url_expired_or_expiring());
+
+        // 2. URL que ya expiró (hace 100 segundos) -> expirada
+        let expired_meta = TrackMetadata {
+            title: "Test Expired".to_string(),
+            source_url: "https://youtube.com/watch?v=123".to_string(),
+            stream_url: format!("https://rr1.googlevideo.com/videoplayback?expire={}&id=123", now_ts - 100),
+            duration_secs: Some(180),
+            author: None,
+            thumbnail: None,
+            skip_segments: vec![],
+            stream_headers: vec![],
+            stream_content_length: None,
+            resolved_at: Instant::now(),
+            is_live: false,
+            suggested_preset: None,
+        };
+        assert!(expired_meta.is_url_expired_or_expiring());
+
+        // 3. URL a punto de expirar (en 300 segundos, < 10 mins) -> expirando
+        let expiring_meta = TrackMetadata {
+            title: "Test Expiring Soon".to_string(),
+            source_url: "https://youtube.com/watch?v=123".to_string(),
+            stream_url: format!("https://rr1.googlevideo.com/videoplayback?expire={}&id=123", now_ts + 300),
+            duration_secs: Some(180),
+            author: None,
+            thumbnail: None,
+            skip_segments: vec![],
+            stream_headers: vec![],
+            stream_content_length: None,
+            resolved_at: Instant::now(),
+            is_live: false,
+            suggested_preset: None,
+        };
+        assert!(expiring_meta.is_url_expired_or_expiring());
+    }
+
+    #[test]
+    fn test_detect_suggested_preset() {
+        assert_eq!(
+            detect_suggested_preset("Phonk Mega Bass Boost 2024", None),
+            Some("bass_boost".to_string())
+        );
+        assert_eq!(
+            detect_suggested_preset("Rockefeller Street", Some("Nightcore")),
+            Some("nightcore".to_string())
+        );
+        assert_eq!(
+            detect_suggested_preset("Coffee Shop Chill Lofi Beats to Sleep", None),
+            Some("lofi".to_string())
+        );
+        assert_eq!(
+            detect_suggested_preset("Interstellar Theme Orchestral Soundtrack", None),
+            Some("cinema_3d".to_string())
+        );
+        assert_eq!(
+            detect_suggested_preset("Tech Talk Weekly Podcast Episode 10", None),
+            Some("vocal_clarity".to_string())
+        );
+        assert_eq!(
+            detect_suggested_preset("Normal Song Title", Some("Normal Artist")),
+            None
+        );
     }
 }
