@@ -301,10 +301,10 @@ impl SourceResolver {
         } else {
             let pot_provider_url = std::env::var("BGUTIL_POT_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:4416".to_string());
-            // Con cookies, `tv_embedded` es el cliente más estable desde IP datacenter;
-            // `mweb` queda a merced del experimento SABR de YouTube (yt-dlp #17666).
+            // android es el cliente más compatible que entrega streams directos estables sin 403 en IPs de servidor;
+            // web sirve como fallback si se especifican cookies o po-token web.
             let default_clients = std::env::var("YTDLP_PLAYER_CLIENTS")
-                .unwrap_or_else(|_| if cookie_path.is_some() { "tv_embedded".to_string() } else { "tv_embedded,mweb".to_string() });
+                .unwrap_or_else(|_| "android,web".to_string());
             cmd.arg("--extractor-args")
                 .arg(format!("youtube:pot_bgutil_webpo:base_url={}", pot_provider_url))
                 .arg("--extractor-args")
@@ -497,9 +497,11 @@ impl SourceResolver {
             cmd.arg("--remote-components").arg(remote_components);
         }
 
-        let js_runtimes = std::env::var("YTDLP_JS_RUNTIMES").unwrap_or_else(|_| "quickjs,deno".to_string());
+        let js_runtimes = std::env::var("YTDLP_JS_RUNTIMES").unwrap_or_else(|_| "deno,quickjs".to_string());
         if !js_runtimes.is_empty() && js_runtimes != "none" {
-            cmd.arg("--js-runtimes").arg(js_runtimes);
+            for rt in js_runtimes.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                cmd.arg("--js-runtimes").arg(rt);
+            }
         }
 
         Self::apply_extractor_defaults(&mut cmd, custom_extractor_args, cookie_path);
@@ -641,9 +643,11 @@ impl SourceResolver {
             cmd.arg("--remote-components").arg(remote_components);
         }
 
-        let js_runtimes = std::env::var("YTDLP_JS_RUNTIMES").unwrap_or_else(|_| "quickjs,deno".to_string());
+        let js_runtimes = std::env::var("YTDLP_JS_RUNTIMES").unwrap_or_else(|_| "deno,quickjs".to_string());
         if !js_runtimes.is_empty() && js_runtimes != "none" {
-            cmd.arg("--js-runtimes").arg(js_runtimes);
+            for rt in js_runtimes.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                cmd.arg("--js-runtimes").arg(rt);
+            }
         }
 
         Self::apply_extractor_defaults(&mut cmd, custom_extractor_args, cookie_path);
@@ -758,6 +762,32 @@ impl SourceResolver {
         let stream_headers: Vec<(String, String)> = val
             .get("http_headers")
             .or_else(|| entries_first.and_then(|e| e.get("http_headers")))
+            .or_else(|| {
+                val.get("requested_formats")
+                    .and_then(|arr| arr.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|fmt| fmt.get("http_headers"))
+            })
+            .or_else(|| {
+                val.get("formats")
+                    .and_then(|arr| arr.as_array())
+                    .and_then(|arr| arr.last())
+                    .and_then(|fmt| fmt.get("http_headers"))
+            })
+            .or_else(|| {
+                entries_first
+                    .and_then(|e| e.get("requested_formats"))
+                    .and_then(|arr| arr.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|fmt| fmt.get("http_headers"))
+            })
+            .or_else(|| {
+                entries_first
+                    .and_then(|e| e.get("formats"))
+                    .and_then(|arr| arr.as_array())
+                    .and_then(|arr| arr.last())
+                    .and_then(|fmt| fmt.get("http_headers"))
+            })
             .and_then(|h| h.as_object())
             .map(|obj| {
                 obj.iter()

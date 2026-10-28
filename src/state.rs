@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use dashmap::{DashMap, DashSet};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,8 @@ pub struct AppState {
     pub tracks_played_count: Arc<AtomicU64>,
     /// Contador atómico de resoluciones de pistas ejecutadas
     pub resolves_count: Arc<AtomicU64>,
+    /// Contador y marca de tiempo de fallos consecutivos de reproducción para el Circuit Breaker anti-bucle
+    pub consecutive_errors: Arc<DashMap<PlayerKey, (u32, Instant)>>,
 }
 
 impl AppState {
@@ -150,6 +152,7 @@ impl AppState {
             custom_presets: Arc::new(Self::load_presets_from_disk()),
             tracks_played_count: Arc::new(AtomicU64::new(0)),
             resolves_count: Arc::new(AtomicU64::new(0)),
+            consecutive_errors: Arc::new(DashMap::new()),
         }
     }
 
@@ -233,6 +236,35 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    /// Registra un fallo de reproducción para el reproductor.
+    /// Retorna `true` si se alcanzó el umbral de disparo del Circuit Breaker (3 fallos en menos de 15s).
+    pub fn record_track_error(&self, key: PlayerKey) -> bool {
+        let mut entry = self.consecutive_errors.entry(key).or_insert((0, Instant::now()));
+        let (ref mut count, ref mut last_time) = *entry;
+        if last_time.elapsed() < Duration::from_secs(15) {
+            *count += 1;
+        } else {
+            *count = 1;
+        }
+        *last_time = Instant::now();
+        *count >= 3
+    }
+
+    /// Retorna `true` si el reproductor está temporalmente bloqueado por dispararse el Circuit Breaker (3 fallos en menos de 15s).
+    pub fn is_circuit_tripped(&self, key: PlayerKey) -> bool {
+        if let Some(entry) = self.consecutive_errors.get(&key) {
+            let (count, last_time) = *entry;
+            count >= 3 && last_time.elapsed() < Duration::from_secs(15)
+        } else {
+            false
+        }
+    }
+
+    /// Limpia el contador de errores consecutivos tras una reproducción exitosa.
+    pub fn reset_consecutive_errors(&self, key: PlayerKey) {
+        self.consecutive_errors.remove(&key);
     }
 
     pub fn record_seen_track(&self, key: PlayerKey, video_id: &str) {
@@ -602,5 +634,30 @@ mod tests {
         assert_eq!(cfg.dsp_params.as_ref().map(|d| d.timescale.speed), Some(1.25));
 
         let _ = std::fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn test_circuit_breaker() {
+        let state = AppState::new();
+        let key = PlayerKey::new(1234, 5678);
+
+        // Sin errores previos, el circuit breaker no debe estar activo
+        assert!(!state.is_circuit_tripped(key));
+
+        // 1er error: no salta
+        assert!(!state.record_track_error(key));
+        assert!(!state.is_circuit_tripped(key));
+
+        // 2do error: no salta
+        assert!(!state.record_track_error(key));
+        assert!(!state.is_circuit_tripped(key));
+
+        // 3er error consecutivo: salta el circuit breaker
+        assert!(state.record_track_error(key));
+        assert!(state.is_circuit_tripped(key));
+
+        // Reset: se limpia y vuelve a estar libre
+        state.reset_consecutive_errors(key);
+        assert!(!state.is_circuit_tripped(key));
     }
 }

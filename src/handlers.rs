@@ -16,6 +16,7 @@ use songbird::ConnectionInfo;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
@@ -35,17 +36,12 @@ struct TrackPlayNotifier {
     event_tx: broadcast::Sender<PlayerEvent>,
     state: Option<AppState>,
     has_played: Arc<AtomicBool>,
-    retried: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl EventHandler for TrackPlayNotifier {
     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
         self.has_played.store(true, Ordering::SeqCst);
-        // Al comenzar a reproducir con éxito, reseteamos el indicador de retry
-        // Esto permite que si la URL de CDN de YouTube expira tras 6 horas de reproducción continua,
-        // la auto-curación se active de nuevo sin límite arbitrario.
-        self.retried.store(false, Ordering::SeqCst);
         info!(guild = self.key.guild_id, bot = self.key.bot_id, title = %self.meta.title, "Evento TrackPlay emitido");
         if let Some(ref st) = self.state {
             st.tracks_played_count.fetch_add(1, Ordering::Relaxed);
@@ -112,6 +108,9 @@ impl EventHandler for TrackEndNotifier {
         // Bucle de cola: Si la pista terminó con éxito y el modo es Queue, re-encolar al final
         if reason == "finished" {
             if let Some(ref st) = self.state {
+                // Éxito confirmado: limpiar contador de fallos consecutivos del Circuit Breaker
+                st.reset_consecutive_errors(self.key);
+
                 if st.get_loop_mode(self.key) == LoopMode::Queue {
                     let st_clone = st.clone();
                     let key = self.key;
@@ -146,14 +145,20 @@ impl EventHandler for TrackEndNotifier {
                                 meta.clone()
                             };
 
-                            let trk = create_track_with_dsp(
+                            let trk = match create_track_with_dsp(
                                 st_clone.http_client.clone(),
                                 meta_to_use.stream_url.clone(),
                                 meta_to_use.clone(),
                                 dsp_params,
                                 play_opts.user_agent.as_deref(),
                             )
-                            .await;
+                            .await {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    warn!(error = %e, "Fallo al inicializar stream para loop de cola");
+                                    return;
+                                }
+                            };
 
                             let mut driver = driver_ref.lock().await;
                             let handle = driver.enqueue(trk).await;
@@ -196,15 +201,51 @@ struct TrackErrorNotifier {
 #[async_trait]
 impl EventHandler for TrackErrorNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        let err_msg = match ctx {
-            EventContext::Track(slice) => slice
-                .first()
-                .map(|(state, _)| format!("{:?}", state.playing))
-                .unwrap_or_else(|| "Error de reproducción".to_string()),
-            _ => "Error de reproducción".to_string(),
+        let (err_msg, track_handle) = match ctx {
+            EventContext::Track(slice) => {
+                let msg = slice
+                    .first()
+                    .map(|(state, _)| format!("{:?}", state.playing))
+                    .unwrap_or_else(|| "Error de reproducción".to_string());
+                let h = slice.first().map(|(_, h)| (*h).clone());
+                (msg, h)
+            }
+            _ => ("Error de reproducción".to_string(), None),
         };
 
+        // Si la pista tenía repetición activa en su handle, desactivarla inmediatamente
+        // para que Songbird no intente re-reproducir un stream roto en un bucle cerrado nativo.
+        if let Some(ref h) = track_handle {
+            let _ = h.disable_loop();
+        }
+
         if let Some(ref st) = self.state {
+            // Circuit Breaker: si 3 canciones consecutivas fallan en menos de 15 segundos,
+            // detener la reproducción para evitar bucles infinitos y saturación de APIs.
+            let circuit_tripped = st.record_track_error(self.key);
+            if circuit_tripped {
+                warn!(
+                    guild = self.key.guild_id,
+                    bot = self.key.bot_id,
+                    title = %self.meta.title,
+                    "Circuit Breaker activado: 3 canciones consecutivas fallaron al conectar con el stream. Deteniendo reproducción para evitar bucle."
+                );
+                if let Some(driver_ref) = st.players.get(&self.key) {
+                    let d = driver_ref.lock().await;
+                    d.queue().stop();
+                }
+                st.pending_playlists.remove(&self.key);
+                st.reset_consecutive_errors(self.key);
+
+                let _ = self.event_tx.send(PlayerEvent::TrackError {
+                    guild_id: self.key.guild_id,
+                    bot_id: Some(self.key.bot_id),
+                    track: Some(self.meta.to_response()),
+                    error: "Reproducción detenida por protección anti-bucle: 3 canciones consecutivas fallaron al reproducirse.".to_string(),
+                });
+                return None;
+            }
+
             if !self.retried.swap(true, Ordering::SeqCst) {
                 st.resolver.invalidate_cache(&self.meta.source_url);
                 st.resolver.invalidate_cache(&self.meta.stream_url);
@@ -248,43 +289,56 @@ impl EventHandler for TrackErrorNotifier {
                                 let effective_vol = (target_vol * 0.95).clamp(0.0, 2.0);
                                 let track_meta = Arc::new(fresh_track.clone());
 
-                                let songbird_track = create_track_with_dsp(
+                                match create_track_with_dsp(
                                     st_clone.http_client.clone(),
                                     fresh_track.stream_url.clone(),
                                     track_meta.clone(),
                                     dsp_params,
                                     play_opts.user_agent.as_deref(),
                                 )
-                                .await;
+                                .await
+                                {
+                                    Ok(songbird_track) => {
+                                        let handle = {
+                                            let mut driver = driver_ref.lock().await;
+                                            let h = driver.enqueue(songbird_track).await;
+                                            let _ = h.set_volume(effective_vol);
+                                            h
+                                        };
 
-                                let handle = {
-                                    let mut driver = driver_ref.lock().await;
-                                    let h = driver.enqueue(songbird_track).await;
-                                    let _ = h.set_volume(effective_vol);
-                                    h
-                                };
+                                        // El flag de reintento queda permanentemente en true para evitar reintentar en bucle
+                                        let retried_flag = Arc::new(AtomicBool::new(true));
+                                        attach_track_events_with_retried(
+                                            key,
+                                            track_meta,
+                                            &handle,
+                                            &event_tx_clone,
+                                            Some(st_clone.clone()),
+                                            retried_flag,
+                                        );
 
-                                let retried_flag = Arc::new(AtomicBool::new(true));
-                                attach_track_events_with_retried(
-                                    key,
-                                    track_meta,
-                                    &handle,
-                                    &event_tx_clone,
-                                    Some(st_clone.clone()),
-                                    retried_flag,
-                                );
+                                        if st_clone.get_loop_mode(key) == LoopMode::Track {
+                                            let _ = handle.enable_loop();
+                                        }
 
-                                if st_clone.get_loop_mode(key) == LoopMode::Track {
-                                    let _ = handle.enable_loop();
+                                        info!(
+                                            guild = key.guild_id,
+                                            bot = key.bot_id,
+                                            title = %fresh_track.title,
+                                            "Auto-curación exitosa: pista re-resuelta con stream fresco y reanudada"
+                                        );
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            guild = key.guild_id,
+                                            bot = key.bot_id,
+                                            title = %fresh_track.title,
+                                            error = %e,
+                                            "Auto-curación descartada: el stream re-resuelto tampoco pudo abrirse"
+                                        );
+                                    }
                                 }
-
-                                info!(
-                                    guild = key.guild_id,
-                                    bot = key.bot_id,
-                                    title = %fresh_track.title,
-                                    "Auto-curación exitosa: pista re-resuelta con stream fresco y reanudada"
-                                );
-                                return;
                             }
                         }
                         Err(e) => {
@@ -312,6 +366,7 @@ impl EventHandler for TrackErrorNotifier {
                         }),
                         error: err_msg,
                     });
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     maybe_prefetch_next_track(&st_clone, key).await;
                 });
 
@@ -387,7 +442,6 @@ fn attach_track_events_with_retried(
             event_tx: event_tx.clone(),
             state: state.clone(),
             has_played: has_played.clone(),
-            retried: retried.clone(),
         },
     );
     let _ = handle.add_event(
@@ -708,7 +762,7 @@ async fn create_track_with_dsp(
     meta: Arc<TrackMetadata>,
     dsp_params: Arc<std::sync::RwLock<DspParams>>,
     custom_user_agent: Option<&str>,
-) -> Track {
+) -> Result<Track, String> {
     let is_google_cdn = stream_url.contains("googlevideo.com")
         || stream_url.contains("googleapis.com/videoplayback");
 
@@ -760,7 +814,7 @@ async fn create_track_with_dsp(
         }
     }
 
-    let mut source = HttpRequest::new_with_headers(client.clone(), stream_url.clone(), headers);
+    let mut source = HttpRequest::new_with_headers(client.clone(), stream_url.clone(), headers.clone());
     if let Some(len) = meta.stream_content_length {
         source.content_length = Some(len);
     }
@@ -777,12 +831,23 @@ async fn create_track_with_dsp(
             if let Some(parsed) = playable.parsed_mut() {
                 inject_dsp(parsed, dsp_params);
             }
-            Track::new_with_data(playable, meta)
+            Ok(Track::new_with_data(playable, meta))
         }
         Err(e) => {
-            warn!(error = ?e, "Pre-parsing falló para DSP, usando entrada nativa de Songbird");
-            let fallback = HttpRequest::new(client, stream_url);
-            Track::new_with_data(fallback.into(), meta)
+            let err_str = e.to_string();
+            if err_str.contains("403")
+                || err_str.contains("Forbidden")
+                || err_str.contains("404")
+                || err_str.contains("410")
+            {
+                return Err(format!("Error HTTP ({}) al abrir stream", err_str));
+            }
+            warn!(error = ?e, "Pre-parsing falló para DSP, intentando entrada nativa de Songbird con headers");
+            let mut fallback = HttpRequest::new_with_headers(client, stream_url, headers);
+            if let Some(len) = meta.stream_content_length {
+                fallback.content_length = Some(len);
+            }
+            Ok(Track::new_with_data(fallback.into(), meta))
         }
     }
 }
@@ -849,14 +914,26 @@ pub async fn player_play(
     // IMPORTANTE: create_track_with_dsp conecta vía HTTP para resolver headers del stream.
     // Lo ejecutamos FUERA del lock del Driver para no bloquear /queue, /control ni /leave.
     let first_meta = Arc::new(batch.first_track.clone());
-    let songbird_track = create_track_with_dsp(
+    let songbird_track = match create_track_with_dsp(
         state.http_client.clone(),
         batch.first_track.stream_url.clone(),
         first_meta.clone(),
         dsp_params.clone(),
         payload.user_agent.as_deref(),
     )
-    .await;
+    .await {
+        Ok(t) => t,
+        Err(e) => {
+            error!(guild = payload.guild_id, bot = player_key.bot_id, error = %e, "Fallo al inicializar stream de audio");
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(ApiResponse::err(format!("Fallo al conectar con el stream de audio: {}", e))),
+            ));
+        }
+    };
+
+    // Petición explícita de usuario: resetear contador de fallos del Circuit Breaker
+    state.reset_consecutive_errors(player_key);
 
     let (handle, initial_queue_len, total_queue_len) = {
         let mut driver = driver_ref.lock().await;
@@ -1136,6 +1213,7 @@ pub async fn player_control(
             state.next_epoch(player_key);
             state.pending_playlists.remove(&player_key);
             state.end_prefetch(player_key);
+            state.reset_consecutive_errors(player_key);
             driver.queue().stop();
             driver.stop();
             Ok(Json(ApiResponse::ok("Reproductor detenido".to_string())))
@@ -1148,6 +1226,7 @@ pub async fn player_control(
             state.next_epoch(player_key);
             state.pending_playlists.remove(&player_key);
             state.end_prefetch(player_key);
+            state.reset_consecutive_errors(player_key);
             driver.queue().modify_queue(|q| {
                 if q.len() > 1 {
                     let first = q.pop_front().unwrap();
@@ -1949,6 +2028,11 @@ pub async fn player_dsp_reset(
 /// Evalúa el estado del reproductor y, si restan 10-15s para el final de la pista actual
 /// (o si la cola está vacía tras un salto), pre-resuelve y encola la siguiente pista de la cola.
 pub async fn maybe_prefetch_next_track(state: &AppState, key: PlayerKey) {
+    // 0. Si el Circuit Breaker está disparado (3 errores continuos), abortar para evitar bucle
+    if state.is_circuit_tripped(key) {
+        return;
+    }
+
     // 1. Si el modo de repetición es 'track', la pista actual se repite indefinidamente
     if state.get_loop_mode(key) == LoopMode::Track {
         return;
@@ -2123,79 +2207,146 @@ pub async fn maybe_prefetch_next_track(state: &AppState, key: PlayerKey) {
             state: state_clone_for_guard,
         };
 
-        info!(
-            guild = guard_key.guild_id,
-            bot = guard_key.bot_id,
-            next_title = %next_item.title,
-            trigger = %reason,
-            "Prefetch anticipado activado: resolviendo y precalentando flujo de audio (gapless)..."
-        );
+        let mut current_item = next_item;
+        loop {
+            info!(
+                guild = guard_key.guild_id,
+                bot = guard_key.bot_id,
+                next_title = %current_item.title,
+                trigger = %reason,
+                "Prefetch anticipado: resolviendo y precalentando flujo de audio (gapless)..."
+            );
 
-        let resolve_res = state_clone
-            .resolver
-            .resolve_single(
-                &next_item.url,
-                play_opts.extractor_args.as_deref(),
-                play_opts.extra_args.as_deref(),
-                play_opts.cookies.as_deref(),
-                play_opts.format.as_deref(),
-            )
-            .await;
-
-        match resolve_res {
-            Ok(track) => {
-                let dsp_params = state_clone.get_dsp_params(guard_key);
-                let target_vol = state_clone.get_volume(guard_key);
-                let effective_vol = (target_vol * 0.95).clamp(0.0, 2.0);
-                let track_meta = Arc::new(track.clone());
-
-                let songbird_track = create_track_with_dsp(
-                    state_clone.http_client.clone(),
-                    track.stream_url.clone(),
-                    track_meta.clone(),
-                    dsp_params,
-                    play_opts.user_agent.as_deref(),
+            let resolve_res = state_clone
+                .resolver
+                .resolve_single(
+                    &current_item.url,
+                    play_opts.extractor_args.as_deref(),
+                    play_opts.extra_args.as_deref(),
+                    play_opts.cookies.as_deref(),
+                    play_opts.format.as_deref(),
                 )
                 .await;
 
-                let handle = {
-                    let mut driver = driver_clone.lock().await;
-                    let h = driver.enqueue(songbird_track).await;
-                    let _ = h.set_volume(effective_vol);
-                    h
-                };
+            match resolve_res {
+                Ok(track) => {
+                    let dsp_params = state_clone.get_dsp_params(guard_key);
+                    let target_vol = state_clone.get_volume(guard_key);
+                    let effective_vol = (target_vol * 0.95).clamp(0.0, 2.0);
+                    let track_meta = Arc::new(track.clone());
 
-                attach_track_events(
-                    guard_key,
-                    track_meta,
-                    &handle,
-                    &state_clone.event_tx,
-                    Some(state_clone.clone()),
-                );
+                    match create_track_with_dsp(
+                        state_clone.http_client.clone(),
+                        track.stream_url.clone(),
+                        track_meta.clone(),
+                        dsp_params,
+                        play_opts.user_agent.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(songbird_track) => {
+                            let handle = {
+                                let mut driver = driver_clone.lock().await;
+                                let h = driver.enqueue(songbird_track).await;
+                                let _ = h.set_volume(effective_vol);
+                                h
+                            };
 
-                if state_clone.get_loop_mode(guard_key) == LoopMode::Track {
-                    let _ = handle.enable_loop();
+                            attach_track_events(
+                                guard_key,
+                                track_meta,
+                                &handle,
+                                &state_clone.event_tx,
+                                Some(state_clone.clone()),
+                            );
+
+                            if state_clone.get_loop_mode(guard_key) == LoopMode::Track {
+                                let _ = handle.enable_loop();
+                            }
+
+                            info!(
+                                guild = guard_key.guild_id,
+                                bot = guard_key.bot_id,
+                                title = %track.title,
+                                "Prefetch exitoso: decodificador y stream listos en cola Songbird (transición gapless)"
+                            );
+                            break;
+                        }
+                        Err(err) => {
+                            warn!(
+                                guild = guard_key.guild_id,
+                                bot = guard_key.bot_id,
+                                title = %track.title,
+                                error = %err,
+                                "Fallo al abrir stream de pista prefetch; descartando pista fallida"
+                            );
+                            let is_idle = {
+                                let driver = driver_clone.lock().await;
+                                driver.queue().is_empty()
+                            };
+                            if is_idle {
+                                if state_clone.record_track_error(guard_key) {
+                                    warn!(
+                                        guild = guard_key.guild_id,
+                                        bot = guard_key.bot_id,
+                                        "Circuit Breaker activado durante prefetch/autoplay: deteniendo cola."
+                                    );
+                                    state_clone.pending_playlists.remove(&guard_key);
+                                    let _ = state_clone.event_tx.send(PlayerEvent::TrackError {
+                                        guild_id: guard_key.guild_id,
+                                        bot_id: Some(guard_key.bot_id),
+                                        track: Some(track.to_response()),
+                                        error: "Reproducción detenida por protección anti-bucle: múltiples canciones consecutivas no pudieron reproducirse.".to_string(),
+                                    });
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                if let Some(mut list) = state_clone.pending_playlists.get_mut(&guard_key) {
+                                    if !list.is_empty() {
+                                        current_item = list.remove(0);
+                                        continue;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
-
-                info!(
-                    guild = guard_key.guild_id,
-                    bot = guard_key.bot_id,
-                    title = %track.title,
-                    "Prefetch exitoso: decodificador y stream listos en cola Songbird (transición gapless)"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    guild = guard_key.guild_id,
-                    bot = guard_key.bot_id,
-                    url = %next_item.url,
-                    title = %next_item.title,
-                    error = %err,
-                    "Fallo al resolver pista durante prefetch anticipado; continuará con la siguiente de la cola"
-                );
+                Err(err) => {
+                    warn!(
+                        guild = guard_key.guild_id,
+                        bot = guard_key.bot_id,
+                        url = %current_item.url,
+                        title = %current_item.title,
+                        error = %err,
+                        "Fallo al resolver pista durante prefetch anticipado; continuará con la siguiente de la cola"
+                    );
+                    let is_idle = {
+                        let driver = driver_clone.lock().await;
+                        driver.queue().is_empty()
+                    };
+                    if is_idle {
+                        if state_clone.record_track_error(guard_key) {
+                            warn!(
+                                guild = guard_key.guild_id,
+                                bot = guard_key.bot_id,
+                                "Circuit Breaker activado durante resolución prefetch: deteniendo cola."
+                            );
+                            state_clone.pending_playlists.remove(&guard_key);
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        if let Some(mut list) = state_clone.pending_playlists.get_mut(&guard_key) {
+                            if !list.is_empty() {
+                                current_item = list.remove(0);
+                                continue;
+                            }
+                        }
+                    }
+                    break;
+                }
             }
         }
-        // _guard se destruye aquí, llamando end_prefetch automáticamente
     });
 }
 
