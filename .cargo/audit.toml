@@ -1,0 +1,46 @@
+# Configuration for cargo-audit in axAudio
+# See https://github.com/rustsec/rustsec/blob/main/cargo-audit/audit.toml.example
+
+[advisories]
+# Ignore advisories that either:
+# 1. Do not affect axAudio (phantom dependencies resolved in Cargo.lock by upstream optional features, but never compiled)
+# 2. Are in upstream dependencies (songbird / davey for Discord DAVE E2EE) awaiting upstream crate updates, where the vulnerability is not exploitable in our audio pipeline.
+ignore = [
+    # --- PHANTOM DEPENDENCIES (not compiled into axAudio binary) ---
+    # songbird publishes optional serenity support, causing Cargo to resolve serenity/rustls 0.22 and rustls-webpki 0.102 in Cargo.lock.
+    # axAudio uses rustls 0.23 / rustls-webpki 0.103.16 (both patched) and never compiles serenity or rustls 0.22.
+    "RUSTSEC-2026-0346", # rustls 0.22.4 Debug impls expose TLS secrets
+    "RUSTSEC-2026-0347", # rustls 0.22.4 Unauthenticated ServerHello leads to deadlock
+    "RUSTSEC-2026-0348", # rustls 0.22.4 Infinite loop on non-standard close_notify
+    "RUSTSEC-2026-0349", # rustls 0.22.4 Malformed hello message causes panic
+    "RUSTSEC-2026-0351", # rustls 0.22.4 Memory leak during handshakes
+    "RUSTSEC-2026-0352", # rustls 0.22.4 Unbounded buffer growth on TLS 1.3 key update
+    "RUSTSEC-2026-0382", # rustls-webpki 0.102.8 revocation checking
+    "RUSTSEC-2026-0049", # rustls-webpki 0.102.8 CRLs not considered authoritative
+    "RUSTSEC-2026-0098", # rustls-webpki 0.102.8 Name constraints URI
+    "RUSTSEC-2026-0099", # rustls-webpki 0.102.8 Name constraints wildcard
+    "RUSTSEC-2026-0104", # rustls-webpki 0.102.8 Reachable panic in CRL parsing
+
+    # --- NON-EXPLOITABLE IN AXAUDIO ---
+    # ringbuf 0.4.8: Double free when an element's `Drop` panics during Consumer::skip/clear.
+    # Songbird buffers only f32 and i16 audio samples, which are primitive Copy types that never run Drop or panic.
+    "RUSTSEC-2026-0293",
+
+    # --- UPSTREAM DAVE E2EE STACK (songbird 0.6.1 -> davey 0.1.5 -> hpke-rs / openmls) ---
+    # Discord Audio End-to-End Encryption protocol dependencies. Awaiting upstream songbird updates.
+    "RUSTSEC-2026-0387", # crypto-bigint 0.5.5: timing variability in constant-time ops (p256 in DAVE)
+    "RUSTSEC-2026-0209", # libcrux-aesgcm: AAD length limit
+    "RUSTSEC-2026-0211", # libcrux-aesgcm: non-constant time auth tag check
+    "RUSTSEC-2026-0124", # libcrux-chacha20poly1305: panic on overlong ciphertext buffer
+    "RUSTSEC-2026-0330", # libcrux-kem: hybrid encapsulation panic on short seed
+    "RUSTSEC-2026-0331", # libcrux-kem: panic on decoding short hybrid keys
+    "RUSTSEC-2026-0212", # libcrux-secrets: constant-time swap/select on aarch64
+    "RUSTSEC-2026-0207", # libcrux-sha3: incremental SHAKE API on multiple squeeze calls
+    "RUSTSEC-2026-0208", # libcrux-sha3: AVX2 SHAKE-256 panic
+]
+
+informational_warnings = []
+
+[yanked]
+enabled = true
+update_index = true

@@ -29,21 +29,28 @@ ENV AXAUDIO_VERSION=$AXAUDIO_VERSION
 RUN touch src/main.rs && cargo build --release
 
 # ==========================================
-# Stage 2: Minimal Runtime stage
+# Stage 2: Proof-of-Origin Token Provider
+# ==========================================
+FROM brainicism/bgutil-ytdlp-pot-provider:latest AS pot-provider
+
+# ==========================================
+# Stage 3: Minimal All-in-One Runtime stage
 # ==========================================
 FROM debian:bookworm-slim AS runner
 
 # Instalar dependencias mínimas de ejecución:
 # - ca-certificates: esencial para streaming HTTPS de audios
 # - libopus0: librería compartida de códec de audio
-# - curl, unzip: utilidades
+# - curl, unzip, dumb-init: utilidades de red e init process
 # - python3 & yt-dlp: extractor de audio y resolución de URLs CDN directas
 # - quickjs & deno: motor ultraligero QuickJS (~2MB RAM, ~3ms) como primario y Deno como fallback
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libopus0 \
+    libatomic1 \
     curl \
     unzip \
+    dumb-init \
     python3 \
     python3-pip \
     && ARCH=$(uname -m) \
@@ -60,19 +67,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get purge -y unzip \
     && rm -rf /var/lib/apt/lists/*
 
+# Copiar Node.js y el servidor bgutil-pot para ejecutar el generador de PO Tokens localmente
+COPY --from=pot-provider /usr/local/bin/node /usr/local/bin/node
+COPY --from=pot-provider /app /opt/bgutil-pot
+
 # Seguridad: crear usuario no root
 RUN useradd -m -u 10001 -s /bin/sh axaudio \
-    && chown -R axaudio:axaudio /tmp/yt-dlp-cache
-USER axaudio
+    && chown -R axaudio:axaudio /tmp/yt-dlp-cache /opt/bgutil-pot
 
 WORKDIR /app
 
-# Copiar el binario optimizado desde el builder
+# Copiar el binario optimizado y el script de inicio
 COPY --from=builder --chown=axaudio:axaudio /app/target/release/axAudio /app/axAudio
+COPY --chown=axaudio:axaudio entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+USER axaudio
 
 # Variables de entorno predeterminadas
 ENV PORT=2333
 ENV RUST_LOG=axAudio=info,tower_http=info
+ENV BGUTIL_POT_URL=http://127.0.0.1:4416
 
 # Exponer puertos HTTP (2333 por defecto, 3000 para Coolify)
 EXPOSE 2333 3000
@@ -81,5 +96,5 @@ EXPOSE 2333 3000
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
     CMD sh -c 'curl -f "http://127.0.0.1:${PORT:-2333}/health" || exit 1'
 
-# Ejecutar el motor de audio
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/app/entrypoint.sh"]
 CMD ["/app/axAudio"]

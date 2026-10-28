@@ -7,3 +7,5 @@ presets/*.json
 !presets/.gitkeep
 settings/*.json
 !settings/.gitkeep
+.cargo/*
+!.cargo/audit.toml

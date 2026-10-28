@@ -300,7 +300,7 @@ impl SourceResolver {
             cmd.arg("--extractor-args").arg(env_args);
         } else {
             let pot_provider_url = std::env::var("BGUTIL_POT_URL")
-                .unwrap_or_else(|_| "http://bgutil-pot:4416".to_string());
+                .unwrap_or_else(|_| "http://127.0.0.1:4416".to_string());
             // Con cookies, `tv_embedded` es el cliente más estable desde IP datacenter;
             // `mweb` queda a merced del experimento SABR de YouTube (yt-dlp #17666).
             let default_clients = std::env::var("YTDLP_PLAYER_CLIENTS")

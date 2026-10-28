@@ -11,18 +11,20 @@ services:
       - PORT=2333
       - RUST_LOG=axAudio=info,tower_http=info
       - TOKIO_WORKER_THREADS=2
-      - BGUTIL_POT_URL=http://bgutil-pot:4416
+      # Opcional: Para usar un proveedor POT externo en lugar del interno en 127.0.0.1:4416:
+      # - BGUTIL_POT_URL=http://otro-host:4416
+      # - ENABLE_INTERNAL_POT=false
     volumes:
-      # Mount single cookie file or an entire directory of multi-account cookies
-      - ./cookies.txt:/app/cookies.txt
-      - ./cookies:/app/cookies
-    depends_on:
-      - bgutil-pot
+      # Montaje opcional de cookies (archivo individual o carpeta multi-cuenta)
+      - ./cookies.txt:/app/cookies.txt:ro
+      - ./cookies:/app/cookies:ro
+      # Opcional: Persistir la caché de yt-dlp (acelera la resolución y evita re-descargas)
+      - ytdlp-cache:/tmp/yt-dlp-cache
     deploy:
       resources:
         limits:
-          cpus: '1.20'
-          memory: 128M
+          cpus: '1.50'
+          memory: 256M
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:2333/health"]
       interval: 15s
@@ -30,9 +32,6 @@ services:
       retries: 3
       start_period: 5s
 
-  bgutil-pot:
-    image: brainicism/bgutil-ytdlp-pot-provider:latest
-    container_name: bgutil-pot
-    restart: unless-stopped
-    ports:
-      - "4416:4416"
+volumes:
+  # Volumen nombrado para la persistencia opcional de la caché de yt-dlp
+  ytdlp-cache:
