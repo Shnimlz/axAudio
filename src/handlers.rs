@@ -783,11 +783,13 @@ async fn create_track_with_dsp(
             });
         reqwest::Client::builder()
             .user_agent(ua)
+            .connect_timeout(Duration::from_secs(4))
             .build()
             .unwrap_or_else(|_| http_client.clone())
     } else if let Some(ua) = custom_user_agent {
         reqwest::Client::builder()
             .user_agent(ua)
+            .connect_timeout(Duration::from_secs(4))
             .build()
             .unwrap_or_else(|_| http_client.clone())
     } else {
@@ -820,20 +822,19 @@ async fn create_track_with_dsp(
     }
     let input: songbird::input::Input = source.into();
 
-    match input
-        .make_playable_async(
-            songbird::input::codecs::get_codec_registry(),
-            songbird::input::codecs::get_probe(),
-        )
-        .await
-    {
-        Ok(mut playable) => {
+    let make_playable_fut = input.make_playable_async(
+        songbird::input::codecs::get_codec_registry(),
+        songbird::input::codecs::get_probe(),
+    );
+
+    match tokio::time::timeout(Duration::from_secs(5), make_playable_fut).await {
+        Ok(Ok(mut playable)) => {
             if let Some(parsed) = playable.parsed_mut() {
                 inject_dsp(parsed, dsp_params);
             }
             Ok(Track::new_with_data(playable, meta))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let err_str = e.to_string();
             if err_str.contains("403")
                 || err_str.contains("Forbidden")
@@ -843,6 +844,14 @@ async fn create_track_with_dsp(
                 return Err(format!("Error HTTP ({}) al abrir stream", err_str));
             }
             warn!(error = ?e, "Pre-parsing falló para DSP, intentando entrada nativa de Songbird con headers");
+            let mut fallback = HttpRequest::new_with_headers(client, stream_url, headers);
+            if let Some(len) = meta.stream_content_length {
+                fallback.content_length = Some(len);
+            }
+            Ok(Track::new_with_data(fallback.into(), meta))
+        }
+        Err(_) => {
+            warn!("Pre-parsing excedió límite de 5s, usando entrada nativa en streaming de Songbird");
             let mut fallback = HttpRequest::new_with_headers(client, stream_url, headers);
             if let Some(len) = meta.stream_content_length {
                 fallback.content_length = Some(len);
