@@ -80,24 +80,163 @@ impl EventHandler for TrackEndNotifier {
             );
             return None;
         }
-        let reason = match ctx {
+        let (reason, played_secs) = match ctx {
             EventContext::Track(slice) => slice
                 .first()
-                .map(|(state, _)| match state.playing {
-                    songbird::tracks::PlayMode::Stop => "stopped",
-                    songbird::tracks::PlayMode::End => "finished",
-                    songbird::tracks::PlayMode::Errored(_) => "error",
-                    _ => "finished",
+                .map(|(state, _)| {
+                    let r = match state.playing {
+                        songbird::tracks::PlayMode::Stop => "stopped",
+                        songbird::tracks::PlayMode::End => "finished",
+                        songbird::tracks::PlayMode::Errored(_) => "error",
+                        _ => "finished",
+                    };
+                    (r, state.position.as_secs_f64())
                 })
-                .unwrap_or("finished"),
-            _ => "finished",
+                .unwrap_or(("finished", 0.0)),
+            _ => ("finished", 0.0),
         };
+
+        // Detección de corte prematuro del stream por el CDN (menos de 4s reproducidos cuando la canción dura > 20s)
+        let is_premature_eof = reason == "finished"
+            && played_secs < 4.0
+            && self.meta.duration_secs.map(|d| d > 20).unwrap_or(false)
+            && !self.meta.is_live;
+
+        if is_premature_eof {
+            warn!(
+                guild = self.key.guild_id,
+                bot = self.key.bot_id,
+                title = %self.meta.title,
+                played_secs,
+                expected_duration = ?self.meta.duration_secs,
+                "TrackEnd anómalo: la pista finalizó tras solo {:.2}s (< 4s). Posible corte de CDN o stream truncado.",
+                played_secs
+            );
+
+            if let Some(ref st) = self.state {
+                let circuit_tripped = st.record_track_error(self.key);
+                if circuit_tripped {
+                    warn!(
+                        guild = self.key.guild_id,
+                        bot = self.key.bot_id,
+                        "Circuit Breaker activado: 3 pistas consecutivas finalizaron prematuramente. Deteniendo reproducción para evitar bucle."
+                    );
+                    if let Some(driver_ref) = st.players.get(&self.key) {
+                        let d = driver_ref.lock().await;
+                        d.queue().stop();
+                    }
+                    st.pending_playlists.remove(&self.key);
+                    let _ = self.event_tx.send(PlayerEvent::TrackError {
+                        guild_id: self.key.guild_id,
+                        bot_id: Some(self.key.bot_id),
+                        track: Some(self.meta.to_response()),
+                        error: "Reproducción detenida por protección anti-bucle: múltiples canciones fallaron o finalizaron prematuramente.".to_string(),
+                    });
+                    return None;
+                }
+
+                // Si aún no es intento de reintento, intentar auto-curación
+                if !self.is_retry_attempt {
+                    st.resolver.invalidate_cache(&self.meta.source_url);
+                    st.resolver.invalidate_cache(&self.meta.stream_url);
+
+                    let st_clone = st.clone();
+                    let key = self.key;
+                    let source_url = self.meta.source_url.clone();
+                    let event_tx_clone = self.event_tx.clone();
+                    let meta_clone = self.meta.clone();
+
+                    tokio::spawn(async move {
+                        let play_opts = st_clone
+                            .guild_play_options
+                            .get(&key)
+                            .map(|p| p.clone())
+                            .unwrap_or_default();
+
+                        match st_clone
+                            .resolver
+                            .resolve_single(
+                                &source_url,
+                                play_opts.extractor_args.as_deref(),
+                                play_opts.extra_args.as_deref(),
+                                play_opts.cookies.as_deref(),
+                                play_opts.format.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(fresh_track) => {
+                                if let Some(driver_ref) = st_clone.players.get(&key) {
+                                    let dsp_params = st_clone.get_dsp_params(key);
+                                    let target_vol = st_clone.get_volume(key);
+                                    let effective_vol = (target_vol * 0.95).clamp(0.0, 2.0);
+                                    let track_meta = Arc::new(fresh_track.clone());
+
+                                    if let Ok(songbird_track) = create_track_with_dsp(
+                                        st_clone.http_client.clone(),
+                                        fresh_track.stream_url.clone(),
+                                        track_meta.clone(),
+                                        dsp_params,
+                                        play_opts.user_agent.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        let handle = {
+                                            let mut driver = driver_ref.lock().await;
+                                            let h = driver.enqueue(songbird_track).await;
+                                            let _ = h.set_volume(effective_vol);
+                                            h
+                                        };
+
+                                        let retried_flag = Arc::new(AtomicBool::new(true));
+                                        attach_track_events_with_retried(
+                                            key,
+                                            track_meta,
+                                            &handle,
+                                            &event_tx_clone,
+                                            Some(st_clone.clone()),
+                                            retried_flag,
+                                        );
+
+                                        info!(
+                                            guild = key.guild_id,
+                                            bot = key.bot_id,
+                                            title = %fresh_track.title,
+                                            "Auto-curación exitosa tras corte prematuro de CDN: pista reanudada"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    guild = key.guild_id,
+                                    bot = key.bot_id,
+                                    error = %e,
+                                    "Auto-curación no pudo re-resolver la pista tras corte prematuro"
+                                );
+                            }
+                        }
+
+                        let _ = event_tx_clone.send(PlayerEvent::TrackError {
+                            guild_id: key.guild_id,
+                            bot_id: Some(key.bot_id),
+                            track: Some(meta_clone.to_response()),
+                            error: "El stream de audio se interrumpió de forma prematura (< 4s).".to_string(),
+                        });
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        maybe_prefetch_next_track(&st_clone, key).await;
+                    });
+
+                    return None;
+                }
+            }
+        }
 
         if reason == "error" && self.state.is_some() && !self.is_retry_attempt {
             return None;
         }
 
-        info!(guild = self.key.guild_id, bot = self.key.bot_id, title = %self.meta.title, reason = %reason, "Evento TrackEnd emitido");
+        info!(guild = self.key.guild_id, bot = self.key.bot_id, title = %self.meta.title, reason = %reason, played_secs, "Evento TrackEnd emitido");
         let _ = self.event_tx.send(PlayerEvent::TrackEnd {
             guild_id: self.key.guild_id,
             bot_id: Some(self.key.bot_id),
@@ -106,7 +245,7 @@ impl EventHandler for TrackEndNotifier {
         });
 
         // Bucle de cola: Si la pista terminó con éxito y el modo es Queue, re-encolar al final
-        if reason == "finished" {
+        if reason == "finished" && !is_premature_eof {
             if let Some(ref st) = self.state {
                 // Éxito confirmado: limpiar contador de fallos consecutivos del Circuit Breaker
                 st.reset_consecutive_errors(self.key);
@@ -235,7 +374,8 @@ impl EventHandler for TrackErrorNotifier {
                     d.queue().stop();
                 }
                 st.pending_playlists.remove(&self.key);
-                st.reset_consecutive_errors(self.key);
+                // El Circuit Breaker se mantiene activo durante el tiempo de enfriamiento (30s)
+                // para evitar que reintentos en segundo plano o autoplay vuelvan a generar bucles.
 
                 let _ = self.event_tx.send(PlayerEvent::TrackError {
                     guild_id: self.key.guild_id,
@@ -816,8 +956,12 @@ async fn create_track_with_dsp(
         }
     }
 
+    let effective_content_length = meta
+        .stream_content_length
+        .or_else(|| SourceResolver::extract_clen_from_url(&stream_url));
+
     let mut source = HttpRequest::new_with_headers(client.clone(), stream_url.clone(), headers.clone());
-    if let Some(len) = meta.stream_content_length {
+    if let Some(len) = effective_content_length {
         source.content_length = Some(len);
     }
     let input: songbird::input::Input = source.into();
@@ -845,7 +989,7 @@ async fn create_track_with_dsp(
             }
             warn!(error = ?e, "Pre-parsing falló para DSP, intentando entrada nativa de Songbird con headers");
             let mut fallback = HttpRequest::new_with_headers(client, stream_url, headers);
-            if let Some(len) = meta.stream_content_length {
+            if let Some(len) = effective_content_length {
                 fallback.content_length = Some(len);
             }
             Ok(Track::new_with_data(fallback.into(), meta))
@@ -853,7 +997,7 @@ async fn create_track_with_dsp(
         Err(_) => {
             warn!("Pre-parsing excedió límite de 5s, usando entrada nativa en streaming de Songbird");
             let mut fallback = HttpRequest::new_with_headers(client, stream_url, headers);
-            if let Some(len) = meta.stream_content_length {
+            if let Some(len) = effective_content_length {
                 fallback.content_length = Some(len);
             }
             Ok(Track::new_with_data(fallback.into(), meta))

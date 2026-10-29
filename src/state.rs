@@ -239,11 +239,11 @@ impl AppState {
     }
 
     /// Registra un fallo de reproducción para el reproductor.
-    /// Retorna `true` si se alcanzó el umbral de disparo del Circuit Breaker (3 fallos en menos de 15s).
+    /// Retorna `true` si se alcanzó el umbral de disparo del Circuit Breaker (3 fallos en menos de 20s).
     pub fn record_track_error(&self, key: PlayerKey) -> bool {
         let mut entry = self.consecutive_errors.entry(key).or_insert((0, Instant::now()));
         let (ref mut count, ref mut last_time) = *entry;
-        if last_time.elapsed() < Duration::from_secs(15) {
+        if last_time.elapsed() < Duration::from_secs(20) {
             *count += 1;
         } else {
             *count = 1;
@@ -252,11 +252,12 @@ impl AppState {
         *count >= 3
     }
 
-    /// Retorna `true` si el reproductor está temporalmente bloqueado por dispararse el Circuit Breaker (3 fallos en menos de 15s).
+    /// Retorna `true` si el reproductor está temporalmente bloqueado por dispararse el Circuit Breaker (3 fallos en menos de 20s).
+    /// El bloqueo se mantiene durante un periodo de enfriamiento de 30s para evitar bucles infinitos.
     pub fn is_circuit_tripped(&self, key: PlayerKey) -> bool {
         if let Some(entry) = self.consecutive_errors.get(&key) {
             let (count, last_time) = *entry;
-            count >= 3 && last_time.elapsed() < Duration::from_secs(15)
+            count >= 3 && last_time.elapsed() < Duration::from_secs(30)
         } else {
             false
         }
@@ -481,6 +482,7 @@ impl AppState {
         if let Ok(json) = serde_json::to_string_pretty(&map) {
             let _ = std::fs::write(&path, json);
         }
+        self.resolver.persist_cache_to_disk(&crate::sources::SourceResolver::get_cache_file_path());
     }
 
     /// Retorna la memoria residente (RSS) en bytes del proceso axAudio

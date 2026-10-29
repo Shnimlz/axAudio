@@ -217,13 +217,72 @@ impl SourceResolver {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2);
 
+        let cache = Arc::new(Self::load_cache_from_disk(&Self::get_cache_file_path()));
+
         Self {
-            cache: Arc::new(DashMap::new()),
+            cache,
             related_cache: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(3600 * 4), // 4 horas de TTL para streams de audio
             cookie_rotation_index: Arc::new(AtomicUsize::new(0)),
             process_semaphore: Arc::new(Semaphore::new(max_concurrent)),
             http_client,
+        }
+    }
+
+    /// Ruta al archivo persistente opcional de caché de streams en disco
+    pub fn get_cache_file_path() -> PathBuf {
+        if let Ok(path) = std::env::var("AXAUDIO_CACHE_FILE") {
+            PathBuf::from(path)
+        } else if let Ok(settings_path) = std::env::var("AXAUDIO_GUILD_SETTINGS_FILE") {
+            let p = PathBuf::from(settings_path);
+            if let Some(parent) = p.parent() {
+                parent.join("resolver_cache.json")
+            } else {
+                PathBuf::from("settings/resolver_cache.json")
+            }
+        } else {
+            PathBuf::from("settings/resolver_cache.json")
+        }
+    }
+
+    /// Carga la caché de resolución previamente persistida en disco, descartando URLs expiradas
+    pub fn load_cache_from_disk(path: &std::path::Path) -> DashMap<String, (TrackMetadata, Instant)> {
+        let map = DashMap::new();
+        if path.exists() {
+            if let Ok(data) = std::fs::read_to_string(path) {
+                if let Ok(entries) = serde_json::from_str::<std::collections::HashMap<String, TrackMetadata>>(&data) {
+                    let mut loaded_count = 0;
+                    for (k, meta) in entries {
+                        if !meta.is_url_expired_or_expiring() {
+                            map.insert(k, (meta, Instant::now()));
+                            loaded_count += 1;
+                        }
+                    }
+                    if loaded_count > 0 {
+                        info!(count = loaded_count, path = ?path, "Caché del resolvedor de fuentes cargada exitosamente desde disco");
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    /// Persiste las pistas vigentes en la caché de memoria a disco para acelerar reinicios
+    pub fn persist_cache_to_disk(&self, path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut map = std::collections::HashMap::new();
+        for item in self.cache.iter() {
+            let (meta, cached_at) = item.value();
+            if cached_at.elapsed() < self.ttl && !meta.is_url_expired_or_expiring() {
+                map.insert(item.key().clone(), meta.clone());
+            }
+        }
+        if !map.is_empty() {
+            if let Ok(json) = serde_json::to_string(&map) {
+                let _ = std::fs::write(path, json);
+            }
         }
     }
 
@@ -385,6 +444,25 @@ impl SourceResolver {
                 if !id.is_empty() {
                     return Some(format!("https://www.youtube.com/watch?v={}", id));
                 }
+            }
+        }
+        None
+    }
+
+    /// Extrae el tamaño en bytes (`clen`) del flujo si está presente en los parámetros de la URL
+    pub fn extract_clen_from_url(url: &str) -> Option<u64> {
+        let needle = if let Some(pos) = url.find("clen=") {
+            Some(&url[pos + 5..])
+        } else if let Some(pos) = url.find("clen%3D") {
+            Some(&url[pos + 7..])
+        } else {
+            None
+        };
+
+        if let Some(after) = needle {
+            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(val) = num_str.parse::<u64>() {
+                return Some(val);
             }
         }
         None
@@ -797,9 +875,34 @@ impl SourceResolver {
             .unwrap_or_default();
 
         let stream_content_length = val
-            .get("content_length")
+            .get("filesize")
+            .or_else(|| val.get("filesize_approx"))
+            .or_else(|| val.get("content_length"))
+            .or_else(|| entries_first.and_then(|e| e.get("filesize")))
+            .or_else(|| entries_first.and_then(|e| e.get("filesize_approx")))
             .or_else(|| entries_first.and_then(|e| e.get("content_length")))
-            .and_then(|c| c.as_u64());
+            .or_else(|| {
+                val.get("requested_formats")
+                    .and_then(|arr| arr.as_array())
+                    .and_then(|arr| arr.iter().find(|fmt| fmt.get("acodec").map(|a| a != "none").unwrap_or(true)))
+                    .and_then(|fmt| {
+                        fmt.get("filesize")
+                            .or_else(|| fmt.get("filesize_approx"))
+                            .or_else(|| fmt.get("content_length"))
+                    })
+            })
+            .or_else(|| {
+                val.get("formats")
+                    .and_then(|arr| arr.as_array())
+                    .and_then(|arr| arr.iter().rev().find(|fmt| fmt.get("acodec").map(|a| a != "none").unwrap_or(true)))
+                    .and_then(|fmt| {
+                        fmt.get("filesize")
+                            .or_else(|| fmt.get("filesize_approx"))
+                            .or_else(|| fmt.get("content_length"))
+                    })
+            })
+            .and_then(|c| c.as_u64())
+            .or_else(|| Self::extract_clen_from_url(stream_url));
 
         let is_live = val
             .get("is_live")
@@ -864,7 +967,7 @@ impl SourceResolver {
                 thumbnail: None,
                 skip_segments: Vec::new(),
                 stream_headers: Vec::new(),
-                stream_content_length: None,
+                stream_content_length: Self::extract_clen_from_url(query_trimmed),
                 resolved_at: Instant::now(),
                 is_live: false,
                 suggested_preset: None,
@@ -1894,7 +1997,7 @@ impl SourceResolver {
                 thumbnail: None,
                 skip_segments: Vec::new(),
                 stream_headers: Vec::new(),
-                stream_content_length: None,
+                stream_content_length: Self::extract_clen_from_url(query_trimmed),
                 resolved_at: Instant::now(),
                 is_live: false,
                 suggested_preset: None,
@@ -2134,5 +2237,52 @@ mod tests {
             detect_suggested_preset("Normal Song Title", Some("Normal Artist")),
             None
         );
+    }
+
+    #[test]
+    fn test_extract_clen_from_url() {
+        let url_plain = "https://rr1---sn-0opoxu-gxml.googlevideo.com/videoplayback?expire=1793253790&clen=66504297&dur=3695.701";
+        assert_eq!(SourceResolver::extract_clen_from_url(url_plain), Some(66504297));
+
+        let url_encoded = "https://rr1---sn.googlevideo.com/videoplayback?expire=1793253790&clen%3D260101051&dur=120";
+        assert_eq!(SourceResolver::extract_clen_from_url(url_encoded), Some(260101051));
+
+        let url_no_clen = "https://example.com/audio.mp3";
+        assert_eq!(SourceResolver::extract_clen_from_url(url_no_clen), None);
+    }
+
+    #[test]
+    fn test_resolver_disk_cache_roundtrip() {
+        let temp_dir = std::env::temp_dir();
+        let cache_file = temp_dir.join(format!("axaudio_test_cache_{}.json", std::process::id()));
+
+        let resolver = SourceResolver::new();
+        let test_meta = TrackMetadata {
+            title: "Test Cached Song".to_string(),
+            source_url: "https://youtube.com/watch?v=cached123".to_string(),
+            stream_url: "https://example.com/stream.mp3".to_string(),
+            duration_secs: Some(240),
+            author: Some("Artist".to_string()),
+            thumbnail: None,
+            skip_segments: vec![],
+            stream_headers: vec![],
+            stream_content_length: Some(1234567),
+            resolved_at: Instant::now(),
+            is_live: false,
+            suggested_preset: None,
+        };
+
+        resolver.cache.insert("https://youtube.com/watch?v=cached123".to_string(), (test_meta.clone(), Instant::now()));
+        resolver.persist_cache_to_disk(&cache_file);
+
+        assert!(cache_file.exists());
+
+        let loaded = SourceResolver::load_cache_from_disk(&cache_file);
+        assert_eq!(loaded.len(), 1);
+        let entry = loaded.get("https://youtube.com/watch?v=cached123").unwrap();
+        assert_eq!(entry.0.title, "Test Cached Song");
+        assert_eq!(entry.0.stream_content_length, Some(1234567));
+
+        let _ = std::fs::remove_file(cache_file);
     }
 }
