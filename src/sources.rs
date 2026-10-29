@@ -345,6 +345,19 @@ impl SourceResolver {
         None
     }
 
+/// Cadena completa de clientes de Convx para resolución de audio en YouTube:
+/// 1. visionos: cliente principal sin autenticación, entrega flujos directos Opus/AAC sin SABR ni PO-token
+/// 2. android_vr: cliente Oculus VR ligero sin requerimiento de login
+/// 3. ios: cliente móvil estable
+/// 4. tv_simply: cliente embebido (PS4) para saltar restricciones de edad sin login
+/// 5. web_music: YouTube Music catálogo web
+/// 6. android: cliente Android estándar
+/// 7. tv: Smart TV (Tizen / Samsung)
+/// 8. web: cliente Web de escritorio con soporte de PO-token
+pub const CONVX_DEFAULT_CLIENTS: &str = "visionos,android_vr,ios,tv_simply,web_music,android,tv,web";
+pub const CONVX_PRIMARY_CLIENT: &str = "visionos";
+pub const CONVX_FALLBACK_CLIENTS: &str = "android_vr,ios,tv_simply,web_music,android,tv,web";
+
     /// Aplica los argumentos de extractor por defecto (PO tokens + player clients + authcheck).
     /// La sintaxis `youtube:pot_bgutil_webpo` es la que yt-dlp (≥2026) reconoce; la antigua
     /// `youtubepot-bgutilhttp` se ignora en silencio y el token GVS nunca se solicita.
@@ -360,10 +373,10 @@ impl SourceResolver {
         } else {
             let pot_provider_url = std::env::var("BGUTIL_POT_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:4416".to_string());
-            // android es el cliente más compatible que entrega streams directos estables sin 403 en IPs de servidor;
-            // web sirve como fallback si se especifican cookies o po-token web.
+            // Prioridad de clientes inspirada en Convx (visionos -> android_vr -> ios -> tv_simply -> web_music -> android -> tv -> web).
+            // visionos entrega flujos directos estables sin requerir PO-token ni ser afectado por experimentos SABR.
             let default_clients = std::env::var("YTDLP_PLAYER_CLIENTS")
-                .unwrap_or_else(|_| "android,web".to_string());
+                .unwrap_or_else(|_| Self::CONVX_DEFAULT_CLIENTS.to_string());
             cmd.arg("--extractor-args")
                 .arg(format!("youtube:pot_bgutil_webpo:base_url={}", pot_provider_url))
                 .arg("--extractor-args")
@@ -466,6 +479,68 @@ impl SourceResolver {
             }
         }
         None
+    }
+
+    /// Valida si una URL de audio responde con contenido real (206 Partial Content o 200 OK)
+    /// utilizando una petición GET de rango de 1 byte (`Range: bytes=0-0`), idéntico al método `validateStatus` de Convx.
+    /// Importante: Nunca envía cabeceras `Cookie` a googlevideo.com / videoplayback porque el CDN
+    /// de YouTube rechaza cookies de cuenta con HTTP 403 Forbidden en URLs firmadas.
+    pub async fn validate_stream_url(
+        client: &reqwest::Client,
+        stream_url: &str,
+        stream_headers: &[(String, String)],
+    ) -> bool {
+        if !stream_url.starts_with("http://") && !stream_url.starts_with("https://") {
+            return true;
+        }
+
+        let is_google_cdn = stream_url.contains("googlevideo.com") || stream_url.contains("/videoplayback");
+        let mut req = client
+            .get(stream_url)
+            .header(reqwest::header::RANGE, "bytes=0-0")
+            .timeout(Duration::from_millis(2500));
+
+        let mut has_ua = false;
+        for (k, v) in stream_headers {
+            if k.eq_ignore_ascii_case("Content-Length") || k.eq_ignore_ascii_case("Range") {
+                continue;
+            }
+            if is_google_cdn && k.eq_ignore_ascii_case("Cookie") {
+                // Regla Convx: googlevideo.com CDN rechaza cookies de cuenta con 403 Forbidden.
+                continue;
+            }
+            if k.eq_ignore_ascii_case("User-Agent") {
+                has_ua = true;
+            }
+            if let (Ok(name), Ok(val)) = (
+                k.parse::<reqwest::header::HeaderName>(),
+                v.parse::<reqwest::header::HeaderValue>(),
+            ) {
+                req = req.header(name, val);
+            }
+        }
+
+        if !has_ua {
+            req = req.header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0",
+            );
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let ok = status == reqwest::StatusCode::PARTIAL_CONTENT || status == reqwest::StatusCode::OK;
+                if !ok {
+                    warn!(status = %status, url = %stream_url, "Stream pre-flight validation (Range: bytes=0-0) fue rechazado por el CDN");
+                }
+                ok
+            }
+            Err(err) => {
+                warn!(error = ?err, url = %stream_url, "Stream pre-flight validation falló (timeout o error de red)");
+                false
+            }
+        }
     }
 
     /// Escanea y retorna la lista de archivos de cookies disponibles (Pool multi-cuenta)
@@ -837,6 +912,9 @@ impl SourceResolver {
         // Recuperar `http_headers` (User-Agent, Client-Context, etc.) y `content_length`
         // del formato de yt-dlp. GoogleVideo firma la URL contra estos headers; sin ellos
         // el CDN rechaza la descarga con 403.
+        // Regla Convx: se descartan cabeceras `Cookie` si el stream apunta a googlevideo.com
+        // porque el CDN rechaza cookies de cuenta con 403 Forbidden en URLs firmadas.
+        let is_google_stream = stream_url.contains("googlevideo.com") || stream_url.contains("/videoplayback");
         let stream_headers: Vec<(String, String)> = val
             .get("http_headers")
             .or_else(|| entries_first.and_then(|e| e.get("http_headers")))
@@ -869,6 +947,7 @@ impl SourceResolver {
             .and_then(|h| h.as_object())
             .map(|obj| {
                 obj.iter()
+                    .filter(|(k, _)| !(is_google_stream && k.eq_ignore_ascii_case("Cookie")))
                     .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
                     .collect()
             })
@@ -950,8 +1029,14 @@ impl SourceResolver {
             if let Some(entry) = self.cache.get(&cache_key) {
                 let (meta, cached_at) = entry.value();
                 if cached_at.elapsed() < self.ttl && !meta.is_url_expired_or_expiring() {
-                    info!(query = %query_trimmed, title = %meta.title, "Acierto en caché del resolvedor de fuentes");
-                    return Ok(meta.clone());
+                    // Pre-flight check antes de retornar de caché (estilo Convx)
+                    if Self::validate_stream_url(&self.http_client, &meta.stream_url, &meta.stream_headers).await {
+                        info!(query = %query_trimmed, title = %meta.title, "Acierto en caché verificado del resolvedor de fuentes");
+                        return Ok(meta.clone());
+                    } else {
+                        warn!(query = %query_trimmed, title = %meta.title, "Stream en caché rechazado por CDN (403/expirado); purgando entrada...");
+                        self.cache.remove(&cache_key);
+                    }
                 }
             }
         }
@@ -1049,61 +1134,82 @@ impl SourceResolver {
             if let Some(entry) = self.cache.get(&target_cache_key) {
                 let (meta, cached_at) = entry.value();
                 if cached_at.elapsed() < self.ttl && !meta.is_url_expired_or_expiring() {
-                    info!(query = %query_trimmed, resolved = %resolved_target, title = %meta.title, "Acierto en caché del resolvedor tras resolución InnerTube");
-                    self.cache.insert(cache_key, (meta.clone(), Instant::now()));
-                    return Ok(meta.clone());
+                    if Self::validate_stream_url(&self.http_client, &meta.stream_url, &meta.stream_headers).await {
+                        info!(query = %query_trimmed, resolved = %resolved_target, title = %meta.title, "Acierto en caché verificado del resolvedor tras resolución InnerTube");
+                        self.cache.insert(cache_key, (meta.clone(), Instant::now()));
+                        return Ok(meta.clone());
+                    } else {
+                        warn!(query = %query_trimmed, resolved = %resolved_target, title = %meta.title, "Stream en caché por resolved_target rechazado por CDN; purgando...");
+                        self.cache.remove(&target_cache_key);
+                    }
                 }
             }
         }
 
-        // 3. Intento primario con cookie personalizada o pool
+        // 3. Resolución con estrategia jerárquica de clientes (inspirada en Convx):
+        // Tier 1 (Main fast client): visionos (sin cookies, entrega flujos directos Opus/AAC sin SABR ni PO-token en ~2s)
+        // Tier 2 (Fallback clients): android_vr, ios, tv_simply, web_music, android, tv, web (anónimos)
+        // Tier 3 (Pool de cookies): si fallan los clientes anónimos y existen cookies disponibles
         let primary_result = if let Some(c) = custom_cookies {
             self.run_single_track_cmd(&resolved_target, custom_extractor_args, custom_extra_args, Some(c), custom_format).await
+        } else if custom_extractor_args.is_some() || std::env::var("YTDLP_PLAYER_CLIENTS").is_ok() {
+            // Si el llamador especificó extractor_args o el operador definió YTDLP_PLAYER_CLIENTS en env, respetarlo directamente
+            self.run_single_track_cmd(&resolved_target, custom_extractor_args, custom_extra_args, None, custom_format).await
         } else {
-            let cookie_pool = self.get_available_cookie_pool().await;
-            if cookie_pool.is_empty() {
-                self.run_single_track_cmd(&resolved_target, custom_extractor_args, custom_extra_args, None, custom_format).await
-            } else {
-                let total = cookie_pool.len();
-                let start_idx = self.cookie_rotation_index.fetch_add(1, Ordering::Relaxed) % total;
-                let mut last_err = String::new();
-                let mut resolved = None;
+            // Tier 1: visionos rápido anónimo
+            let primary_client_args = format!("youtube:player_client={}", Self::CONVX_PRIMARY_CLIENT);
+            let mut attempt = self.run_single_track_cmd(&resolved_target, Some(&primary_client_args), custom_extra_args, None, custom_format).await;
 
-                for i in 0..total {
-                    let idx = (start_idx + i) % total;
-                    let cookie_file = &cookie_pool[idx];
-                    match self
-                        .run_single_track_cmd(&resolved_target, custom_extractor_args, custom_extra_args, Some(cookie_file), custom_format)
-                        .await
-                    {
-                        Ok(meta) => {
-                            resolved = Some(meta);
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(cookie_file = %cookie_file, error = %e, "Cookie falló para pista, reintentando...");
-                            last_err = e;
+            if let Ok(ref meta) = attempt {
+                if !Self::validate_stream_url(&self.http_client, &meta.stream_url, &meta.stream_headers).await {
+                    warn!(title = %meta.title, "Stream visionos no superó validación CDN (403/inactivo); activando fallback jerárquico Convx...");
+                    attempt = Err("Validación CDN falló para cliente visionos".to_string());
+                }
+            }
+
+            // Tier 2: Clientes fallback de Convx (android_vr, ios, tv_simply, web_music, android, tv, web)
+            if attempt.is_err() {
+                warn!(query = %resolved_target, "Tier 1 (visionos) no disponible o bloqueado; intentando clientes fallback Convx...");
+                let fallback_client_args = format!("youtube:player_client={}", Self::CONVX_FALLBACK_CLIENTS);
+                attempt = self.run_single_track_cmd(&resolved_target, Some(&fallback_client_args), custom_extra_args, None, custom_format).await;
+
+                if let Ok(ref meta) = attempt {
+                    if !Self::validate_stream_url(&self.http_client, &meta.stream_url, &meta.stream_headers).await {
+                        warn!(title = %meta.title, "Stream fallback Convx no superó validación CDN");
+                        attempt = Err("Validación CDN falló para clientes fallback Convx".to_string());
+                    }
+                }
+            }
+
+            // Tier 3: Si fallaron los clientes anónimos (ej. video privado/restringido con cuenta) y hay cookies en el pool
+            if attempt.is_err() {
+                let cookie_pool = self.get_available_cookie_pool().await;
+                if !cookie_pool.is_empty() {
+                    warn!(query = %resolved_target, "Clientes anónimos Convx fallaron; probando pool de cookies multi-cuenta...");
+                    let total = cookie_pool.len();
+                    let start_idx = self.cookie_rotation_index.fetch_add(1, Ordering::Relaxed) % total;
+                    for i in 0..total {
+                        let idx = (start_idx + i) % total;
+                        let cookie_file = &cookie_pool[idx];
+                        match self
+                            .run_single_track_cmd(&resolved_target, custom_extractor_args, custom_extra_args, Some(cookie_file), custom_format)
+                            .await
+                        {
+                            Ok(meta) => {
+                                if Self::validate_stream_url(&self.http_client, &meta.stream_url, &meta.stream_headers).await {
+                                    attempt = Ok(meta);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(cookie_file = %cookie_file, error = %e, "Cookie del pool falló para pista");
+                            }
                         }
                     }
                 }
-
-                if let Some(m) = resolved {
-                    Ok(m)
-                } else {
-                    warn!(
-                        last_err = %last_err,
-                        "Todas las cookies del pool fallaron resolviendo la pista; intentando fallback sin cookies (bgutil-pot)..."
-                    );
-                    self.run_single_track_cmd(
-                        &resolved_target,
-                        custom_extractor_args,
-                        custom_extra_args,
-                        None,
-                        custom_format,
-                    )
-                    .await
-                }
             }
+
+            attempt
         };
 
         match primary_result {
@@ -2284,5 +2390,18 @@ mod tests {
         assert_eq!(entry.0.stream_content_length, Some(1234567));
 
         let _ = std::fs::remove_file(cache_file);
+    }
+
+    #[tokio::test]
+    async fn test_convx_clients_and_non_http_validation() {
+        assert!(SourceResolver::CONVX_DEFAULT_CLIENTS.contains("visionos"));
+        assert!(SourceResolver::CONVX_DEFAULT_CLIENTS.contains("android_vr"));
+        assert!(SourceResolver::CONVX_DEFAULT_CLIENTS.contains("tv_simply"));
+        assert_eq!(SourceResolver::CONVX_PRIMARY_CLIENT, "visionos");
+
+        let client = reqwest::Client::new();
+        // URLs no HTTP (como archivos locales o streams virtuales) deben ser aprobadas directamente
+        let is_valid = SourceResolver::validate_stream_url(&client, "file:///tmp/audio.opus", &[]).await;
+        assert!(is_valid);
     }
 }

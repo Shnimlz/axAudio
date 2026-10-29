@@ -11,6 +11,7 @@ services:
       - PORT=2333
       - RUST_LOG=axAudio=info,tower_http=info
       - TOKIO_WORKER_THREADS=2
+      - YTDLP_PLAYER_CLIENTS=visionos,android_vr,ios,tv_simply,web_music,android,tv,web
       # Opcional: Para usar un proveedor POT externo en lugar del interno en 127.0.0.1:4416:
       # - BGUTIL_POT_URL=http://otro-host:4416
       # - ENABLE_INTERNAL_POT=false

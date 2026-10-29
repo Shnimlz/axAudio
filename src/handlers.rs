@@ -948,6 +948,11 @@ async fn create_track_with_dsp(
             // songbird construya `Range: bytes=0-{max}` correctamente.
             continue;
         }
+        if is_google_cdn && k.eq_ignore_ascii_case("Cookie") {
+            // Regla Convx: googlevideo.com CDN rechaza cookies de cuenta con 403 Forbidden.
+            // Las URLs firmadas ya incluyen autenticación en los parámetros de consulta.
+            continue;
+        }
         if let (Ok(name), Ok(val)) = (
             k.parse::<reqwest::header::HeaderName>(),
             v.parse::<reqwest::header::HeaderValue>(),
