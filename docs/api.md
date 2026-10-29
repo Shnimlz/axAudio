@@ -366,29 +366,55 @@ Inspects the guild's current playback queue, including tracks currently being fe
 ## 6. DSP & Equalization Endpoints
 
 ### `POST /v1/player/eq`
-Configures the 15-band graphic equalizer or applies an acoustic preset.
+Configures the multi-mode studio equalizer or applies an acoustic preset.
 
 **Request Body**:
 ```json
 {
   "guild_id": "1198516089758785536",
-  "preset": "cinema-3d",
+  "bot_id": "100234857289384729",
+  "preset": "moto-spatial",
   "bands": [
-    { "band": 0, "gain": 4.5 },
-    { "band": 1, "gain": 3.0 }
-  ]
+    { "band": 0, "gain": 4.5, "filter_type": "peaking" },
+    { "band": 1, "gain": 3.0, "filter_type": "lowshelf" }
+  ],
+  "parametric": [
+    { "freq": 1000.0, "q": 1.4, "gain_db": 3.0, "filter_type": "peaking", "channel": "Mid" },
+    { "freq": 12000.0, "q": 0.7, "gain_db": 4.5, "filter_type": "highshelf", "channel": "Side" },
+    { "freq": 60.0, "q": 12.0, "gain_db": -24.0, "filter_type": "notch", "channel": "Stereo" }
+  ],
+  "dolby_bands": [3.0, 2.5, 2.0, 1.5, 1.0, 0.5, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.0, 3.5, 3.0, 2.5],
+  "iso31_bands": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 2.5, 2.0, 1.5, 1.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 4.0, 3.5, 3.0, 2.5, 2.0, 1.5, 1.0]
 }
 ```
 
-- `preset`: Name of a factory preset (`music`, `cinema-3d`, `bass-boost-3d`, `vocal-clarity`, `gaming-3d`, `concert-hall`, `flat`).
-- `bands`: Array of `{ band: 0..14, gain: float, filter_type?: string }`.
+#### Field Specifications:
+- `preset` (optional): Name of a factory preset or custom preset (18 built-in presets supported).
+- `bands` (optional): Array of 15-band graphic equalizer adjustments `{ band: 0..14, gain: float, filter_type?: string }`.
   - Values between `-0.5` and `1.0` are converted automatically using the Lavalink scale; values outside this range are interpreted directly as decibels (`-15.0 dB` to `+15.0 dB`).
-  - `filter_type` (optional): Filter response curve. Supported values:
-    - `"peaking"` (default): Bell curve centered at the band frequency with psicoacoustic Q.
-    - `"lowshelf"`: Boosts or cuts all frequencies below the band frequency.
-    - `"highshelf"`: Boosts or cuts all frequencies above the band frequency.
-    - `"lowpass"`: Butterworth 2nd-order low-pass filter (attenuates high frequencies).
-    - `"highpass"`: Butterworth 2nd-order high-pass filter (attenuates low frequencies).
+- `parametric` (optional): Array of dynamic studio filter bands `{ freq: float, q: float, gain_db: float, filter_type?: string, channel?: string }`.
+  - `freq`: 20.0 Hz to 22,000.0 Hz.
+  - `q`: 0.1 to 20.0.
+  - `gain_db`: -24.0 dB to +24.0 dB.
+  - `filter_type`: `"peaking"`, `"lowshelf"`, `"highshelf"`, `"lowpass"`, `"highpass"`, `"notch"`, `"bandpass"`.
+  - `channel`: `"Stereo"` (default), `"Mid"` (mono center: vocals, kick, snare, bass), or `"Side"` (stereo difference: air, room reverb, wide synths).
+- `dolby_bands` (optional): Array of exactly 20 decibel gains matching the psychoacoustic critical bands of Dolby DAX:
+  `[47, 141, 234, 328, 422, 562, 750, 984, 1266, 1641, 2109, 2719, 3469, 4406, 5578, 7078, 9000, 11484, 14766, 19688] Hz`.
+- `iso31_bands` (optional): Array of exactly 31 decibel gains matching the ISO 1/3-octave studio frequencies (20 Hz to 20 kHz).
+
+**Supported Filter Types**:
+- `"peaking"` (default): Bell curve centered at the band frequency.
+- `"lowshelf"`: Boosts or cuts all frequencies below the band frequency.
+- `"highshelf"`: Boosts or cuts all frequencies above the band frequency.
+- `"lowpass"`: Butterworth 2nd-order low-pass filter (attenuates high frequencies).
+- `"highpass"`: Butterworth 2nd-order high-pass filter (attenuates low frequencies).
+- `"notch"`: Narrow band-reject filter for hum or feedback elimination.
+- `"bandpass"`: Bandpass filter with 0 dB peak gain.
+
+**Supported Built-In Presets (18 profiles)**:
+- **Motorola Dolby Atmos**: `moto-spatial` (calibrated for moto buds bass), `dolby-music`, `dolby-movie`, `dolby-game`, `dolby-voice`.
+- **Studio Audiophile**: `music` (Hi-Fi), `cinema-3d` (Atmos immersion), `bass-boost-3d`, `vocal-clarity`, `gaming-3d`, `concert-hall`.
+- **Effects & Loudness**: `nightcore`, `vaporwave`, `8d`, `tremolo`, `vibrato`, `broadcast` (EBU R128), `flat` (bypass).
 
 **Response `200 OK`**:
 ```json
@@ -397,13 +423,13 @@ Configures the 15-band graphic equalizer or applies an acoustic preset.
   "data": {
     "guild_id": 1198516089758785536,
     "status": {
-      "active_preset": "cinema-3d",
-      "stereo_width": 1.35,
+      "active_preset": "moto-spatial",
+      "stereo_width": 1.25,
       "binaural_crossfeed": true,
       "bass_exciter": true,
-      "eq_bands": [3.5, 3.0, 2.0, 0.5, 0.0, 0.0, 0.5, 0.5, 1.0, 1.5, 2.0, 2.0, 2.5, 2.5, 3.0]
+      "eq_bands": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     },
-    "message": "Preset 'cinema-3d' aplicado: Inmersión cinemática 3D tipo Dolby Atmos..."
+    "message": "Preset 'moto-spatial' aplicado: Motorola Dolby Atmos Spatial Audio calibrado vía ADB (moto buds bass)..."
   }
 }
 ```
@@ -411,13 +437,13 @@ Configures the 15-band graphic equalizer or applies an acoustic preset.
 ---
 
 ### `POST /v1/player/dsp`
-Full control over the DSP mastering chain, including Mid/Side stereo widening, acoustic crossfeed, and the sub-bass exciter.
+Full control over the DSP mastering chain, including multi-mode EQ, Mid/Side stereo widening, acoustic crossfeed, and the sub-bass exciter.
 
 **Request Body**:
 ```json
 {
   "guild_id": "1198516089758785536",
-  "preset": null,
+  "preset": "moto-spatial",
   "spatial": {
     "stereo_width": 1.35,
     "binaural_crossfeed": true,
@@ -425,6 +451,11 @@ Full control over the DSP mastering chain, including Mid/Side stereo widening, a
     "bass_exciter": true,
     "bass_exciter_drive": 0.25
   },
+  "parametric": [
+    { "freq": 1000.0, "q": 1.4, "gain_db": 3.0, "channel": "Mid" }
+  ],
+  "dolby_bands": null,
+  "iso31_bands": null,
   "bands": null
 }
 ```

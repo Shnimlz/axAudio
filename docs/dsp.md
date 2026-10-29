@@ -89,9 +89,13 @@ Where $s_1$ and $s_2$ are the canonical state registers.
 
 ---
 
-## 3. 15-Band Studio Equalizer
+## 3. Multi-Mode Studio Equalizer
 
-The equalizer divides the audible spectrum into 15 ISO standard center frequencies:
+axAudio features an adaptable, multi-topology equalization engine capable of switching dynamically between ISO graphic modes, hardware-calibrated critical band modes, and arbitrary parametric Mid/Side stages.
+
+### 3.1 15-Band ISO Graphic Equalizer
+
+The standard 15-band equalizer divides the audible spectrum into ISO center frequencies with frequency-dependent Q calibration:
 
 | Band | Center Freq | Calibrated Q | Acoustic Target |
 | :---: | :---: | :---: | :--- |
@@ -111,9 +115,85 @@ The equalizer divides the audible spectrum into 15 ISO standard center frequenci
 | **13** | **10.0 kHz**| `1.2` | High treble brilliance. |
 | **14** | **16.0 kHz**| `1.2` | Airy sheen and high-frequency sparkle. |
 
-### Sub-Bass Q Stabilization
+---
 
-At sample rates of 48 kHz, center frequencies below 60 Hz place digital filter poles dangerously close to the unit circle $z = 1$. A high Q factor in this zone causes numeric overflow.
+### 3.2 Dolby DAX 20 Psychoacoustic Critical Bands
+
+Extracted directly from Motorola / Dolby Audio Processing (DAP) DAX v3 hardware configurations, this topology aligns filters with the human auditory system's **Bark critical bandwidths**:
+
+$$\text{Bark} = 13 \cdot \arctan(0.00076 \cdot f) + 3.5 \cdot \arctan\left(\left(\frac{f}{7500}\right)^2\right)$$
+
+The 20 critical band center frequencies are:
+`[47, 141, 234, 328, 422, 562, 750, 984, 1266, 1641, 2109, 2719, 3469, 4406, 5578, 7078, 9000, 11484, 14766, 19688] Hz`
+
+- **Logarithmic Spacing**: Denser resolution in the human speech region (300 Hz - 4 kHz) to accurately match the ear's cochlear filter banks.
+- **Constant Psychoacoustic Q ($Q \approx 2.5$)**: Provides surgical correction without phase smearing across neighboring critical bands.
+
+---
+
+### 3.3 ISO 31-Band 1/3-Octave Studio Standard
+
+For acoustically challenging room correction and master-grade frequency response adjustments, axAudio provides a full 1/3-octave 31-band bank:
+
+`[20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000] Hz`
+
+Each band is calibrated with a constant fractional bandwidth of:
+$$Q = \frac{\sqrt{2^{1/3}}}{2^{1/3} - 1} \approx 4.318$$
+
+---
+
+### 3.4 Dynamic Parametric Equalizer & Orthogonal Mid/Side (M/S) Matrix
+
+In parametric mode, arbitrary dynamic filter bands can be allocated at runtime. Each band allows independent configuration of:
+- **Frequency ($f_0$)**: 20 Hz to 22,000 Hz.
+- **Bandwidth ($Q$)**: 0.1 to 20.0.
+- **Gain**: -24.0 dB to +24.0 dB.
+- **Filter Curve**: Peaking, LowShelf, HighShelf, LowPass, HighPass, Notch, BandPass.
+- **Channel Routing**: `Stereo`, `Mid`, or `Side`.
+
+#### Orthogonal Mid/Side Decomposition
+
+By decomposing incoming stereo signals into sum (mono / center) and difference (stereo side / ambience) components, axAudio performs surgical corrections without collateral damage to stereo imaging:
+
+1. **Unitary Forward M/S Encoding**:
+   $$\begin{aligned}
+   M[n] &= \frac{L[n] + R[n]}{\sqrt{2}} \\
+   S[n] &= \frac{L[n] - R[n]}{\sqrt{2}}
+   \end{aligned}$$
+2. **Channel-Isolated Filtering**:
+   - `Mid` filters process only $M[n]$ (lead vocals, kick drum, bass, dialogue).
+   - `Side` filters process only $S[n]$ (room reverb, wide guitars, stereo synthesizers, binaural atmosphere).
+   - `Stereo` filters process both channels in planar stereo space.
+3. **Unitary Inverse M/S Decoding**:
+   $$\begin{aligned}
+   L[n] &= \frac{M[n] + S[n]}{\sqrt{2}} \\
+   R[n] &= \frac{M[n] - S[n]}{\sqrt{2}}
+   \end{aligned}$$
+
+The $\frac{1}{\sqrt{2}}$ factor preserves total acoustic energy across encoding and decoding with mathematical exactness:
+$$|L|^2 + |R|^2 = |M|^2 + |S|^2$$
+
+---
+
+### 3.5 Biquad Filter Topologies
+
+axAudio implements 7 distinct filter transfer functions derived from Robert Bristow-Johnson's audio biquad models:
+
+1. **Peaking**: Bell-shaped boost/cut centered at $f_0$.
+2. **LowShelf**: In-phase boost/cut for all frequencies below $f_0$.
+3. **HighShelf**: In-phase boost/cut for all frequencies above $f_0$.
+4. **LowPass (Butterworth 2nd-order)**: 12 dB/octave attenuation above $f_0$ ($Q = \frac{1}{\sqrt{2}} \approx 0.707$).
+5. **HighPass (Butterworth 2nd-order)**: 12 dB/octave attenuation below $f_0$ ($Q = 0.707$).
+6. **Notch (Band-Reject)**: Infinite theoretical attenuation at $f_0$ with zero gain alteration elsewhere. Essential for removing ground hum (50/60 Hz) or microphonic feedback.
+7. **BandPass**: Constant 0 dB peak gain at $f_0$ with 6 dB/octave roll-off on either side.
+
+---
+
+### 3.6 Sub-Bass Q Stabilization & Dynamic Pre-Amp Headroom Compensation
+
+#### Sub-Bass Q Stabilization
+
+At 48 kHz sampling rates, center frequencies below 60 Hz place digital filter poles dangerously close to the unit circle $z = 1$. A high Q factor in this zone causes numeric overflow and ringing.
 
 axAudio applies automatic low-frequency Q tapering:
 
@@ -122,15 +202,13 @@ $$\text{effective\_Q} = \begin{cases}
 \max(0.1, Q) & \text{otherwise}
 \end{cases}$$
 
-This ensures the filter remains unconditionally stable, smooth, and phase-linear.
-
-### Dynamic Pre-Amp Headroom Compensation
+#### Dynamic Pre-Amp Headroom Compensation
 
 When multiple EQ bands are boosted, summing the filters can easily exceed digital full scale ($0\text{ dBFS}$), leading to digital clipping.
 
-axAudio calculates the peak positive gain across all 15 bands:
+axAudio calculates the peak positive gain across all active equalizer bands:
 
-$$\text{max\_boost} = \max_{i=0..14} (\text{gain\_db}_i)$$
+$$\text{max\_boost} = \max_{i} (\text{gain\_db}_i)$$
 
 If $\text{max\_boost} > 0.2\text{ dB}$, an automatic pre-attenuation gain is applied to the input block:
 
@@ -235,34 +313,123 @@ x & \text{if } |x| \le 0.95 \\
 
 ## 8. Calibrated Factory Presets
 
-axAudio includes 6 meticulously voiced acoustic presets:
+axAudio includes 18 meticulously voiced acoustic presets divided across hardware-calibrated Dolby profiles, audiophile mastering curves, and creative effects:
 
-### 1. `music` (Hi-Fi Master)
+### 8.1 Motorola Dolby Atmos Hardware Profiles
+
+Extracted directly via ADB root from Motorola moto g85 5G DAX v3 hardware configurations:
+
+#### 1. `moto-spatial` (aliases: `dolby-moto`, `moto-buds`, `spatial-audio`)
+- **Acoustic Target**: Calibrated to Motorola Moto Buds Bass. Surround virtualizer +6 dB, crossfeed 45°, Mid-boost on vocal presence, Side-boost on high-frequency air, and sub-bass harmonic excitation.
+- **Parametric EQ**:
+  - Sub-Bass (35 Hz, Q=0.8, +4.5 dB, Peaking, Stereo)
+  - Punch Bass (80 Hz, Q=1.2, +3.0 dB, Peaking, Stereo)
+  - Mid Vocal Focus (1.0 kHz, Q=1.4, +2.5 dB, Peaking, Mid channel)
+  - Upper Mid Presence (3.2 kHz, Q=2.0, +2.0 dB, Peaking, Stereo)
+  - Spatial Air Sheen (12.0 kHz, Q=0.7, +3.5 dB, HighShelf, Side channel)
+- **Spatial**: Width `1.25`, Crossfeed `0.18` (binaural enabled), Bass Exciter `0.25`.
+
+#### 2. `dolby-music` (alias: `dolby-audio-music`)
+- **Acoustic Target**: Dolby Audio DAP v3 Music profile. Intelligent Equalizer (IEQ) warmth curve, natural harmonic bass enhancement, and subtle holographic soundstage widening.
+- **Parametric EQ**:
+  - Low Shelf (60 Hz, Q=0.7, +2.5 dB, LowShelf, Stereo)
+  - Lower Mid Warmth (250 Hz, Q=1.0, +1.0 dB, Peaking, Stereo)
+  - Vocal Intelligibility (2.0 kHz, Q=1.5, +1.5 dB, Peaking, Mid channel)
+  - Treble Brilliance (10.0 kHz, Q=0.8, +2.0 dB, HighShelf, Side channel)
+- **Spatial**: Width `1.18`, Crossfeed `0.12`, Bass Exciter `0.15`.
+
+#### 3. `dolby-movie` (alias: `dolby-cinema`)
+- **Acoustic Target**: Dolby Audio DAP v3 Movie / Cinema profile. Focuses dialogue intelligibility onto the center Mid channel while expanding atmospheric sound effects across the Side channel.
+- **Parametric EQ**:
+  - Sub-Bass Boom (45 Hz, Q=1.0, +3.5 dB, Peaking, Stereo)
+  - Dialogue Core (1.2 kHz, Q=1.8, +3.5 dB, Peaking, Mid channel)
+  - Dialogue Articulation (3.5 kHz, Q=2.0, +2.5 dB, Peaking, Mid channel)
+  - Cinema Surround Width (8.0 kHz, Q=0.7, +3.0 dB, HighShelf, Side channel)
+- **Spatial**: Width `1.35`, Crossfeed `0.18`, Bass Exciter `0.22`.
+
+#### 4. `dolby-game` (alias: `dolby-gaming`)
+- **Acoustic Target**: Dolby Audio DAP v3 Gaming profile. Tactical acoustic cue boosts (footsteps and reloads at 2.5k–6kHz) with punchy explosion dynamics.
+- **Parametric EQ**:
+  - Sub Impact (50 Hz, Q=1.2, +4.0 dB, Peaking, Stereo)
+  - Mud Cut (300 Hz, Q=1.5, -2.0 dB, Peaking, Stereo)
+  - Footstep / Reload Snap (2.8 kHz, Q=2.5, +3.5 dB, Peaking, Stereo)
+  - Spatial Positioning Cue (5.5 kHz, Q=2.0, +3.0 dB, Peaking, Side channel)
+- **Spatial**: Width `1.30`, Crossfeed `0.15`, Bass Exciter `0.20`.
+
+#### 5. `dolby-voice` (aliases: `dolby-dialogue`, `dolby-podcast`)
+- **Acoustic Target**: Dolby Audio Dialogue Enhancer. Center-channel speech focus with low-end rumble attenuation and sibilance notch filtering.
+- **Parametric EQ**:
+  - Rumble HighPass (70 Hz, Q=0.707, HighPass, Stereo)
+  - Chest Body (220 Hz, Q=1.2, +1.5 dB, Peaking, Mid channel)
+  - Vocal Intelligibility (1.5 kHz, Q=1.5, +3.5 dB, Peaking, Mid channel)
+  - Speech Articulation (3.5 kHz, Q=2.0, +2.5 dB, Peaking, Mid channel)
+  - De-Esser Taming (7.0 kHz, Q=4.0, -2.5 dB, Peaking, Mid channel)
+- **Spatial**: Width `1.0` (pure centered focus), Crossfeed Off, Exciter Off.
+
+---
+
+### 8.2 Audiophile Mastering Profiles
+
+#### 6. `music` (alias: `hifi`)
 - **Profile**: Warm low-end, neutral vocal clarity, silky top-end sheen.
-- **EQ (dB)**: `[2.5, 2.0, 1.5, 0.5, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.5, 1.5, 2.0, 2.0]`
-- **Spatial**: Width `1.18`, Crossfeed `0.12`, Bass Exciter Drive `0.15`.
+- **EQ (15-Band dB)**: `[2.5, 2.0, 1.5, 0.5, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.5, 1.5, 2.0, 2.0]`
+- **Spatial**: Width `1.18`, Crossfeed `0.12`, Bass Exciter `0.15`.
 
-### 2. `cinema-3d` (Dolby Atmos-Style Immersion)
+#### 7. `cinema-3d` (alias: `atmos`)
 - **Profile**: Wide holographic soundstage, distinct center dialogue, cinematic sub-bass punch.
-- **EQ (dB)**: `[3.5, 3.0, 2.0, 0.5, 0.0, 0.0, 0.5, 0.5, 1.0, 1.5, 2.0, 2.0, 2.5, 2.5, 3.0]`
-- **Spatial**: Width `1.35`, Crossfeed `0.18`, Bass Exciter Drive `0.22`.
+- **EQ (15-Band dB)**: `[3.5, 3.0, 2.0, 0.5, 0.0, 0.0, 0.5, 0.5, 1.0, 1.5, 2.0, 2.0, 2.5, 2.5, 3.0]`
+- **Spatial**: Width `1.35`, Crossfeed `0.18`, Bass Exciter `0.22`.
 
-### 3. `bass-boost-3d`
+#### 8. `bass-boost-3d` (aliases: `bass-boost`, `bass`)
 - **Profile**: Heavy visceral bass without masking midrange vocals.
-- **EQ (dB)**: `[5.0, 4.5, 3.0, 1.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.5, 2.0, 2.0]`
-- **Spatial**: Width `1.15`, Crossfeed `0.10`, Bass Exciter Drive `0.30`.
+- **EQ (15-Band dB)**: `[5.0, 4.5, 3.0, 1.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.5, 2.0, 2.0]`
+- **Spatial**: Width `1.15`, Crossfeed `0.10`, Bass Exciter `0.30`.
 
-### 4. `vocal-clarity`
-- **Profile**: Podcasts, audiobooks, and vocal-centric tracks; low-frequency rumble filtered out.
-- **EQ (dB)**: `[-3.0, -2.5, -1.5, -0.5, 0.0, 0.5, 1.5, 2.0, 2.5, 2.5, 1.5, 1.0, 0.5, 0.0, 0.0]`
+#### 9. `vocal-clarity` (alias: `vocal`)
+- **Profile**: Podcasts and vocal-centric tracks; low-frequency rumble filtered out.
+- **EQ (15-Band dB)**: `[-3.0, -2.5, -1.5, -0.5, 0.0, 0.5, 1.5, 2.0, 2.5, 2.5, 1.5, 1.0, 0.5, 0.0, 0.0]`
 - **Spatial**: Width `1.05`, Crossfeed Off, Exciter Off.
 
-### 5. `gaming-3d`
-- **Profile**: Footstep and tactical cue amplification, expansive stereo separation, impactful explosions.
-- **EQ (dB)**: `[3.0, 2.5, 1.5, 0.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.5, 3.0, 2.5, 2.0, 2.5, 2.5]`
-- **Spatial**: Width `1.30`, Crossfeed `0.15`, Bass Exciter Drive `0.20`.
+#### 10. `gaming-3d`
+- **Profile**: Footstep and tactical cue amplification with expansive stereo separation.
+- **EQ (15-Band dB)**: `[3.0, 2.5, 1.5, 0.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.5, 3.0, 2.5, 2.0, 2.5, 2.5]`
+- **Spatial**: Width `1.30`, Crossfeed `0.15`, Bass Exciter `0.20`.
 
-### 6. `concert-hall`
+#### 11. `concert-hall`
 - **Profile**: Airy arena dispersion with sparkling ambient reverberation feel.
-- **EQ (dB)**: `[1.5, 1.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.0, 2.5, 2.5, 3.0, 3.0]`
-- **Spatial**: Width `1.35`, Crossfeed `0.20`, Bass Exciter Drive `0.10`.
+- **EQ (15-Band dB)**: `[1.5, 1.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.0, 2.5, 2.5, 3.0, 3.0]`
+- **Spatial**: Width `1.35`, Crossfeed `0.20`, Bass Exciter `0.10`.
+
+---
+
+### 8.3 Acoustic Effects & Normalization Profiles
+
+#### 12. `nightcore`
+- **Profile**: High-energy dance aesthetic; 1.25x speed and pitch acceleration with attenuated low rumble.
+- **Timescale**: Speed `1.25`, Pitch `1.25`.
+- **EQ**: Low frequencies attenuated (-2.0 dB below 100 Hz), high frequencies boosted (+2.5 dB at 8k–16kHz).
+
+#### 13. `vaporwave`
+- **Profile**: Nostalgic analog aesthetic; slowed 0.85x speed and pitch with warm low-pass rolloff and subtle stereo widening.
+- **Timescale**: Speed `0.85`, Pitch `0.85`.
+- **Spatial**: Width `1.20`.
+
+#### 14. `8d`
+- **Profile**: Continuous 360° binaural circular orbit around the listener's head.
+- **Modulation**: Rotation active at `0.12 Hz` (~8.3 seconds per full rotation).
+- **Spatial**: Width `1.35`, Crossfeed `0.20`.
+
+#### 15. `tremolo`
+- **Profile**: Rhythmic amplitude modulation creating classic vintage amplifier tremolo.
+- **Modulation**: Tremolo active at `4.0 Hz` with `0.4` depth.
+
+#### 16. `vibrato`
+- **Profile**: Musical frequency pitch modulation for expressive vocal or synth warble.
+- **Modulation**: Vibrato active at `5.0 Hz` with `0.3` semitone pitch depth.
+
+#### 17. `broadcast`
+- **Profile**: ITU-R BS.1770-4 and EBU R128 loudness normalization calibrated for competitive streaming and multi-track listening sessions.
+- **Loudness**: Target `-14.0 LUFS`, max boost `+9.0 dB`, max attenuation `-12.0 dB`.
+
+#### 18. `flat` (aliases: `reset`, `bypass`)
+- **Profile**: Completely bypasses all EQ, spatialization, modulation, and timescale stages, passing bit-perfect raw decoded PCM.

@@ -78,7 +78,8 @@ Running Lavalink means running a JVM. On a small VPS that is most of your RAM go
 - 🎵 **Wide format & source support**: MP3, FLAC, AAC, OGG Vorbis, WAV, direct HTTP / ICY streams, and **native Spotify resolution** (Tracks, Playlists, Albums via 0-key public embeds).
 - 📻 **Live Radio Streaming & ICY Demuxer**: Dedicated `/v1/player/live` endpoint for Icecast/SHOUTcast continuous radio streams with real-time `metadata_update` WebSocket events and zero decoder desync.
 - 💾 **Persistent Guild & DSP Configuration**: Volume, loop mode, 24/7, autoplay, and complete DSP pipelines persist to disk (`settings/guild_settings.json`) across server restarts.
-- 🎛️ **Granular DSP & Extended Filters**: Modular endpoints for Reverb FDN, Spatial 3D, Timescale, Loudness, Modulation, and 15-band EQ supporting Peaking, LowShelf, HighShelf, LowPass, and HighPass curves.
+- 🎛️ **Studio Multi-Mode EQ & Master DSP**: 15-band ISO Graphic EQ, Dolby DAX 20 critical psychoacoustic bands, ISO 31-band 1/3-octave studio EQ, dynamic Parametric EQ with **Orthogonal Mid/Side (M/S) Matrixing**, and extended Biquads (Peaking, LowShelf, HighShelf, LowPass, HighPass, Notch, BandPass).
+- 🎧 **Motorola Dolby Atmos Hardware Calibration**: 5 factory-calibrated Dolby Atmos profiles extracted directly from Motorola DAX v3 hardware via ADB root (`moto-spatial`, `dolby-music`, `dolby-movie`, `dolby-game`, `dolby-voice`) alongside 13 classic studio presets.
 - 🎯 **Automatic Suggested Presets**: Track metadata automatically suggests ideal DSP presets (Bass Boost, Nightcore, Lo-Fi, Spatial 8D, Vocal Clarity, Cinema 3D) for zero-config clients.
 - 📡 **Real-time transport**: direct 50 Hz UDP RTP Opus streaming with hardware-accelerated ChaCha20-Poly1305 and AES-GCM encryption.
 - ⚙️ **Simple REST control plane**: Axum 0.8 on a multi-threaded Tokio runtime.
@@ -683,16 +684,21 @@ Content-Type: application/json
 
 ### POST `/v1/player/eq`
 
-Applies the 15-band equaliser or a named DSP preset. Use **either** `preset` **or** `bands`, not both (`bands` wins when both are sent).
+Configures the multi-mode studio equaliser or applies an acoustic preset. Supports 4 distinct equalization topologies:
+1. **Named Presets**: Studio acoustic profiles and Motorola Dolby Atmos hardware presets.
+2. **15-Band ISO Graphic EQ**: Standard ISO bands (25 Hz to 16 kHz) with frequency-dependent Q factors.
+3. **Parametric EQ with Mid/Side Matrixing**: Custom bands with arbitrary frequency, Q, gain, filter curve, and channel isolation (`Stereo`, `Mid`, `Side`).
+4. **Dolby DAX 20 Critical Bands**: Psychoacoustic critical bands (47 Hz to 19.688 kHz) extracted from Dolby Audio Processing (DAP) hardware profiles.
+5. **ISO 31-Band 1/3-Octave Standard**: Full 1/3-octave studio precision from 20 Hz to 20 kHz.
 
 ```http
 POST /v1/player/eq
 Content-Type: application/json
 
-# Option A: apply a named preset
-{ "guild_id": "1234", "preset": "bass-boost-3d" }
+# Option A: Apply a named preset (e.g. Motorola Dolby Atmos Spatializer)
+{ "guild_id": "1234", "preset": "moto-spatial" }
 
-# Option B: custom per-band gains (decibel values -15 to +15)
+# Option B: 15-band graphic equaliser gains (dB values -15.0 to +15.0)
 {
   "guild_id": "1234",
   "bands": [
@@ -703,9 +709,36 @@ Content-Type: application/json
     { "band": 14, "gain_db":  5.0 }
   ]
 }
+
+# Option C: Parametric EQ with Orthogonal Mid/Side (M/S) Matrix routing
+{
+  "guild_id": "1234",
+  "parametric": [
+    { "freq": 1000.0, "q": 1.4, "gain_db": 3.0, "filter_type": "peaking", "channel": "Mid" },
+    { "freq": 12000.0, "q": 0.7, "gain_db": 4.5, "filter_type": "highshelf", "channel": "Side" },
+    { "freq": 60.0, "q": 12.0, "gain_db": -24.0, "filter_type": "notch", "channel": "Stereo" }
+  ]
+}
+
+# Option D: Dolby DAX 20 Psychoacoustic Critical Bands (47 Hz - 19.688 kHz)
+{
+  "guild_id": "1234",
+  "dolby_bands": [3.0, 2.5, 2.0, 1.5, 1.0, 0.5, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.0, 3.5, 3.0, 2.5]
+}
+
+# Option E: ISO 31-Band 1/3-Octave Studio Precision (20 Hz - 20 kHz)
+{
+  "guild_id": "1234",
+  "iso31_bands": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 2.5, 2.0, 1.5, 1.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 4.0, 3.5, 3.0, 2.5, 2.0, 1.5, 1.0]
+}
 ```
 
-**Band frequencies** (15 bands, IEC R125 centred): `25 Hz, 40, 63, 100, 160, 250, 400, 630, 1k, 1.6k, 2.5k, 4k, 6.3k, 10k, 16k`.
+**Supported Filter Types**: `peaking`, `lowshelf`, `highshelf`, `lowpass`, `highpass`, `notch`, `bandpass`.
+
+**Channel Routing Options**:
+- `Stereo` (default): Applies filter equally to Left and Right channels.
+- `Mid` ($M = \frac{L + R}{\sqrt{2}}$): Targets mono center content (lead vocals, kick, bass, snare).
+- `Side` ($S = \frac{L - R}{\sqrt{2}}$): Targets stereo peripheral content (reverb, air, width, backing instruments).
 
 **Response**
 
@@ -715,9 +748,11 @@ Content-Type: application/json
   "data": {
     "guild_id": 1234,
     "status": {
-      "active_preset": "bass-boost-3d",
-      "eq_bands": [6.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-      "stereo_width": 1.35,
+      "active_preset": "moto-spatial",
+      "stereo_width": 1.25,
+      "binaural_crossfeed": true,
+      "bass_exciter": true,
+      "eq_bands": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
       "rotation": false,
       "tremolo": false,
       "vibrato": false,
@@ -727,7 +762,7 @@ Content-Type: application/json
       "pitch": 1.0,
       "rate": 1.0
     },
-    "message": "Preset 'bass-boost-3d' aplicado: Sub-graves acentuados, campo estéreo 1.35x"
+    "message": "Preset 'moto-spatial' aplicado: Motorola Dolby Atmos Spatial Audio calibrado vía ADB (moto buds bass)..."
   },
   "message": null
 }
@@ -737,7 +772,7 @@ Content-Type: application/json
 
 ### POST `/v1/player/dsp`
 
-Full-featured DSP control. Accepts a `preset` and/or any combination of `spatial`, `modulation`, `loudness`, `timescale`, and `bands` — all sub-objects are optional and merged into the guild's parameter block.
+Full-featured DSP control. Accepts a `preset`, multi-mode EQ (`bands`, `parametric`, `dolby_bands`, `iso31_bands`), and/or any combination of `spatial`, `modulation`, `loudness`, and `timescale` — all sub-objects are merged atomically into the player's DSP pipeline.
 
 ```http
 POST /v1/player/dsp
@@ -745,7 +780,7 @@ Content-Type: application/json
 
 {
   "guild_id": "1234",
-  "preset": "8d",
+  "preset": "moto-spatial",
 
   "spatial": {
     "stereo_width": 1.35,
@@ -756,7 +791,7 @@ Content-Type: application/json
   },
 
   "modulation": {
-    "rotation": true,
+    "rotation": false,
     "rotation_speed_hz": 0.15,
     "tremolo": false,
     "vibrato": false
@@ -777,7 +812,28 @@ Content-Type: application/json
 }
 ```
 
-**Valid preset names** (all lowercase, hyphens): `music`, `bass-boost-3d`, `bass-boost`, `bass`, `cinema-3d`, `dolby-atmos`, `vocal-clarity`, `vocal`, `gaming-3d`, `concert-hall`, `nightcore`, `vaporwave`, `8d`, `tremolo`, `vibrato`, `broadcast`, `flat`.
+**Built-In Presets (18 Profiles)**:
+- **Motorola Dolby Atmos Hardware Profiles**:
+  - `moto-spatial` (aliases: `dolby-moto`, `moto-buds`, `spatial-audio`): Calibrated from Motorola moto g85 5G DAX v3 profile for Moto Buds Bass. Virtualizer +6dB, crossfeed 45°, Mid-vocal clarity, Side-air boost, and sub-bass exciter (30–90 Hz).
+  - `dolby-music` (alias: `dolby-audio-music`): Dolby Audio DAP v3 Music profile with warm IEQ, natural harmonic bass enhancement, and holographic staging.
+  - `dolby-movie` (alias: `dolby-cinema`): Dolby Audio DAP v3 Movie/Cinema profile with Mid-channel dialogue enhancement and wide surround field.
+  - `dolby-game` (alias: `dolby-gaming`): Dolby Audio DAP v3 Gaming profile with tactical acoustic cue boosts (2.5k–6kHz) and impactful explosion punch.
+  - `dolby-voice` (aliases: `dolby-dialogue`, `dolby-podcast`): Dolby Audio Voice Clarifier with centered vocal projection and de-esser rumble filtering.
+- **Studio Audiophile Profiles**:
+  - `music` (alias: `hifi`): Hi-Fi Studio mastering curve with silky top sheen and warm low-end.
+  - `cinema-3d` (alias: `atmos`): Cinematic 3D immersion with expansive soundstage.
+  - `bass-boost-3d` (aliases: `bass-boost`, `bass`): Visceral low-end reinforcement with vocal preservation.
+  - `vocal-clarity` (alias: `vocal`): Speech and podcast optimization with high-pass rumble reduction.
+  - `gaming-3d`: Positional 3D spatialization for competitive gaming.
+  - `concert-hall`: Arena acoustic reverberation and ambient dispersion.
+- **Acoustic Effects & Normalization**:
+  - `nightcore`: 1.25x pitch & tempo acceleration with bright high-end response.
+  - `vaporwave`: 0.85x slowed tempo, low-pass filter warmth, and vintage analog vibe.
+  - `8d`: Continuous 3D binaural orbital panning at 0.12 Hz.
+  - `tremolo`: Harmonic volume modulation at 4 Hz.
+  - `vibrato`: Pitch modulation at 5 Hz with 0.3 semitone depth.
+  - `broadcast`: ITU-R BS.1770 / EBU R128 loudness normalization (-14 LUFS) with transparent peak limiting.
+  - `flat` (aliases: `reset`, `bypass`): Restores pristine bit-perfect neutral studio response.
 
 **Response shape** — identical to `/v1/player/eq`.
 
