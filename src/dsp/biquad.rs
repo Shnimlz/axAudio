@@ -11,6 +11,8 @@ pub enum FilterType {
     HighShelf,
     LowPass,
     HighPass,
+    Notch { q: f32 },
+    BandPass { q: f32 },
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +147,42 @@ impl BiquadCoefficients {
                     a2: a2 / a0,
                 }
             }
+            FilterType::Notch { q } => {
+                let q_f64 = (q as f64).max(0.1);
+                let alpha = sin_w0 / (2.0 * q_f64);
+                let a0 = 1.0 + alpha;
+                let b0 = 1.0;
+                let b1 = -2.0 * cos_w0;
+                let b2 = 1.0;
+                let a1 = -2.0 * cos_w0;
+                let a2 = 1.0 - alpha;
+
+                Self {
+                    b0: b0 / a0,
+                    b1: b1 / a0,
+                    b2: b2 / a0,
+                    a1: a1 / a0,
+                    a2: a2 / a0,
+                }
+            }
+            FilterType::BandPass { q } => {
+                let q_f64 = (q as f64).max(0.1);
+                let alpha = sin_w0 / (2.0 * q_f64);
+                let a0 = 1.0 + alpha;
+                let b0 = alpha;
+                let b1 = 0.0;
+                let b2 = -alpha;
+                let a1 = -2.0 * cos_w0;
+                let a2 = 1.0 - alpha;
+
+                Self {
+                    b0: b0 / a0,
+                    b1: b1 / a0,
+                    b2: b2 / a0,
+                    a1: a1 / a0,
+                    a2: a2 / a0,
+                }
+            }
         }
     }
 
@@ -157,8 +195,8 @@ impl BiquadCoefficients {
         let den = 1.0 + self.a1 * self.a1 + self.a2 * self.a2
             + 2.0 * (self.a1 + self.a1 * self.a2) * c1
             + 2.0 * self.a2 * c2;
-        if den <= 1e-12 {
-            return 0.0;
+        if den <= 1e-12 || num <= 1e-12 {
+            return -80.0;
         }
         10.0 * (num / den).log10()
     }
@@ -201,7 +239,10 @@ pub struct StereoBiquad {
 
 impl StereoBiquad {
     pub fn new(filter_type: FilterType, freq_hz: f32, gain_db: f32, sample_rate: f32) -> Self {
-        let active = matches!(filter_type, FilterType::LowPass | FilterType::HighPass) || gain_db.abs() > 0.01;
+        let active = matches!(
+            filter_type,
+            FilterType::LowPass | FilterType::HighPass | FilterType::Notch { .. } | FilterType::BandPass { .. }
+        ) || gain_db.abs() > 0.01;
         Self {
             coeffs: BiquadCoefficients::compute(filter_type, freq_hz, gain_db, sample_rate),
             left: BiquadState::default(),
@@ -212,7 +253,10 @@ impl StereoBiquad {
 
     pub fn update(&mut self, filter_type: FilterType, freq_hz: f32, gain_db: f32, sample_rate: f32) {
         self.coeffs = BiquadCoefficients::compute(filter_type, freq_hz, gain_db, sample_rate);
-        self.active = matches!(filter_type, FilterType::LowPass | FilterType::HighPass) || gain_db.abs() > 0.01;
+        self.active = matches!(
+            filter_type,
+            FilterType::LowPass | FilterType::HighPass | FilterType::Notch { .. } | FilterType::BandPass { .. }
+        ) || gain_db.abs() > 0.01;
     }
 
     #[inline(always)]
@@ -276,6 +320,51 @@ mod tests {
             assert!(l.abs() < 5.0);
             assert!(r.abs() < 5.0);
         }
+    }
+
+    #[test]
+    fn test_notch_filter() {
+        let mut filter = StereoBiquad::new(FilterType::Notch { q: 2.0 }, 1000.0, 0.0, 48000.0);
+        assert!(filter.active);
+
+        // Sinusoid at notch frequency (1000 Hz) should be strongly attenuated
+        let freq = 1000.0;
+        let sr = 48000.0;
+        let mut total_in = 0.0f32;
+        let mut total_out = 0.0f32;
+
+        for n in 0..4800 {
+            let sample = (2.0 * std::f32::consts::PI * freq * (n as f32) / sr).sin();
+            let (out_l, _) = filter.process_pair(sample, sample);
+            if n > 2400 {
+                total_in += sample.abs();
+                total_out += out_l.abs();
+            }
+        }
+        assert!(total_out < total_in * 0.2, "Notch should attenuate target frequency");
+    }
+
+    #[test]
+    fn test_bandpass_filter() {
+        let mut filter = StereoBiquad::new(FilterType::BandPass { q: 2.0 }, 1000.0, 0.0, 48000.0);
+        assert!(filter.active);
+
+        // DC (0 Hz) and high freq (15000 Hz) should be attenuated, 1000 Hz passed
+        let sr = 48000.0;
+        let mut out_1k = 0.0f32;
+        for n in 0..2400 {
+            let sample = (2.0 * std::f32::consts::PI * 1000.0 * (n as f32) / sr).sin();
+            let (l, _) = filter.process_pair(sample, sample);
+            if n > 1200 { out_1k += l.abs(); }
+        }
+        filter.reset();
+        let mut out_15k = 0.0f32;
+        for n in 0..2400 {
+            let sample = (2.0 * std::f32::consts::PI * 15000.0 * (n as f32) / sr).sin();
+            let (l, _) = filter.process_pair(sample, sample);
+            if n > 1200 { out_15k += l.abs(); }
+        }
+        assert!(out_1k > out_15k * 2.0, "BandPass should pass 1kHz much stronger than 15kHz");
     }
 }
 

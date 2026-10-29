@@ -387,7 +387,8 @@ pub struct LiveRadioPayload {
 }
 
 use crate::dsp::{
-    BandSetting, LoudnessSettings, ModulationSettings, ReverbSettings, SpatialSettings, TimescaleSettings,
+    BandSetting, LoudnessSettings, ModulationSettings, ParametricBand, ReverbSettings,
+    SpatialSettings, TimescaleSettings,
 };
 
 #[derive(Debug, Deserialize)]
@@ -397,6 +398,9 @@ pub struct EqPayload {
     #[serde(default, deserialize_with = "deserialize_optional_u64_flexible", alias = "user_id", alias = "bot")]
     pub bot_id: Option<u64>,
     pub bands: Option<Vec<BandSetting>>,
+    pub parametric: Option<Vec<ParametricBand>>,
+    pub dolby_bands: Option<Vec<f32>>,
+    pub iso31_bands: Option<Vec<f32>>,
     pub preset: Option<String>,
 }
 
@@ -413,6 +417,9 @@ pub struct DspPayload {
     pub timescale: Option<TimescaleSettings>,
     pub reverb: Option<ReverbSettings>,
     pub bands: Option<Vec<BandSetting>>,
+    pub parametric: Option<Vec<ParametricBand>>,
+    pub dolby_bands: Option<Vec<f32>>,
+    pub iso31_bands: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Deserialize)]

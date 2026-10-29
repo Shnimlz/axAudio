@@ -18,7 +18,10 @@ pub mod timescale;
 
 pub use biquad::{FilterType, StereoBiquad};
 pub use decoder::{inject_dsp, DspDecoder};
-pub use equalizer::{BandSetting, Equalizer, EQ_FREQUENCIES};
+pub use equalizer::{
+    BandSetting, DynamicFilter, EqChannel, Equalizer, ParametricBand, DOLBY_DAX_FREQUENCIES,
+    EQ_FREQUENCIES, ISO_31_FREQUENCIES,
+};
 pub use loudness::{LoudnessNormalizer, LoudnessSettings};
 pub use modulation::{
     ChorusProcessor, FlangerProcessor, ModulationProcessor, ModulationSettings, PhaserProcessor,
@@ -37,6 +40,8 @@ pub struct DspParams {
     pub gains_db: [f32; 15],
     #[serde(default)]
     pub filter_types: [Option<String>; 15],
+    #[serde(default)]
+    pub parametric_bands: Option<Vec<ParametricBand>>,
     pub spatial: SpatialSettings,
     #[serde(default)]
     pub reverb: ReverbSettings,
@@ -52,6 +57,7 @@ impl Default for DspParams {
         Self {
             gains_db: [0.0; 15],
             filter_types: Default::default(),
+            parametric_bands: None,
             spatial: SpatialSettings::default(),
             reverb: ReverbSettings::default(),
             modulation: ModulationSettings::default(),
@@ -82,6 +88,18 @@ impl DspParams {
                 }
             }
         }
+        self.active_preset = None;
+        self.version += 1;
+    }
+
+    pub fn set_parametric_bands(&mut self, bands: Vec<ParametricBand>) {
+        self.parametric_bands = Some(bands);
+        self.active_preset = None;
+        self.version += 1;
+    }
+
+    pub fn clear_parametric_bands(&mut self) {
+        self.parametric_bands = None;
         self.active_preset = None;
         self.version += 1;
     }
@@ -128,6 +146,7 @@ impl DspParams {
             reverb_wet: self.reverb.reverb_wet,
             eq_bands: self.gains_db,
             filter_types: self.filter_types.clone(),
+            parametric_bands: self.parametric_bands.clone(),
             rotation: self.modulation.rotation,
             rotation_speed_hz: self.modulation.rotation_speed_hz,
             tremolo: self.modulation.tremolo,
@@ -156,6 +175,8 @@ pub struct DspStatus {
     pub reverb_wet: f32,
     pub eq_bands: [f32; 15],
     pub filter_types: [Option<String>; 15],
+    #[serde(default)]
+    pub parametric_bands: Option<Vec<ParametricBand>>,
     pub rotation: bool,
     pub rotation_speed_hz: f32,
     pub tremolo: bool,
@@ -207,6 +228,11 @@ impl DspChain {
             } else {
                 self.equalizer.set_band_db(i, gain);
             }
+        }
+        if let Some(ref pb) = params.parametric_bands {
+            self.equalizer.set_parametric_bands(pb);
+        } else {
+            self.equalizer.clear_parametric_bands();
         }
         self.spatial.update_sample_rate(sample_rate);
         self.spatial.set_settings(params.spatial.clone());
@@ -540,6 +566,7 @@ mod integration_tests {
         let params = DspParams {
             gains_db: [3.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.5, 1.5, 2.0, 2.0],
             filter_types: Default::default(),
+            parametric_bands: None,
             spatial: SpatialSettings {
                 stereo_width: 1.3,
                 binaural_crossfeed: true,

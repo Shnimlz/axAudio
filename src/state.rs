@@ -414,11 +414,10 @@ impl AppState {
             .unwrap_or_else(|_| std::path::PathBuf::from("settings/guild_settings.json"))
     }
 
-    /// Carga configuraciones de guilds guardadas previamente en disco
-    pub fn load_guild_settings_from_disk() -> HashMap<String, PersistedPlayerConfig> {
-        let path = Self::get_guild_settings_file_path();
+    /// Carga configuraciones de guilds desde una ruta de archivo
+    pub fn load_guild_settings_from_path(path: &std::path::Path) -> HashMap<String, PersistedPlayerConfig> {
         if path.exists() {
-            if let Ok(file_content) = std::fs::read_to_string(&path) {
+            if let Ok(file_content) = std::fs::read_to_string(path) {
                 if let Ok(map) = serde_json::from_str::<HashMap<String, PersistedPlayerConfig>>(&file_content) {
                     tracing::info!(count = map.len(), path = ?path, "Configuraciones de guilds cargadas desde disco");
                     return map;
@@ -428,9 +427,13 @@ impl AppState {
         HashMap::new()
     }
 
-    /// Escribe las configuraciones activas de los reproductores a disco
-    pub fn persist_guild_settings(&self) {
-        let path = Self::get_guild_settings_file_path();
+    /// Carga configuraciones de guilds guardadas previamente en disco
+    pub fn load_guild_settings_from_disk() -> HashMap<String, PersistedPlayerConfig> {
+        Self::load_guild_settings_from_path(&Self::get_guild_settings_file_path())
+    }
+
+    /// Escribe las configuraciones activas a una ruta específica
+    pub fn persist_guild_settings_to_path(&self, path: &std::path::Path) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -480,9 +483,14 @@ impl AppState {
             map.insert(format!("{}:{}", key.guild_id, key.bot_id), config);
         }
         if let Ok(json) = serde_json::to_string_pretty(&map) {
-            let _ = std::fs::write(&path, json);
+            let _ = std::fs::write(path, json);
         }
         self.resolver.persist_cache_to_disk(&crate::sources::SourceResolver::get_cache_file_path());
+    }
+
+    /// Escribe las configuraciones activas de los reproductores a disco
+    pub fn persist_guild_settings(&self) {
+        self.persist_guild_settings_to_path(&Self::get_guild_settings_file_path());
     }
 
     /// Retorna la memoria residente (RSS) en bytes del proceso axAudio
@@ -605,9 +613,6 @@ mod tests {
     #[test]
     fn test_guild_settings_persistence() {
         let temp_path = std::env::temp_dir().join(format!("axaudio_test_settings_{}.json", std::process::id()));
-        unsafe {
-            std::env::set_var("AXAUDIO_GUILD_SETTINGS_FILE", &temp_path);
-        }
 
         let state = AppState::new();
         let key = PlayerKey::new(999, 888);
@@ -620,14 +625,14 @@ mod tests {
         if let Ok(mut p) = dsp_params.write() {
             p.timescale.speed = 1.25;
         }
-        state.persist_guild_settings();
+        state.persist_guild_settings_to_path(&temp_path);
 
         assert!(temp_path.exists());
         let content = std::fs::read_to_string(&temp_path).unwrap();
         assert!(content.contains("0.42"));
         assert!(content.contains("\"twenty_four_seven\": true"));
 
-        let loaded = AppState::load_guild_settings_from_disk();
+        let loaded = AppState::load_guild_settings_from_path(&temp_path);
         let cfg = loaded.get("999:888").expect("Should have persisted 999:888");
         assert_eq!(cfg.volume, Some(0.42));
         assert_eq!(cfg.loop_mode, Some(LoopMode::Queue));

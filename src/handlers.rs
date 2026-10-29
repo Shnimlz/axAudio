@@ -1958,6 +1958,57 @@ pub async fn player_eq(
         }
     }
 
+    if let Some(ref parametric) = payload.parametric {
+        params.set_parametric_bands(parametric.clone());
+        if message.is_empty() {
+            message = format!("Se configuraron {} bandas paramétricas / Mid-Side", parametric.len());
+        }
+    }
+
+    if let Some(ref dolby_gains) = payload.dolby_bands {
+        if dolby_gains.len() == 20 {
+            let mut gains = [0.0f32; 20];
+            gains.copy_from_slice(&dolby_gains[..20]);
+            let pb: Vec<crate::dsp::ParametricBand> = crate::dsp::DOLBY_DAX_FREQUENCIES
+                .iter()
+                .zip(gains.iter())
+                .map(|(&freq, &gain_db)| crate::dsp::ParametricBand {
+                    freq,
+                    gain_db,
+                    q: 1.4,
+                    filter_type: "peaking".to_string(),
+                    channel: crate::dsp::EqChannel::Stereo,
+                })
+                .collect();
+            params.set_parametric_bands(pb);
+            if message.is_empty() {
+                message = "Se aplicó curva Dolby DAX de 20 bandas críticas".to_string();
+            }
+        }
+    }
+
+    if let Some(ref iso_gains) = payload.iso31_bands {
+        if iso_gains.len() == 31 {
+            let mut gains = [0.0f32; 31];
+            gains.copy_from_slice(&iso_gains[..31]);
+            let pb: Vec<crate::dsp::ParametricBand> = crate::dsp::ISO_31_FREQUENCIES
+                .iter()
+                .zip(gains.iter())
+                .map(|(&freq, &gain_db)| crate::dsp::ParametricBand {
+                    freq,
+                    gain_db,
+                    q: 2.0,
+                    filter_type: "peaking".to_string(),
+                    channel: crate::dsp::EqChannel::Stereo,
+                })
+                .collect();
+            params.set_parametric_bands(pb);
+            if message.is_empty() {
+                message = "Se aplicó ecualizador gráfico ISO de 31 bandas (1/3 octava)".to_string();
+            }
+        }
+    }
+
     let status = params.get_status();
     drop(params);
     state.persist_guild_settings();
@@ -2029,6 +2080,48 @@ pub async fn player_dsp(
 
     if let Some(ref bands) = payload.bands {
         params.set_bands(bands);
+    }
+
+    if let Some(ref parametric) = payload.parametric {
+        params.set_parametric_bands(parametric.clone());
+    }
+
+    if let Some(ref dolby_gains) = payload.dolby_bands {
+        if dolby_gains.len() == 20 {
+            let mut gains = [0.0f32; 20];
+            gains.copy_from_slice(&dolby_gains[..20]);
+            let pb: Vec<crate::dsp::ParametricBand> = crate::dsp::DOLBY_DAX_FREQUENCIES
+                .iter()
+                .zip(gains.iter())
+                .map(|(&freq, &gain_db)| crate::dsp::ParametricBand {
+                    freq,
+                    gain_db,
+                    q: 1.4,
+                    filter_type: "peaking".to_string(),
+                    channel: crate::dsp::EqChannel::Stereo,
+                })
+                .collect();
+            params.set_parametric_bands(pb);
+        }
+    }
+
+    if let Some(ref iso_gains) = payload.iso31_bands {
+        if iso_gains.len() == 31 {
+            let mut gains = [0.0f32; 31];
+            gains.copy_from_slice(&iso_gains[..31]);
+            let pb: Vec<crate::dsp::ParametricBand> = crate::dsp::ISO_31_FREQUENCIES
+                .iter()
+                .zip(gains.iter())
+                .map(|(&freq, &gain_db)| crate::dsp::ParametricBand {
+                    freq,
+                    gain_db,
+                    q: 2.0,
+                    filter_type: "peaking".to_string(),
+                    channel: crate::dsp::EqChannel::Stereo,
+                })
+                .collect();
+            params.set_parametric_bands(pb);
+        }
     }
 
     let status = params.get_status();
@@ -2719,19 +2812,31 @@ pub async fn preset_apply(
     Ok(Json(ApiResponse::ok(res)))
 }
 
-/// Lista todos los presets personalizados
+/// Lista todos los presets (del sistema y personalizados)
 pub async fn preset_list(State(state): State<AppState>) -> Json<ApiResponse<PresetListResponse>> {
-    let presets: Vec<PresetInfo> = state
-        .list_custom_presets()
-        .into_iter()
-        .filter_map(|name| {
-            state.get_custom_preset(&name).map(|params| PresetInfo {
+    let mut presets: Vec<PresetInfo> = Vec::new();
+
+    // 1. Presets del sistema precalibrados (Dolby Atmos, HiFi, Studio)
+    for (name, desc) in crate::dsp::presets::list_builtin_presets() {
+        let mut params = DspParams::default();
+        let _ = crate::dsp::apply_preset_to_params(name, &mut params);
+        presets.push(PresetInfo {
+            name: name.to_string(),
+            description: Some(desc.to_string()),
+            status: params.get_status(),
+        });
+    }
+
+    // 2. Presets personalizados guardados por los usuarios
+    for name in state.list_custom_presets() {
+        if let Some(params) = state.get_custom_preset(&name) {
+            presets.push(PresetInfo {
                 name: name.clone(),
-                description: None,
+                description: Some("Preset personalizado del servidor".to_string()),
                 status: params.get_status(),
-            })
-        })
-        .collect();
+            });
+        }
+    }
 
     let response = PresetListResponse {
         count: presets.len(),
