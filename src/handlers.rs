@@ -315,14 +315,16 @@ impl EventHandler for TrackEndNotifier {
             }
         }
 
-        // Activación de prefetch de seguridad
-        if let Some(ref st) = self.state {
-            let st_clone = st.clone();
-            let key = self.key;
-            tokio::spawn(async move {
-                tokio::task::yield_now().await;
-                maybe_prefetch_next_track(&st_clone, key).await;
-            });
+        // Activación de prefetch de seguridad (únicamente si NO fue una detención intencional)
+        if reason != "stopped" {
+            if let Some(ref st) = self.state {
+                let st_clone = st.clone();
+                let key = self.key;
+                tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    maybe_prefetch_next_track(&st_clone, key).await;
+                });
+            }
         }
 
         None
@@ -1374,6 +1376,7 @@ pub async fn player_control(
             state.pending_playlists.remove(&player_key);
             state.end_prefetch(player_key);
             state.reset_consecutive_errors(player_key);
+            state.last_tracks.remove(&player_key);
             driver.queue().modify_queue(|q| {
                 for handle in q.drain(..) {
                     let _ = handle.stop();
@@ -2317,7 +2320,8 @@ pub async fn maybe_prefetch_next_track(state: &AppState, key: PlayerKey) {
         return;
     }
 
-    // 4. Obtener el reproductor activo
+    // 4. Obtener el reproductor activo y capturar la época actual para abortar si ocurre un stop concurrente
+    let start_epoch = state.current_epoch(key);
     let driver_ref = match state.players.get(&key) {
         Some(d) => d.clone(),
         None => return,
@@ -2331,8 +2335,14 @@ pub async fn maybe_prefetch_next_track(state: &AppState, key: PlayerKey) {
     };
 
     let (should_prefetch, reason) = if q_len == 0 {
-        // Cola vacía (por ejemplo tras skip o final abrupto): prefetch y arranque inmediato
-        (true, "cola vacía, iniciando siguiente pista de inmediato".to_string())
+        if has_pending {
+            // Cola vacía en Songbird pero hay pistas pendientes en la playlist: arranque de la siguiente
+            (true, "cola vacía, iniciando siguiente pista de playlist pendiente".to_string())
+        } else {
+            // Ni hay pistas en Songbird ni pistas pendientes: el reproductor está inactivo o fue detenido con /stop.
+            // NO invocar prefetch ni autoplay cuando el reproductor está en reposo.
+            (false, String::new())
+        }
     } else if q_len == 1 {
         // Solo hay 1 pista en Songbird (la que suena) y 0 pistas siguientes encoladas
         if let Some(ref current) = current_track {
@@ -2381,12 +2391,13 @@ pub async fn maybe_prefetch_next_track(state: &AppState, key: PlayerKey) {
     }
 
     // 6. Si no hay pistas pendientes pero autoplay está activo, generar recomendaciones vía InnerTube
+    // CONDICIÓN ESTRICTA: Solo generar recomendaciones si hay una pista actualmente reproduciéndose
     if !has_pending && state.is_autoplay(key) {
         let seed_opt = if let Some(ref curr) = current_track {
             let meta: Arc<TrackMetadata> = curr.data();
             Some(meta.source_url.clone())
         } else {
-            state.get_last_track(key).map(|t| t.source_url)
+            None
         };
 
         if let Some(seed_url) = seed_opt {
@@ -2508,6 +2519,15 @@ pub async fn maybe_prefetch_next_track(state: &AppState, key: PlayerKey) {
                     .await
                     {
                         Ok(songbird_track) => {
+                            if state_clone.current_epoch(guard_key) != start_epoch {
+                                warn!(
+                                    guild = guard_key.guild_id,
+                                    bot = guard_key.bot_id,
+                                    "Prefetch cancelado: la época del reproductor cambió durante la resolución (stop/clear invocado)"
+                                );
+                                break;
+                            }
+
                             let handle = {
                                 let mut driver = driver_clone.lock().await;
                                 let h = driver.enqueue(songbird_track).await;

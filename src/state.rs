@@ -287,6 +287,7 @@ impl AppState {
         self.last_tracks.insert(key, track);
     }
 
+    #[allow(dead_code)]
     pub fn get_last_track(&self, key: PlayerKey) -> Option<TrackMetadata> {
         self.last_tracks.get(&key).map(|t| t.clone())
     }
@@ -686,5 +687,24 @@ mod tests {
         state.touch_activity(key);
         let recent = state.get_last_activity(key);
         assert!(recent.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_stop_action_epoch_advancement_and_isolation() {
+        let state = AppState::new();
+        let key = PlayerKey::new(1001, 2002);
+
+        let initial_epoch = state.current_epoch(key);
+        assert_eq!(initial_epoch, 0);
+
+        // Simular stop: incrementa época
+        let epoch1 = state.next_epoch(key);
+        assert_eq!(epoch1, 1);
+        assert_eq!(state.current_epoch(key), 1);
+
+        // Si se llama de nuevo
+        let epoch2 = state.next_epoch(key);
+        assert_eq!(epoch2, 2);
+        assert_eq!(state.current_epoch(key), 2);
     }
 }
