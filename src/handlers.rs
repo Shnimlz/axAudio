@@ -870,6 +870,8 @@ pub async fn voice_join(
         .value()
         .clone();
 
+    state.touch_activity(player_key);
+
     let mut driver = driver_ref.lock().await;
 
     // Configuración de Bitrate Opus de alta definición (por defecto 128 kbps, o variable AUDIO_BITRATE)
@@ -1372,8 +1374,13 @@ pub async fn player_control(
             state.pending_playlists.remove(&player_key);
             state.end_prefetch(player_key);
             state.reset_consecutive_errors(player_key);
-            driver.queue().stop();
+            driver.queue().modify_queue(|q| {
+                for handle in q.drain(..) {
+                    let _ = handle.stop();
+                }
+            });
             driver.stop();
+            state.touch_activity(player_key);
             Ok(Json(ApiResponse::ok("Reproductor detenido".to_string())))
         }
         "skip" => {
@@ -1849,6 +1856,11 @@ pub async fn cleanup_guild_player(state: &AppState, key: PlayerKey) -> bool {
 
     if let Some((_, driver_ref)) = state.players.remove(&key) {
         let mut driver = driver_ref.lock().await;
+        driver.queue().modify_queue(|q| {
+            for handle in q.drain(..) {
+                let _ = handle.stop();
+            }
+        });
         driver.stop();
         driver.leave();
         true

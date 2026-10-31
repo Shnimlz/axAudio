@@ -332,13 +332,17 @@ impl AppState {
     }
 
     /// Retorna la última actividad del reproductor.
-    /// Si no hay entrada, retorna `Instant::now() - Duration::MAX` (prácticamente el inicio del runtime),
-    /// lo que hace que el GC detecte inmediatamente el reproductor como inactivo.
+    /// Si no hay entrada, retorna un instante seguro en el pasado (hasta 24h antes),
+    /// evitando overflow al restar duraciones de Instant::now().
     pub fn get_last_activity(&self, key: PlayerKey) -> Instant {
         self.last_activity
             .get(&key)
             .map(|t| *t.value())
-            .unwrap_or_else(|| Instant::now() - std::time::Duration::MAX)
+            .unwrap_or_else(|| {
+                Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(86400))
+                    .unwrap_or_else(Instant::now)
+            })
     }
 
     /// Ruta al archivo de almacenamiento persistente de presets personalizados
@@ -666,5 +670,21 @@ mod tests {
         // Reset: se limpia y vuelve a estar libre
         state.reset_consecutive_errors(key);
         assert!(!state.is_circuit_tripped(key));
+    }
+
+    #[test]
+    fn test_get_last_activity_without_entry_never_overflows() {
+        let state = AppState::new();
+        let key = PlayerKey::new(777, 888);
+
+        // Sin registrar actividad, get_last_activity NO debe desbordar ni provocar panic
+        let last = state.get_last_activity(key);
+        // Debe ser en el pasado o presente
+        assert!(last <= std::time::Instant::now());
+
+        // Tras touch_activity, debe reflejar actividad reciente
+        state.touch_activity(key);
+        let recent = state.get_last_activity(key);
+        assert!(recent.elapsed() < std::time::Duration::from_secs(5));
     }
 }
