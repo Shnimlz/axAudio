@@ -13,8 +13,6 @@ ignore = [
     "RUSTSEC-2026-0347", # rustls 0.22.4 Unauthenticated ServerHello leads to deadlock
     "RUSTSEC-2026-0348", # rustls 0.22.4 Infinite loop on non-standard close_notify
     "RUSTSEC-2026-0349", # rustls 0.22.4 Malformed hello message causes panic
-    "RUSTSEC-2026-0351", # rustls 0.22.4 Memory leak during handshakes
-    "RUSTSEC-2026-0352", # rustls 0.22.4 Unbounded buffer growth on TLS 1.3 key update
     "RUSTSEC-2026-0382", # rustls-webpki 0.102.8 revocation checking
     "RUSTSEC-2026-0049", # rustls-webpki 0.102.8 CRLs not considered authoritative
     "RUSTSEC-2026-0098", # rustls-webpki 0.102.8 Name constraints URI
